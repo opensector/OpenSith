@@ -1,0 +1,189 @@
+using System;
+using System.Buffers.Binary;
+using System.IO;
+
+namespace OpenSith.Core.Materials;
+
+/// <summary>
+/// Parser and representation of a LucasArts Sith Engine MAT (Material/Texture) file.
+/// Decodes 8-bit paletted texture surfaces and mipmaps into modern 32-bit RGBA buffers.
+/// </summary>
+public sealed class MatMaterial
+{
+    private const uint MagicMat = 0x2054414D; // "MAT " little-endian
+    private const int MaterialHeaderSize = 76;   // rdMaterialHeader (0x4C)
+    private const int TexinfoHeaderSize = 24;    // rdTexinfoHeader (0x18)
+    private const int TexinfoExtHeaderSize = 16; // rdTexinfoExtHeader (0x10)
+    private const int TextureHeaderSize = 24;    // rdTextureHeader (0x18)
+
+    public int Version { get; }
+    public int MaterialType { get; }
+    public int MatType => MaterialType;
+    public int RecordCount { get; }
+    public int TextureCount { get; }
+    public int BitDepth { get; }
+    public int SolidColorIndex { get; }
+    public bool AlphaEnabled { get; }
+    public int Width { get; }
+    public int Height { get; }
+    public int MipmapCount { get; }
+    public byte[] IndexedPixels { get; }
+
+    private MatMaterial(
+        int version,
+        int materialType,
+        int recordCount,
+        int textureCount,
+        int bitDepth,
+        int solidColorIndex,
+        bool alphaEnabled,
+        int width,
+        int height,
+        int mipmapCount,
+        byte[] indexedPixels)
+    {
+        Version = version;
+        MaterialType = materialType;
+        RecordCount = recordCount;
+        TextureCount = textureCount;
+        BitDepth = bitDepth;
+        SolidColorIndex = solidColorIndex;
+        AlphaEnabled = alphaEnabled;
+        Width = width;
+        Height = height;
+        MipmapCount = mipmapCount;
+        IndexedPixels = indexedPixels;
+    }
+
+    /// <summary>
+    /// Parses a MAT file from a byte span, supporting both type 0 (solid-color) and type 2 (textured) materials.
+    /// </summary>
+    public static MatMaterial Parse(ReadOnlySpan<byte> data)
+    {
+        if (data.Length < MaterialHeaderSize)
+            throw new InvalidDataException($"Data too short for MAT material header ({data.Length} bytes).");
+
+        uint magic = BinaryPrimitives.ReadUInt32LittleEndian(data[0..4]);
+        if (magic != MagicMat)
+            throw new InvalidDataException($"Invalid MAT magic: 0x{magic:X8}. Expected 'MAT '.");
+
+        int version = BinaryPrimitives.ReadInt32LittleEndian(data[4..8]);
+        int materialType = BinaryPrimitives.ReadInt32LittleEndian(data[8..12]);
+        int recordCount = BinaryPrimitives.ReadInt32LittleEndian(data[12..16]);
+        int textureCount = BinaryPrimitives.ReadInt32LittleEndian(data[16..20]);
+        int bitDepth = BinaryPrimitives.ReadInt32LittleEndian(data[24..28]);
+
+        if (recordCount < 0)
+            throw new InvalidDataException($"Invalid MAT record count: {recordCount}.");
+
+        int offset = MaterialHeaderSize;
+        int solidColorIndex = 0;
+
+        for (int i = 0; i < recordCount; i++)
+        {
+            if (data.Length < offset + TexinfoHeaderSize)
+                throw new InvalidDataException($"MAT file truncated reading texinfo record {i} ({data.Length} bytes).");
+
+            uint texInfoType = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(offset, 4));
+            uint solidColor = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(offset + 4, 4));
+            if (i == 0)
+                solidColorIndex = (int)(solidColor & 0xFF);
+
+            offset += TexinfoHeaderSize;
+
+            if ((texInfoType & 8) != 0)
+            {
+                if (data.Length < offset + TexinfoExtHeaderSize)
+                    throw new InvalidDataException($"MAT file truncated reading texinfo ext header {i} ({data.Length} bytes).");
+                offset += TexinfoExtHeaderSize;
+            }
+        }
+
+        if (materialType == 0 || textureCount == 0)
+        {
+            return new MatMaterial(
+                version,
+                materialType,
+                recordCount,
+                textureCount,
+                bitDepth,
+                solidColorIndex,
+                alphaEnabled: false,
+                width: 1,
+                height: 1,
+                mipmapCount: 0,
+                indexedPixels: [(byte)solidColorIndex]);
+        }
+
+        if (data.Length < offset + TextureHeaderSize)
+            throw new InvalidDataException($"MAT file truncated reading texture header ({data.Length} bytes).");
+
+        int width = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset + 0, 4));
+        int height = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset + 4, 4));
+        uint alphaEn = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(offset + 8, 4));
+        int mipmapCount = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset + 20, 4));
+        offset += TextureHeaderSize;
+
+        if (width <= 0 || height <= 0 || width > 4096 || height > 4096)
+            throw new InvalidDataException($"Invalid texture dimensions: {width}x{height}");
+
+        int expectedPixelBytes = width * height;
+        if (data.Length < offset + expectedPixelBytes)
+            throw new InvalidDataException($"MAT file truncated: expected at least {offset + expectedPixelBytes} bytes, found {data.Length}.");
+
+        byte[] pixels = new byte[expectedPixelBytes];
+        data.Slice(offset, expectedPixelBytes).CopyTo(pixels);
+
+        return new MatMaterial(
+            version,
+            materialType,
+            recordCount,
+            textureCount,
+            bitDepth,
+            solidColorIndex,
+            alphaEnabled: (alphaEn & 1) != 0,
+            width,
+            height,
+            mipmapCount,
+            pixels);
+    }
+
+    /// <summary>
+    /// Converts the 8-bit indexed texture into a 32-bit RGBA pixel array using the specified CMP palette.
+    /// </summary>
+    public Rgba32[] ToRgba32(CmpPalette palette, int lightLevel = 0)
+    {
+        ArgumentNullException.ThrowIfNull(palette);
+
+        var rgba = new Rgba32[Width * Height];
+        for (int i = 0; i < IndexedPixels.Length; i++)
+        {
+            byte paletteIndex = IndexedPixels[i];
+            rgba[i] = palette.GetShadedColor(paletteIndex, lightLevel, useColorKey: AlphaEnabled);
+        }
+        return rgba;
+    }
+
+    /// <summary>
+    /// Converts the 8-bit indexed texture directly into a raw 32-bit RGBA byte buffer (Width * Height * 4 bytes)
+    /// suitable for direct texture upload to OpenGL, Vulkan, Metal, or DirectX.
+    /// </summary>
+    public byte[] ToRgbaByteBuffer(CmpPalette palette, int lightLevel = 0)
+    {
+        ArgumentNullException.ThrowIfNull(palette);
+
+        byte[] buffer = new byte[Width * Height * 4];
+        for (int i = 0; i < IndexedPixels.Length; i++)
+        {
+            byte paletteIndex = IndexedPixels[i];
+            Rgba32 color = palette.GetShadedColor(paletteIndex, lightLevel, useColorKey: AlphaEnabled);
+
+            int offset = i * 4;
+            buffer[offset + 0] = color.R;
+            buffer[offset + 1] = color.G;
+            buffer[offset + 2] = color.B;
+            buffer[offset + 3] = color.A;
+        }
+        return buffer;
+    }
+}

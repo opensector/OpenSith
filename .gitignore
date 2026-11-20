@@ -1,0 +1,28 @@
+# .NET / Visual Studio / IDE
+bin/
+obj/
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+publish/
+artifacts/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs & temporary files
+*.log
+*.tmp
+
+# Internal dev / RE notes
+DECOMPILER_ANALYSIS_REPORT.md
