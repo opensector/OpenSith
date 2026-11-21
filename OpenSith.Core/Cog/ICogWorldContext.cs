@@ -17,6 +17,16 @@ public interface ICogWorldContext
     void SetSectorAdjoins(int sectorId, bool visible);
     void SetSectorLight(int sectorId, float light, float delay);
     void SectorThrust(int sectorId, Vector3 dir, float speed) { }
+    void SetSectorFlags(int sectorId, int flags) { }
+    void ClearSectorFlags(int sectorId, int flags) { }
+    int GetSectorFlags(int sectorId) => 0;
+    void SetSectorTint(int sectorId, Vector3 tint) { }
+    void SectorSound(int sectorId, string sound, float volume) { }
+    void SetColormap(int sectorId, string colormap) { }
+    int FirstThingInSector(int sectorId) => -1;
+    int NextThingInSector(int prevThingId) => -1;
+    int GetNumSectorVertices(int sectorId) => 0;
+    Vector3 GetSectorVertexPos(int sectorId, int vertexIdx) => Vector3.Zero;
 
     int PlaySoundThing(string sound, int thingId, float volume, float minRad, float maxRad, int flags);
 
@@ -61,8 +71,21 @@ public interface ICogWorldContext
     void ClearPhysicsFlags(int thingId, int flags) { }
     int GetItemFlags(int thingId) => 0;
     int GetAttachFlags(int thingId) => 0;
+    void SetThingAttachFlags(int thingId, int flags) { }
     void AttachThingToThingEx(int thingId, int attachToThingId, int attachFlags) { }
     void DetachThing(int thingId) { }
+    void RotatePivot(int thingId, int frameIdx, float time) { }
+    void JumpToFrame(int thingId, int frameIdx, int sectorId) { }
+    void SkipToFrame(int thingId, int frameIdx, float speed) { }
+    void PathMovePause(int thingId) { }
+    void PathMoveResume(int thingId) { }
+    int GetGoalFrame(int thingId) => -1;
+    void TeleportThing(int thingId, int destThingId) { }
+    void SetThingTimer(int thingId, float seconds) { }
+    float GetThingMass(int thingId) => 0f;
+    void SetThingMass(int thingId, float mass) { }
+    int ThingLightAnim(int thingId, float startLight, float endLight, float period) => -1;
+    int IsThingVisible(int thingId) => 0;
     int GetThingClassCog(int thingId) => -1;
     int GetThingGeoMode(int thingId) => 0;
     void SetThingCurGeoMode(int thingId, int geoMode) { }
@@ -132,6 +155,8 @@ public interface ICogWorldContext
     void AISetMoveFrame(int thingId, int frame) { }
     void AISetLookPos(int thingId, Vector3 pos) { }
     void AISetMovePos(int thingId, Vector3 pos) { }
+    void AISetMoveThing(int thingId, int targetThingId) { }
+    void AISetFireTarget(int thingId, int targetThingId) { }
     void AISetMoveSpeed(int thingId, float speed) { }
     void AIJump(int thingId, int destThingId, float speed) { }
     int AiGetMode(int thingId) => -1;
@@ -145,6 +170,23 @@ public interface ICogWorldContext
     float ThingViewDot(int viewerThing, int targetThing) => -1000f;
 
     // Surface, camera, effects & audio verbs
+    void SetFaceGeoMode(int surfaceId, int geoMode) { }
+    int GetFaceGeoMode(int surfaceId) => 0;
+    void SetFaceType(int surfaceId, int faceFlags) { }
+    void SetSurfaceFlags(int surfaceId, int flags) { }
+    void ClearSurfaceFlags(int surfaceId, int flags) { }
+    int GetSurfaceFlags(int surfaceId) => 0;
+    void SetSurfaceMat(int surfaceId, string materialName) { }
+    void SetAdjoinFlags(int surfaceId, int flags) { }
+    void ClearAdjoinFlags(int surfaceId, int flags) { }
+    int GetAdjoinFlags(int surfaceId) => 0;
+    int GetSurfaceSector(int surfaceId) => -1;
+    Vector3 GetSurfaceNormal(int surfaceId) => Vector3.Zero;
+    int GetNumSurfaceVertices(int surfaceId) => 0;
+    Vector3 GetSurfaceVertexPos(int surfaceId, int vertexIdx) => Vector3.Zero;
+    int GetSurfaceAnim(int surfaceId) => -1;
+    int SurfaceLightAnim(int surfaceId, float startLight, float endLight, float period) => -1;
+    void StopAnim(int animId) { }
     void SetSurfaceCel(int surfaceId, int cel) { }
     int GetSurfaceCel(int surfaceId) => 0;
     void SlideSurface(int surfaceId, Vector3 dir, float speed) { }
@@ -199,10 +241,18 @@ public interface ICogWorldContext
     void JkSetTargetColors(int r, int g, int b) { }
     void JkBeginCutscene() { }
     void JkEndCutscene() { }
+    void JkSetSuperFlags(int flags) { }
+    void JkClearSuperFlags(int flags) { }
+    int JkGetSuperFlags() => 0;
+    int JkGetChoice() => 1;
+    void AssignWeapon(int playerThing, int binIdx) { }
+    string LoadSound(string soundName) => soundName ?? string.Empty;
+    string LoadTemplate(string templateName) => templateName ?? string.Empty;
     int GetMajorMode() => 0;
     int GetDifficulty() => 1;
     int IsMulti() => 0;
     int GetSenderId() => -1;
+    int GetSenderType() => 0;
     int GetSourceRef() => -1;
     float GetLevelTime() => 0f;
 }

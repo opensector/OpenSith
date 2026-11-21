@@ -273,6 +273,7 @@ public sealed class CogExecutionContext
     public int SenderRef { get; }
     public int SenderId { get; }
     public int SourceRef { get; }
+    public int SenderType { get; }
     public CogValue[] Parameters { get; }
     public CogValue ReturnValue { get; set; } = CogValue.Null;
     public bool Terminated { get; set; }
@@ -283,13 +284,15 @@ public sealed class CogExecutionContext
         int senderRef = -1,
         CogValue[]? parameters = null,
         int senderId = -1,
-        int sourceRef = -1)
+        int sourceRef = -1,
+        int senderType = -1)
     {
         Instance = instance;
         Pc = pc;
         SenderRef = senderRef;
         SenderId = senderId;
         SourceRef = sourceRef;
+        SenderType = senderType;
         Parameters = parameters ?? [];
     }
 }
@@ -336,21 +339,27 @@ public sealed class CogVm
     }
 
     public CogValue SendMessage(int cogId, string message, int senderRef = -1, params CogValue[]? parameters)
-        => SendMessage(cogId, message, senderRef, -1, -1, parameters);
+        => SendMessage(cogId, message, senderRef, -1, -1, -1, parameters);
 
     public CogValue SendMessage(int cogId, string message, int senderRef, int senderId, int sourceRef, params CogValue[]? parameters)
+        => SendMessage(cogId, message, senderRef, senderId, sourceRef, -1, parameters);
+
+    public CogValue SendMessage(int cogId, string message, int senderRef, int senderId, int sourceRef, int senderType, params CogValue[]? parameters)
     {
         if (_instancesById.TryGetValue(cogId, out var instance))
-            return SendMessage(instance, message, senderRef, senderId, sourceRef, parameters);
+            return SendMessage(instance, message, senderRef, senderId, sourceRef, senderType, parameters);
 
         _context.SendMessage(cogId, message);
         return CogValue.Null;
     }
 
     public CogValue SendMessage(CogInstance instance, string message, int senderRef = -1, params CogValue[]? parameters)
-        => SendMessage(instance, message, senderRef, -1, -1, parameters);
+        => SendMessage(instance, message, senderRef, -1, -1, -1, parameters);
 
     public CogValue SendMessage(CogInstance instance, string message, int senderRef, int senderId, int sourceRef, params CogValue[]? parameters)
+        => SendMessage(instance, message, senderRef, senderId, sourceRef, -1, parameters);
+
+    public CogValue SendMessage(CogInstance instance, string message, int senderRef, int senderId, int sourceRef, int senderType, params CogValue[]? parameters)
     {
         if (instance == null) throw new ArgumentNullException(nameof(instance));
         if (string.IsNullOrWhiteSpace(message)) return CogValue.Null;
@@ -361,7 +370,7 @@ public sealed class CogVm
         if (!TryResolveMessageLabel(instance, message, out int labelPc))
             return CogValue.Null;
 
-        var context = new CogExecutionContext(instance, labelPc, senderRef, parameters, senderId, sourceRef);
+        var context = new CogExecutionContext(instance, labelPc, senderRef, parameters, senderId, sourceRef, senderType);
 
         _recursionDepth++;
         try
@@ -373,6 +382,12 @@ public sealed class CogVm
             _recursionDepth--;
         }
     }
+
+    public CogValue SendMessageEx(int cogId, string message, int senderRef = -1, int senderId = -1, int sourceRef = -1, int senderType = -1, params CogValue[]? parameters)
+        => SendMessage(cogId, message, senderRef, senderId, sourceRef, senderType, parameters);
+
+    public CogValue SendMessageEx(CogInstance instance, string message, int senderRef = -1, int senderId = -1, int sourceRef = -1, int senderType = -1, params CogValue[]? parameters)
+        => SendMessage(instance, message, senderRef, senderId, sourceRef, senderType, parameters);
 
     public void Update(float dt)
     {
@@ -556,17 +571,7 @@ public sealed class CogVm
             case Identifier id:
                 if (id.Name.Equals("true", StringComparison.OrdinalIgnoreCase)) return new CogValue(1);
                 if (id.Name.Equals("false", StringComparison.OrdinalIgnoreCase)) return new CogValue(0);
-                {
-                    var symVal = instance.GetSymbolValue(id.Name);
-                    if (symVal.Type == CogValueType.Int && symVal.AsInt == -1 &&
-                        instance.SymbolSlots.TryGetValue(id.Name, out int slot))
-                    {
-                        var sym = instance.Script.Symbols[slot];
-                        if (sym.Type == CogSymbolType.Template && !string.IsNullOrEmpty(sym.DefaultValue))
-                            return new CogValue(sym.DefaultValue);
-                    }
-                    return symVal;
-                }
+                return instance.GetSymbolValue(id.Name);
 
             case IndexExpr idxExpr:
             {
@@ -677,6 +682,8 @@ public sealed class CogVm
 
         if (TryEvaluateWorldAndVmVerb(verb, call, args, context, out var result))
             return result;
+        if (TryEvaluateSurfaceAndSectorVerb(verb, args, out result))
+            return result;
         if (TryEvaluateThingVerb(verb, args, context.Instance.CogId, out result))
             return result;
         if (TryEvaluateInventoryAndAiVerb(verb, args, out result))
@@ -696,6 +703,7 @@ public sealed class CogVm
         {
             // World query verbs
             case "getthingsector":
+            case "getsector":
                 result = new CogValue(_context.GetThingSector(Arg(0).AsInt));
                 return true;
 
@@ -747,6 +755,7 @@ public sealed class CogVm
                 return true;
 
             case "sectorthrust":
+            case "setsectorthrust":
                 _context.SectorThrust(Arg(0).AsInt, Arg(1).AsVector3, Arg(2).AsFloat);
                 result = CogValue.Null;
                 return true;
@@ -760,7 +769,7 @@ public sealed class CogVm
             {
                 int cogId = Arg(0).AsInt;
                 string msg = ResolveMessageName(call, args, 1);
-                result = SendMessage(cogId, msg, instance.CogId);
+                result = SendMessage(cogId, msg, instance.CogId, -1, -1, senderType: 9);
                 return true;
             }
 
@@ -768,7 +777,7 @@ public sealed class CogVm
             {
                 int cogId = Arg(0).AsInt;
                 string msg = ResolveMessageName(call, args, 1);
-                result = SendMessage(cogId, msg, instance.CogId, [Arg(2), Arg(3), Arg(4), Arg(5)]);
+                result = SendMessage(cogId, msg, instance.CogId, -1, -1, senderType: 9, [Arg(2), Arg(3), Arg(4), Arg(5)]);
                 return true;
             }
 
@@ -800,8 +809,24 @@ public sealed class CogVm
                 result = CogValue.Null;
                 return true;
 
+            case "printvector":
+            {
+                var vec = Arg(0).AsVector3;
+                _context.Print(string.Create(CultureInfo.InvariantCulture, $"({vec.X:F6} {vec.Y:F6} {vec.Z:F6})"));
+                result = CogValue.Null;
+                return true;
+            }
+
             case "rand":
                 result = new CogValue(_context.Rand());
+                return true;
+
+            case "loadsound":
+                result = new CogValue(_context.LoadSound(Arg(0).AsString));
+                return true;
+
+            case "loadtemplate":
+                result = new CogValue(_context.LoadTemplate(Arg(0).AsString));
                 return true;
 
             // VM execution / context verbs
@@ -811,6 +836,10 @@ public sealed class CogVm
 
             case "getsenderid":
                 result = new CogValue(ResolveSenderId(context));
+                return true;
+
+            case "getsendertype":
+                result = new CogValue(ResolveSenderType(context));
                 return true;
 
             case "getsourceref":
@@ -931,6 +960,140 @@ public sealed class CogVm
                 result = CogValue.Null;
                 return true;
             }
+
+            default:
+                result = CogValue.Null;
+                return false;
+        }
+    }
+
+    private bool TryEvaluateSurfaceAndSectorVerb(string verb, List<CogValue> args, out CogValue result)
+    {
+        CogValue Arg(int idx) => CogVm.Arg(args, idx);
+        switch (verb)
+        {
+            // Surface & adjoin verbs
+            case "setfacegeomode":
+                _context.SetFaceGeoMode(Arg(0).AsInt, Arg(1).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "getfacegeomode":
+                result = new CogValue(_context.GetFaceGeoMode(Arg(0).AsInt));
+                return true;
+
+            case "setfacetype":
+                _context.SetFaceType(Arg(0).AsInt, Arg(1).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "setsurfaceflags":
+                _context.SetSurfaceFlags(Arg(0).AsInt, Arg(1).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "clearsurfaceflags":
+                _context.ClearSurfaceFlags(Arg(0).AsInt, Arg(1).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "getsurfaceflags":
+                result = new CogValue(_context.GetSurfaceFlags(Arg(0).AsInt));
+                return true;
+
+            case "setsurfacemat":
+                _context.SetSurfaceMat(Arg(0).AsInt, Arg(1).AsString);
+                result = CogValue.Null;
+                return true;
+
+            case "setadjoinflags":
+                _context.SetAdjoinFlags(Arg(0).AsInt, Arg(1).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "clearadjoinflags":
+                _context.ClearAdjoinFlags(Arg(0).AsInt, Arg(1).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "getadjoinflags":
+                result = new CogValue(_context.GetAdjoinFlags(Arg(0).AsInt));
+                return true;
+
+            case "getsurfacesector":
+                result = new CogValue(_context.GetSurfaceSector(Arg(0).AsInt));
+                return true;
+
+            case "getsurfacenormal":
+                result = new CogValue(_context.GetSurfaceNormal(Arg(0).AsInt));
+                return true;
+
+            case "getnumsurfacevertices":
+                result = new CogValue(_context.GetNumSurfaceVertices(Arg(0).AsInt));
+                return true;
+
+            case "getsurfacevertexpos":
+                result = new CogValue(_context.GetSurfaceVertexPos(Arg(0).AsInt, Arg(1).AsInt));
+                return true;
+
+            case "getsurfaceanim":
+                result = new CogValue(_context.GetSurfaceAnim(Arg(0).AsInt));
+                return true;
+
+            case "surfacelightanim":
+                result = new CogValue(_context.SurfaceLightAnim(Arg(0).AsInt, Arg(1).AsFloat, Arg(2).AsFloat, Arg(3).AsFloat));
+                return true;
+
+            case "stopanim":
+                _context.StopAnim(Arg(0).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            // Sector verbs
+            case "setsectorflags":
+                _context.SetSectorFlags(Arg(0).AsInt, Arg(1).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "clearsectorflags":
+                _context.ClearSectorFlags(Arg(0).AsInt, Arg(1).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "getsectorflags":
+                result = new CogValue(_context.GetSectorFlags(Arg(0).AsInt));
+                return true;
+
+            case "setsectortint":
+                _context.SetSectorTint(Arg(0).AsInt, Arg(1).AsVector3);
+                result = CogValue.Null;
+                return true;
+
+            case "sectorsound":
+                _context.SectorSound(Arg(0).AsInt, Arg(1).AsString, Arg(2).AsFloat);
+                result = CogValue.Null;
+                return true;
+
+            case "setcolormap":
+                _context.SetColormap(Arg(0).AsInt, Arg(1).AsString);
+                result = CogValue.Null;
+                return true;
+
+            case "firstthinginsector":
+                result = new CogValue(_context.FirstThingInSector(Arg(0).AsInt));
+                return true;
+
+            case "nextthinginsector":
+                result = new CogValue(_context.NextThingInSector(Arg(0).AsInt));
+                return true;
+
+            case "getnumsectorvertices":
+                result = new CogValue(_context.GetNumSectorVertices(Arg(0).AsInt));
+                return true;
+
+            case "getsectorvertexpos":
+                result = new CogValue(_context.GetSectorVertexPos(Arg(0).AsInt, Arg(1).AsInt));
+                return true;
 
             default:
                 result = CogValue.Null;
@@ -1108,6 +1271,16 @@ public sealed class CogVm
                 result = new CogValue(_context.GetAttachFlags(Arg(0).AsInt));
                 return true;
 
+            case "setthingattachflags":
+                _context.SetThingAttachFlags(Arg(0).AsInt, Arg(1).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "attachthingtothing":
+                _context.AttachThingToThingEx(Arg(0).AsInt, Arg(1).AsInt, 0);
+                result = CogValue.Null;
+                return true;
+
             case "attachthingtothingex":
                 _context.AttachThingToThingEx(Arg(0).AsInt, Arg(1).AsInt, Arg(2).AsInt);
                 result = CogValue.Null;
@@ -1116,6 +1289,62 @@ public sealed class CogVm
             case "detachthing":
                 _context.DetachThing(Arg(0).AsInt);
                 result = CogValue.Null;
+                return true;
+
+            case "rotatepivot":
+                _context.RotatePivot(Arg(0).AsInt, Arg(1).AsInt, Arg(2).AsFloat);
+                result = CogValue.Null;
+                return true;
+
+            case "jumptoframe":
+                _context.JumpToFrame(Arg(0).AsInt, Arg(1).AsInt, Arg(2).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "skiptoframe":
+                _context.SkipToFrame(Arg(0).AsInt, Arg(1).AsInt, Arg(2).AsFloat);
+                result = CogValue.Null;
+                return true;
+
+            case "pathmovepause":
+                _context.PathMovePause(Arg(0).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "pathmoveresume":
+                _context.PathMoveResume(Arg(0).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "getgoalframe":
+                result = new CogValue(_context.GetGoalFrame(Arg(0).AsInt));
+                return true;
+
+            case "teleportthing":
+                _context.TeleportThing(Arg(0).AsInt, Arg(1).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "setthingtimer":
+                _context.SetThingTimer(Arg(0).AsInt, Arg(1).AsFloat);
+                result = CogValue.Null;
+                return true;
+
+            case "getthingmass":
+                result = new CogValue(_context.GetThingMass(Arg(0).AsInt));
+                return true;
+
+            case "setthingmass":
+                _context.SetThingMass(Arg(0).AsInt, Arg(1).AsFloat);
+                result = CogValue.Null;
+                return true;
+
+            case "thinglightanim":
+                result = new CogValue(_context.ThingLightAnim(Arg(0).AsInt, Arg(1).AsFloat, Arg(2).AsFloat, Arg(3).AsFloat));
+                return true;
+
+            case "isthingvisible":
+                result = new CogValue(_context.IsThingVisible(Arg(0).AsInt));
                 return true;
 
             case "getthingclasscog":
@@ -1265,6 +1494,7 @@ public sealed class CogVm
                 return true;
 
             case "adddynamictint":
+            case "addtint":
                 _context.AddDynamicTint(Arg(0).AsInt, Arg(1).AsFloat, Arg(2).AsFloat, Arg(3).AsFloat);
                 result = CogValue.Null;
                 return true;
@@ -1323,6 +1553,11 @@ public sealed class CogVm
 
             case "pickupbackpack":
                 _context.PickupBackpack(Arg(0).AsInt, Arg(1).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "assignweapon":
+                _context.AssignWeapon(Arg(0).AsInt, Arg(1).AsInt);
                 result = CogValue.Null;
                 return true;
 
@@ -1438,6 +1673,16 @@ public sealed class CogVm
 
             case "aisetmovepos":
                 _context.AISetMovePos(Arg(0).AsInt, Arg(1).AsVector3);
+                result = CogValue.Null;
+                return true;
+
+            case "aisetmovething":
+                _context.AISetMoveThing(Arg(0).AsInt, Arg(1).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "aisetfiretarget":
+                _context.AISetFireTarget(Arg(0).AsInt, Arg(1).AsInt);
                 result = CogValue.Null;
                 return true;
 
@@ -1661,7 +1906,7 @@ public sealed class CogVm
 
             // Level, JK saber/HUD & UI verbs
             case "jkendlevel":
-                _context.JkEndLevel(Arg(0).AsInt);
+                _context.JkEndLevel(args.Count > 0 ? Arg(0).AsInt : 1);
                 result = CogValue.Null;
                 return true;
 
@@ -1767,6 +2012,24 @@ public sealed class CogVm
             case "jkendcutscene":
                 _context.JkEndCutscene();
                 result = CogValue.Null;
+                return true;
+
+            case "jksetsuperflags":
+                _context.JkSetSuperFlags(Arg(0).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "jkclearsuperflags":
+                _context.JkClearSuperFlags(Arg(0).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "jkgetsuperflags":
+                result = new CogValue(_context.JkGetSuperFlags());
+                return true;
+
+            case "jkgetchoice":
+                result = new CogValue(_context.JkGetChoice());
                 return true;
 
             case "getmajormode":
@@ -1912,6 +2175,46 @@ public sealed class CogVm
         return context.SenderRef;
     }
 
+    private int ResolveSenderType(CogExecutionContext context)
+    {
+        if (context.SenderType >= 0)
+            return context.SenderType;
+
+        int contextSenderType = _context.GetSenderType();
+        if (contextSenderType > 0)
+            return contextSenderType;
+
+        if (context.SenderRef >= 0)
+        {
+            var symbols = context.Instance.Script.Symbols;
+            var values = context.Instance.SymbolValues;
+            for (int i = 0; i < symbols.Count && i < values.Length; i++)
+            {
+                var sym = symbols[i];
+                if (sym.Type is CogSymbolType.Thing or CogSymbolType.Sector or CogSymbolType.Surface or CogSymbolType.Cog &&
+                    values[i].Type == CogValueType.Int &&
+                    values[i].AsInt == context.SenderRef)
+                {
+                    return sym.Type switch
+                    {
+                        CogSymbolType.Thing => 3,
+                        CogSymbolType.Sector => 5,
+                        CogSymbolType.Surface => 6,
+                        CogSymbolType.Cog => 9,
+                        _ => 0
+                    };
+                }
+            }
+        }
+
+        return 0;
+    }
+
+    /// <summary>
+    /// Exposes the read-only set of COG verb names supported by <see cref="CogVm"/>.
+    /// </summary>
+    public static IReadOnlyCollection<string> KnownVerbs => SupportedVerbs;
+
     /// <summary>
     /// Returns true if the given COG verb name is handled by <see cref="CogVm"/>.
     /// </summary>
@@ -1920,30 +2223,38 @@ public sealed class CogVm
 
     private static readonly HashSet<string> SupportedVerbs = new(StringComparer.OrdinalIgnoreCase)
     {
-        "getthingsector", "getthingpos", "movetoframe", "isthingmoving", "ismoving", "waitforstop", "getcurframe",
+        "getthingsector", "getsector", "getthingpos", "movetoframe", "isthingmoving", "ismoving", "waitforstop", "getcurframe",
         "getlocalplayerthing", "jkgetlocalplayer", "setsectoradjoins", "sectoradjoins", "setsectorlight",
-        "sectorlight", "sectorthrust", "playsoundthing", "sendmessage", "sendmessageex", "getselfcog", "setmastercog",
-        "getmastercog", "print", "printint", "printflex", "rand", "getsenderref", "getsenderid", "getsourceref", "getleveltime", "getparam",
+        "sectorlight", "sectorthrust", "setsectorthrust", "playsoundthing", "sendmessage", "sendmessageex", "getselfcog", "setmastercog",
+        "getmastercog", "print", "printint", "printflex", "printvector", "rand", "loadsound", "loadtemplate",
+        "getsenderref", "getsenderid", "getsendertype", "getsourceref", "getleveltime", "getparam",
         "settimer", "setpulse", "settimerex", "killtimerex", "sleep", "returnex", "stop",
+        "setfacegeomode", "getfacegeomode", "setfacetype", "setsurfaceflags", "clearsurfaceflags", "getsurfaceflags", "setsurfacemat",
+        "setadjoinflags", "clearadjoinflags", "getadjoinflags", "getsurfacesector", "getsurfacenormal", "getnumsurfacevertices",
+        "getsurfacevertexpos", "getsurfaceanim", "surfacelightanim", "stopanim",
+        "setsectorflags", "clearsectorflags", "getsectorflags", "setsectortint", "sectorsound", "setcolormap",
+        "firstthinginsector", "nextthinginsector", "getnumsectorvertices", "getsectorvertexpos",
         "creatething", "createthingnr", "createthingatpos", "createthingatposnr", "destroything", "setlifeleft", "getlifeleft",
         "damagething", "healthing", "getthinghealth", "gethealth", "setthinghealth", "getthingmaxhealth", "getthingtemplate",
         "setthingvel", "addthingvel", "getthingvel", "setthingrotvel", "getthingrotvel", "applyforce",
-        "stopthing", "thinglight", "setthinglight", "getthinglight", "playkey", "stopkey", "playmode",
+        "stopthing", "thinglight", "setthinglight", "getthinglight", "thinglightanim", "playkey", "stopkey", "playmode",
         "getthingflags", "setthingflags", "clearthingflags", "getactorflags", "setactorflags", "clearactorflags",
-        "getphysicsflags", "setphysicsflags", "clearphysicsflags", "getitemflags", "getattachflags",
-        "attachthingtothingex", "detachthing", "getthingclasscog", "getthinggeomode", "setthingcurgeomode",
+        "getphysicsflags", "setphysicsflags", "clearphysicsflags", "getitemflags", "getattachflags", "setthingattachflags",
+        "attachthingtothing", "attachthingtothingex", "detachthing", "rotatepivot", "jumptoframe", "skiptoframe",
+        "pathmovepause", "pathmoveresume", "getgoalframe", "teleportthing", "setthingtimer", "getthingmass", "setthingmass", "isthingvisible",
+        "getthingclasscog", "getthinggeomode", "setthingcurgeomode",
         "getthingparent", "getthingsignature", "getthingthrust", "getthingtype", "getthinguserdata",
         "setthinguserdata", "setthinglook", "getthinglvec", "capturething", "setthingpulse", "setthingcollidesize", "setcollidetype",
         "setactorextraspeed", "setactorweapon", "setarmedmode",
         "setparticlegrowthspeed", "parsearg", "getcursector",
         "changeinv", "getinv", "setinv", "getinvmax", "setgoalflags", "cleargoalflags", "getgoalflags",
-        "takeitem", "adddynamictint", "adddynamicadd", "getautoreload", "getautopickup", "getautoswitch",
+        "takeitem", "adddynamictint", "addtint", "adddynamicadd", "getautoreload", "getautopickup", "getautoswitch",
         "autoselectweapon", "selectweapon", "getcurweapon", "getcurweaponmode", "getweaponpriority", "setweaponflags", "changefirerate",
-        "createbackpack", "pickupbackpack",
+        "createbackpack", "pickupbackpack", "assignweapon",
         "setcurinvweapon", "getcurinvweapon", "setcurweapon", "activatebin", "deactivatebin",
         "isinvactivated", "setinvactivated", "setinvavailable", "isinvavailable", "setbinwait",
         "activateweapon", "deactivateweapon", "fireprojectile", "setfirewait", "setmountwait",
-        "amputatejoint", "aisetclass", "aiflee", "aisetlookframe", "aisetmoveframe", "aisetlookpos", "aisetmovepos", "aisetmovespeed", "aijump",
+        "amputatejoint", "aisetclass", "aiflee", "aisetlookframe", "aisetmoveframe", "aisetlookpos", "aisetmovepos", "aisetmovething", "aisetfiretarget", "aisetmovespeed", "aijump",
         "aigetmode", "aisetmode", "aiclearmode",
         "getactorweapon", "skilltarget", "firstthinginview", "nextthinginview", "haslos", "thingviewdot",
         "setsurfacecel", "setwallcel", "getsurfacecel", "getwallcel", "slidesurface", "slidewall", "slideceilingsky", "surfaceanim",
@@ -1955,7 +2266,8 @@ public sealed class CogVm
         "jksetweaponmesh", "jkgetweaponmesh", "jkenablesaber", "jkdisablesaber", "jksetsaberinfo",
         "jksetpersuasioninfo", "jksetpovmodel", "jkplaypovkey", "jkstoppovkey", "jksetwaggle",
         "jkgetsabercam", "jksettarget", "jkendtarget", "jksettargetcolors", "jkbegincutscene",
-        "jkendcutscene", "getmajormode", "getdifficulty", "ismulti", "randvec",
+        "jkendcutscene", "jksetsuperflags", "jkclearsuperflags", "jkgetsuperflags", "jkgetchoice",
+        "getmajormode", "getdifficulty", "ismulti", "randvec",
         "vectorset", "vectoradd", "vectorsub", "vectorscale", "vectordist", "vectordot",
         "vectorcross", "vectornorm", "vectorlen", "vectorx", "vectory", "vectorz",
         "bittest", "bitset", "bitclear"

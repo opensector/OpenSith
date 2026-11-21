@@ -118,6 +118,38 @@ public struct SithMatrix34
     }
 
     /// <summary>
+    /// Extracts Euler angles (pitch=X, yaw=Y, roll=Z in degrees) matching the inverse of <see cref="Build34"/>.
+    /// Matches LucasArts <c>rdMatrix_ExtractAngles34</c>.
+    /// </summary>
+    public static Vector3 ExtractPyr(SithMatrix34 m)
+    {
+        const float radToDeg = 180f / MathF.PI;
+        float sinP = Math.Clamp(m.Lvec.Z, -1f, 1f);
+        float pitch = MathF.Asin(sinP) * radToDeg;
+
+        if (MathF.Abs(sinP) < 0.99999f)
+        {
+            float yaw = MathF.Atan2(-m.Lvec.X, m.Lvec.Y) * radToDeg;
+            float roll = MathF.Atan2(-m.Rvec.Z, m.Uvec.Z) * radToDeg;
+            return new Vector3(pitch, yaw, roll);
+        }
+
+        float gimbalYaw = MathF.Atan2(m.Rvec.Y, m.Rvec.X) * radToDeg;
+        return new Vector3(pitch, gimbalYaw, 0f);
+    }
+
+    /// <summary>
+    /// Returns the pure-rotation inverse (transpose of the 3x3 basis) with zero translation.
+    /// </summary>
+    public SithMatrix34 TransposeRotation() => new()
+    {
+        Rvec = new Vector3(Rvec.X, Lvec.X, Uvec.X),
+        Lvec = new Vector3(Rvec.Y, Lvec.Y, Uvec.Y),
+        Uvec = new Vector3(Rvec.Z, Lvec.Z, Uvec.Z),
+        Scale = Vector3.Zero
+    };
+
+    /// <summary>
     /// Converts to standard row-major Matrix4x4 compatible with System.Numerics (v' = v * M).
     /// </summary>
     public Matrix4x4 ToMatrix4x4()

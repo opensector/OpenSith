@@ -427,19 +427,6 @@ public static class Program
         _saberRenderer?.SetTextureManager(_textures);
         _audio = new AudioEngine(_vfs);
 
-        _worldSim = new WorldSimulation(_level, _vfs, _audio, _currentDifficulty);
-        _worldSim.OnSectorLightChanged += (sectorId, light) =>
-            _meshRenderer?.SetSectorExtraLight(sectorId, light);
-        _worldSim.OnSurfaceScroll += (surfaceId, dir, speed) =>
-            _meshRenderer?.SetSurfaceScroll(surfaceId, dir * speed);
-        _worldSim.OnPlayThingKeyframe += (thingId, key, loop) =>
-            _thingRenderer?.SetThingKeyframe(thingId, key, mode: 0, loop: loop);
-
-        if (string.Equals(normalizedFile, "01narshadda.jkl", StringComparison.OrdinalIgnoreCase))
-            _audio.PlayLoopingMusic("01cantinaband02.wav", 0.35f);
-
-        Console.WriteLine($"WorldSimulation ready: {_worldSim.ActiveCogCount} COGs, {_worldSim.FramedThingCount} framed entities, {_worldSim.ActiveNpcCount} AI NPCs.");
-
         var spawn = _level.GetPlayerSpawn();
         if (spawn != null)
         {
@@ -459,8 +446,43 @@ public static class Program
 
         _player.ConfigureFromModel(GetOrLoadModel("ky.3do"));
         _player.ModelResolver = name => string.IsNullOrEmpty(name) ? null : GetOrLoadModel(name);
-
         _selectedWeapon = 2;
+
+        _worldSim = new WorldSimulation(_level, _vfs, _audio, _currentDifficulty, runStartupCogs: false);
+        _worldSim.OnSectorLightChanged += (sectorId, light) =>
+            _meshRenderer?.SetSectorExtraLight(sectorId, light);
+        _worldSim.OnSurfaceScroll += (surfaceId, dir, speed) =>
+            _meshRenderer?.SetSurfaceScroll(surfaceId, dir * speed);
+        _worldSim.OnSurfaceGeoModeChanged += (surfaceId, geoMode) =>
+            _meshRenderer?.SetSurfaceGeoMode(surfaceId, geoMode);
+        _worldSim.OnSurfaceMaterialChanged += (surfaceId, matName) =>
+            _meshRenderer?.SetSurfaceMaterial(surfaceId, matName);
+        _worldSim.OnSurfaceLightChanged += (surfaceId, light) =>
+            _meshRenderer?.SetSurfaceExtraLight(surfaceId, light);
+        _worldSim.OnPlayThingKeyframe += (thingId, key, loop) =>
+            _thingRenderer?.SetThingKeyframe(thingId, key, mode: 0, loop: loop);
+        _worldSim.OnPlayerTeleported += (pos, pyr, sector) =>
+        {
+            if (_player != null)
+            {
+                _player.Position = pos;
+                _player.Velocity = Vector3.Zero;
+                _player.CurrentSectorIndex = sector;
+            }
+            _camera.Yaw = pyr.Y;
+        };
+        _worldSim.OnPlayerWeaponAssigned += binIdx =>
+        {
+            int mapped = binIdx == 10 ? 1 : binIdx;
+            if (mapped is >= 1 and <= 4)
+                _selectedWeapon = mapped;
+        };
+        _worldSim.StartLevel();
+
+        if (string.Equals(normalizedFile, "01narshadda.jkl", StringComparison.OrdinalIgnoreCase))
+            _audio.PlayLoopingMusic("01cantinaband02.wav", 0.35f);
+
+        Console.WriteLine($"WorldSimulation ready: {_worldSim.ActiveCogCount} COGs, {_worldSim.FramedThingCount} framed entities, {_worldSim.ActiveNpcCount} AI NPCs.");
         _weaponAnimTime = 0.0f;
         _weaponFireTimer = 0.0f;
         _weaponFireCooldown = 0.35f;
@@ -837,7 +859,7 @@ public static class Program
             _shader.SetUniform("uModel", model);
             _shader.SetUniform("uView", view);
             _shader.SetUniform("uProjection", projection);
-            _shader.SetUniform("uTint", Vector3.Zero);
+            _shader.SetUniform("uTint", _worldSim?.CurrentScreenTint ?? Vector3.Zero);
             _shader.SetUniform("uAlpha", 1.0f);
 
             _meshRenderer!.Render(_shader);

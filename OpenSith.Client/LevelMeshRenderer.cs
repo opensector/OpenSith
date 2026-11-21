@@ -29,16 +29,20 @@ public sealed class LevelMeshRenderer : IDisposable
     public const int SurfaceFlagSkyMask = SurfaceFlagHorizonSky | SurfaceFlagCeilingSky;
 
     private readonly GL _gl;
+    private readonly JklLevel _level;
     private readonly TextureManager _textureManager;
     private readonly List<MaterialBatch> _batches = [];
     private readonly Dictionary<int, SurfaceMeshSlice> _surfaceSlices = new();
     private readonly Dictionary<int, List<SurfaceMeshSlice>> _sectorSlices = new();
     private readonly List<SurfaceMeshSlice> _skySlices = [];
     private readonly List<SurfaceMeshSlice> _scrollingSlices = [];
+    private readonly Dictionary<int, Vector2> _scrollVelocities = new();
+    private readonly Dictionary<int, float> _sectorExtraLights = new();
     private Vertex[] _vertices = [];
     private uint _vao;
     private uint _vbo;
     private uint _ebo;
+    private bool _geometryDirty;
 
     /// <summary>
     /// Returns true when the surface is flagged as a horizon sky (0x200) or ceiling sky (0x400).
@@ -139,10 +143,17 @@ public sealed class LevelMeshRenderer : IDisposable
         public int SurfaceIndex { get; }
         public int SectorIndex { get; }
         public bool IsSky { get; }
+        public bool DoubleSided { get; }
+        public bool IsTranslucent { get; }
         public int VertexStart { get; }
         public int VertexCount { get; }
         public Vector2[] BaseTexCoords { get; }
         public float[] BaseIntensities { get; }
+        public float[] RawVertexIntensities { get; }
+        public int IndexStart { get; set; }
+        public int IndexCount { get; set; }
+        public uint[] BaseIndices { get; set; } = [];
+        public bool IsVisible { get; set; } = true;
         public Vector2 UvVelocity { get; set; }
         public Vector2 UvOffset { get; set; }
 
@@ -150,18 +161,24 @@ public sealed class LevelMeshRenderer : IDisposable
             int surfaceIndex,
             int sectorIndex,
             bool isSky,
+            bool doubleSided,
+            bool isTranslucent,
             int vertexStart,
             int vertexCount,
             Vector2[] baseTexCoords,
-            float[] baseIntensities)
+            float[] baseIntensities,
+            float[] rawVertexIntensities)
         {
             SurfaceIndex = surfaceIndex;
             SectorIndex = sectorIndex;
             IsSky = isSky;
+            DoubleSided = doubleSided;
+            IsTranslucent = isTranslucent;
             VertexStart = vertexStart;
             VertexCount = vertexCount;
             BaseTexCoords = baseTexCoords;
             BaseIntensities = baseIntensities;
+            RawVertexIntensities = rawVertexIntensities;
         }
     }
 
@@ -206,14 +223,16 @@ public sealed class LevelMeshRenderer : IDisposable
     public LevelMeshRenderer(GL gl, JklLevel level, TextureManager textureManager)
     {
         _gl = gl;
+        _level = level ?? throw new ArgumentNullException(nameof(level));
         _textureManager = textureManager;
-        BuildGeometry(level);
+        BuildGeometry(_level);
     }
 
     private unsafe void BuildGeometry(JklLevel level)
     {
         var vertices = new List<Vertex>();
         var indicesByBatch = new Dictionary<BatchKey, List<uint>>(BatchKeyComparer.Instance);
+        var slicesByBatch = new Dictionary<BatchKey, List<(SurfaceMeshSlice Slice, int LocalOffset)>>(BatchKeyComparer.Instance);
 
         // Map each surface to its parent sector so we can detect same-sector coplanar overlaps and apply sector extra light
         var surfaceToSector = new Dictionary<int, int>();
@@ -260,6 +279,7 @@ public sealed class LevelMeshRenderer : IDisposable
             {
                 indexList = new List<uint>();
                 indicesByBatch[batchKey] = indexList;
+                slicesByBatch[batchKey] = [];
             }
 
             // Compute bounds and check for coplanar overlapping non-portal overlays in the same sector
@@ -296,14 +316,15 @@ public sealed class LevelMeshRenderer : IDisposable
                 placedList.Add(new PlacedSurfaceBounds(surface.Normal, planeDist, minBounds, maxBounds));
             }
 
-            float sectorExtraLight = (sectorIdx >= 0 && sectorIdx < level.Sectors.Count)
-                ? level.Sectors[sectorIdx].ExtraLight
-                : 0.0f;
+            float sectorExtraLight = _sectorExtraLights.TryGetValue(sectorIdx, out float overrideSecLight)
+                ? overrideSecLight
+                : (sectorIdx >= 0 && sectorIdx < level.Sectors.Count ? level.Sectors[sectorIdx].ExtraLight : 0.0f);
 
             int vertexStart = vertices.Count;
             uint baseVertexIndex = (uint)vertexStart;
             var baseTexCoords = new Vector2[nverts];
             var baseIntensities = new float[nverts];
+            var rawVertexIntensities = new float[nverts];
 
             // Emit vertices for this polygon
             for (int i = 0; i < nverts; i++)
@@ -323,23 +344,54 @@ public sealed class LevelMeshRenderer : IDisposable
                 baseTexCoords[i] = uv;
 
                 float rawIntensity = (i < surface.VertexIntensities.Length) ? surface.VertexIntensities[i] : 1.0f;
+                rawVertexIntensities[i] = rawIntensity;
                 baseIntensities[i] = isSky ? 1.0f : rawIntensity + surface.ExtraLight;
 
                 float intensity = ComputeVertexIntensity(surface, i, sectorExtraLight);
                 vertices.Add(new Vertex(pos, surface.Normal, uv, intensity));
             }
 
+            int localIndexOffset = indexList.Count;
+            var triIndices = new List<uint>((nverts - 2) * 3);
+            // Fan triangulation: (0, i, i+1) for i = 1 .. nverts - 2
+            for (int i = 1; i < nverts - 1; i++)
+            {
+                uint a = baseVertexIndex + 0;
+                uint b = baseVertexIndex + (uint)i;
+                uint c = baseVertexIndex + (uint)(i + 1);
+                triIndices.Add(a);
+                triIndices.Add(b);
+                triIndices.Add(c);
+                indexList.Add(a);
+                indexList.Add(b);
+                indexList.Add(c);
+            }
+
             var slice = new SurfaceMeshSlice(
                 surface.SurfaceIndex,
                 sectorIdx,
                 isSky,
+                doubleSided,
+                isTranslucent,
                 vertexStart,
                 nverts,
                 baseTexCoords,
-                baseIntensities);
+                baseIntensities,
+                rawVertexIntensities)
+            {
+                IndexCount = triIndices.Count,
+                BaseIndices = triIndices.ToArray(),
+                IsVisible = true
+            };
             _surfaceSlices[surface.SurfaceIndex] = slice;
+            slicesByBatch[batchKey].Add((slice, localIndexOffset));
             if (isSky)
                 _skySlices.Add(slice);
+            if (_scrollVelocities.TryGetValue(surface.SurfaceIndex, out var scrollVel) && scrollVel != Vector2.Zero)
+            {
+                slice.UvVelocity = scrollVel;
+                _scrollingSlices.Add(slice);
+            }
             if (sectorIdx >= 0)
             {
                 if (!_sectorSlices.TryGetValue(sectorIdx, out var sectorList))
@@ -348,14 +400,6 @@ public sealed class LevelMeshRenderer : IDisposable
                     _sectorSlices[sectorIdx] = sectorList;
                 }
                 sectorList.Add(slice);
-            }
-
-            // Fan triangulation: (0, i, i+1) for i = 1 .. nverts - 2
-            for (int i = 1; i < nverts - 1; i++)
-            {
-                indexList.Add(baseVertexIndex + 0);
-                indexList.Add(baseVertexIndex + (uint)i);
-                indexList.Add(baseVertexIndex + (uint)(i + 1));
             }
         }
 
@@ -376,6 +420,10 @@ public sealed class LevelMeshRenderer : IDisposable
 
                         int start = allIndices.Count;
                         allIndices.AddRange(indexList);
+                        foreach (var (slice, localOffset) in slicesByBatch[key])
+                        {
+                            slice.IndexStart = start + localOffset;
+                        }
                         _batches.Add(new MaterialBatch(key.MaterialName, key.DoubleSided, key.IsTranslucent, key.IsSky, start, indexList.Count));
                     }
                 }
@@ -384,7 +432,7 @@ public sealed class LevelMeshRenderer : IDisposable
 
         _vertices = vertices.ToArray();
 
-        // Upload to GPU (DynamicDraw allows live UV scrolling and sector extra-light updates)
+        // Upload to GPU (DynamicDraw allows live UV scrolling, sector/surface light updates, and EBO surface toggles)
         _vao = _gl.GenVertexArray();
         _vbo = _gl.GenBuffer();
         _ebo = _gl.GenBuffer();
@@ -411,7 +459,7 @@ public sealed class LevelMeshRenderer : IDisposable
                 BufferTargetARB.ElementArrayBuffer,
                 (nuint)(allIndices.Count * sizeof(uint)),
                 iPtr,
-                BufferUsageARB.StaticDraw
+                BufferUsageARB.DynamicDraw
             );
         }
 
@@ -472,6 +520,7 @@ public sealed class LevelMeshRenderer : IDisposable
     /// </summary>
     public void SetSurfaceScroll(int surfaceIndex, Vector2 uvVelocity)
     {
+        _scrollVelocities[surfaceIndex] = uvVelocity;
         if (!_surfaceSlices.TryGetValue(surfaceIndex, out var slice))
             return;
 
@@ -499,10 +548,147 @@ public sealed class LevelMeshRenderer : IDisposable
     }
 
     /// <summary>
+    /// Dynamically toggles or updates a surface's geometry visibility mode (<c>SetFaceGeoMode</c>).
+    /// Uses an O(1) EBO slice toggle when the surface is already batched, or marks geometry for rebuild otherwise.
+    /// </summary>
+    public unsafe void SetSurfaceGeoMode(int surfaceIndex, int geoMode)
+    {
+        if (surfaceIndex < 0 || surfaceIndex >= _level.Surfaces.Count)
+            return;
+
+        var surface = _level.Surfaces[surfaceIndex];
+        surface.GeometryMode = geoMode;
+
+        if (!_surfaceSlices.TryGetValue(surfaceIndex, out var slice))
+        {
+            if (geoMode != 0 && surface.MaterialIndex >= 0 && surface.VertexIndices.Length >= 3)
+                _geometryDirty = true;
+            else if (surface.IsPortal)
+                _geometryDirty = true;
+            return;
+        }
+
+        bool visible = geoMode != 0;
+        if (!visible &&
+            surface.IsPortal &&
+            surface.MirrorSurface != null &&
+            surface.MirrorSurface.GeometryMode != 0 &&
+            surface.MirrorSurface.MaterialIndex >= 0)
+        {
+            _geometryDirty = true;
+            return;
+        }
+
+        if (visible &&
+            (slice.IsTranslucent != IsTranslucentSurface(surface) ||
+             slice.DoubleSided != IsDoubleSidedSurface(surface)))
+        {
+            _geometryDirty = true;
+            return;
+        }
+
+        if (_geometryDirty || slice.IndexCount <= 0)
+            return;
+
+        if (slice.IsVisible == visible)
+            return;
+
+        slice.IsVisible = visible;
+        _gl.BindVertexArray(_vao);
+        _gl.BindBuffer(BufferTargetARB.ElementArrayBuffer, _ebo);
+        if (visible)
+        {
+            fixed (uint* idxPtr = slice.BaseIndices)
+            {
+                _gl.BufferSubData(
+                    BufferTargetARB.ElementArrayBuffer,
+                    (nint)(slice.IndexStart * sizeof(uint)),
+                    (nuint)(slice.IndexCount * sizeof(uint)),
+                    idxPtr);
+            }
+        }
+        else
+        {
+            uint[] zeros = new uint[slice.IndexCount];
+            fixed (uint* zeroPtr = zeros)
+            {
+                _gl.BufferSubData(
+                    BufferTargetARB.ElementArrayBuffer,
+                    (nint)(slice.IndexStart * sizeof(uint)),
+                    (nuint)(slice.IndexCount * sizeof(uint)),
+                    zeroPtr);
+            }
+        }
+        _gl.BindVertexArray(0);
+    }
+
+    /// <summary>
+    /// Assigns a new material name to <paramref name="surfaceIndex"/> and schedules a GPU batch rebuild.
+    /// </summary>
+    public void SetSurfaceMaterial(int surfaceIndex, string materialName)
+    {
+        if (surfaceIndex < 0 || surfaceIndex >= _level.Surfaces.Count || string.IsNullOrWhiteSpace(materialName))
+            return;
+
+        int matIdx = -1;
+        for (int i = 0; i < _level.Materials.Count; i++)
+        {
+            if (string.Equals(_level.Materials[i], materialName, StringComparison.OrdinalIgnoreCase))
+            {
+                matIdx = i;
+                break;
+            }
+        }
+
+        if (matIdx < 0)
+        {
+            matIdx = _level.Materials.Count;
+            _level.Materials.Add(materialName);
+        }
+
+        _level.Surfaces[surfaceIndex].MaterialIndex = matIdx;
+        _geometryDirty = true;
+    }
+
+    /// <summary>
+    /// Updates dynamic extra lighting on a single surface (<c>SurfaceLightAnim</c>).
+    /// </summary>
+    public void SetSurfaceExtraLight(int surfaceIndex, float extraLight)
+    {
+        if (surfaceIndex < 0 || surfaceIndex >= _level.Surfaces.Count)
+            return;
+
+        var surface = _level.Surfaces[surfaceIndex];
+        surface.ExtraLight = extraLight;
+
+        if (!_surfaceSlices.TryGetValue(surfaceIndex, out var slice) || slice.IsSky)
+            return;
+
+        float sectorExtra = _sectorExtraLights.TryGetValue(slice.SectorIndex, out float secOv)
+            ? secOv
+            : (slice.SectorIndex >= 0 && slice.SectorIndex < _level.Sectors.Count ? _level.Sectors[slice.SectorIndex].ExtraLight : 0.0f);
+
+        _gl.BindBuffer(BufferTargetARB.ArrayBuffer, _vbo);
+        for (int i = 0; i < slice.VertexCount; i++)
+        {
+            int vIdx = slice.VertexStart + i;
+            var current = _vertices[vIdx];
+            slice.BaseIntensities[i] = slice.RawVertexIntensities[i] + extraLight;
+            float intensity = Math.Clamp(slice.BaseIntensities[i] + sectorExtra, 0.0f, 1.0f);
+            _vertices[vIdx] = new Vertex(current.Position, current.Normal, current.TexCoord, intensity);
+        }
+        UploadVertexRangeBound(slice.VertexStart, slice.VertexCount);
+        _gl.BindBuffer(BufferTargetARB.ArrayBuffer, 0);
+    }
+
+    /// <summary>
     /// Advances active UV scrolling animations and uploads updated vertex slices to the GPU.
     /// </summary>
     public void Update(float dt)
     {
+        if (_geometryDirty)
+            RebuildGeometry();
+
         if (dt <= 0.0f || _scrollingSlices.Count == 0)
             return;
 
@@ -531,6 +717,7 @@ public sealed class LevelMeshRenderer : IDisposable
     /// </summary>
     public void SetSectorExtraLight(int sectorIndex, float extraLight)
     {
+        _sectorExtraLights[sectorIndex] = extraLight;
         if (!_sectorSlices.TryGetValue(sectorIndex, out var slices) || slices.Count == 0)
             return;
 
@@ -552,6 +739,22 @@ public sealed class LevelMeshRenderer : IDisposable
         _gl.BindBuffer(BufferTargetARB.ArrayBuffer, 0);
     }
 
+    private void RebuildGeometry()
+    {
+        _geometryDirty = false;
+        if (_vbo != 0) _gl.DeleteBuffer(_vbo);
+        if (_ebo != 0) _gl.DeleteBuffer(_ebo);
+        if (_vao != 0) _gl.DeleteVertexArray(_vao);
+
+        _batches.Clear();
+        _surfaceSlices.Clear();
+        _sectorSlices.Clear();
+        _skySlices.Clear();
+        _scrollingSlices.Clear();
+
+        BuildGeometry(_level);
+    }
+
     private unsafe void UploadVertexRangeBound(int vertexStart, int vertexCount)
     {
         if (vertexCount <= 0)
@@ -569,6 +772,9 @@ public sealed class LevelMeshRenderer : IDisposable
 
     public void Render(ShaderProgram shader)
     {
+        if (_geometryDirty)
+            RebuildGeometry();
+
         _gl.BindVertexArray(_vao);
 
         // Enable backface culling for inward-facing sector walls/ceilings/floors so

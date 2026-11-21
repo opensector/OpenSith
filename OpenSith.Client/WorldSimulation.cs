@@ -3,7 +3,10 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Numerics;
 using OpenSith.Core.AI;
+using OpenSith.Core.Animation;
+using OpenSith.Core.Audio;
 using OpenSith.Core.Cog;
+using OpenSith.Core.Data;
 using OpenSith.Core.Models;
 using OpenSith.Core.Physics;
 using OpenSith.Core.Vfs;
@@ -15,12 +18,15 @@ namespace OpenSith.Client;
 /// Live world simulation controller bridging COG script execution (<see cref="CogVm"/>),
 /// frame-based doors/elevators, sector adjoin visibility/collision, and NPC <see cref="AiBrain"/> updates.
 /// </summary>
-public sealed class WorldSimulation : ICogWorldContext
+public sealed partial class WorldSimulation : ICogWorldContext
 {
     private readonly JklLevel _level;
     private readonly IVirtualFileSystem _vfs;
     private readonly CogVm _cogVm;
     private readonly Random _random = new();
+    private readonly UniStringTable _strings;
+    private readonly IReadOnlyDictionary<int, ItemDefinition> _itemDefinitions;
+    private readonly Dictionary<int, int> _surfaceToSector;
 
     private readonly Dictionary<string, CogScript?> _scriptCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<int, List<CogInstance>> _thingToCogs = new();
@@ -41,8 +47,10 @@ public sealed class WorldSimulation : ICogWorldContext
     private readonly Dictionary<int, NpcRuntime> _npcs = new();
     private readonly List<AiSoundEvent> _soundEvents = [];
     private readonly List<Projectile> _projectiles = [];
-    private readonly HashSet<string> _activeLoopingSounds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _activeLoopingSounds = new(StringComparer.OrdinalIgnoreCase);
+    private int _nextHeadlessSoundChannel = 1;
     private readonly AudioEngine? _audio;
+    private bool _startupRun;
 
     private readonly int _localPlayerThingIndex;
     private int _prevPlayerSector = -1;
@@ -72,7 +80,6 @@ public sealed class WorldSimulation : ICogWorldContext
     private Vector3 _lastPlayerAimDir = Vector3.UnitY;
     private bool _hasLastPlayerAimDir;
     private readonly Dictionary<int, int> _surfaceCels = new();
-    private readonly Dictionary<int, (float Fps, int Flags)> _surfaceAnims = new();
     private readonly Dictionary<int, Vector3> _sectorThrusts = new();
     private readonly HashSet<int> _touchedCapturedThings = [];
     private readonly HashSet<int> _sightedThings = [];
@@ -158,10 +165,15 @@ public sealed class WorldSimulation : ICogWorldContext
         public int CurrentFrame;
         public int TargetFrame;
         public bool IsMoving;
+        public bool IsPaused;
+        public bool IsPivotRotation;
         public Vector3 StartPos;
         public Vector3 TargetPos;
         public Vector3 StartPyr;
         public Vector3 TargetPyr;
+        public Vector3 PivotWorldPos;
+        public Vector3 StartOffsetFromPivot;
+        public Vector3 TargetDeltaPyr;
         public float Elapsed;
         public float Duration;
         public float LastDeltaZ;
@@ -196,6 +208,8 @@ public sealed class WorldSimulation : ICogWorldContext
         public Vector3 Velocity;
         public bool IsAirborne;
         public Vector3? OverrideMovePos;
+        public int? OverrideMoveThingId;
+        public int? OverrideFireTargetId;
         public Vector3? OverrideLookPos;
         public float OverrideLookTimer;
     }
@@ -207,12 +221,15 @@ public sealed class WorldSimulation : ICogWorldContext
     private readonly List<ImpactSpark> _sparks = [];
     public IReadOnlyList<ImpactSpark> Sparks => _sparks;
 
-    public WorldSimulation(JklLevel level, IVirtualFileSystem vfs, AudioEngine? audio = null, int difficulty = 1)
+    public WorldSimulation(JklLevel level, IVirtualFileSystem vfs, AudioEngine? audio = null, int difficulty = 1, bool runStartupCogs = true)
     {
         _level = level ?? throw new ArgumentNullException(nameof(level));
         _vfs = vfs ?? throw new ArgumentNullException(nameof(vfs));
         _audio = audio;
         Difficulty = Math.Clamp(difficulty, 0, 2);
+        _strings = UniStringTable.LoadFromVfs(_vfs);
+        _itemDefinitions = LoadItemDefinitions(_vfs);
+        _surfaceToSector = BuildSurfaceToSectorMap(_level);
         _cogVm = new CogVm(this);
 
         var spawn = _level.GetPlayerSpawn();
@@ -233,7 +250,41 @@ public sealed class WorldSimulation : ICogWorldContext
         ParseThingFrames();
         LoadLevelCogs();
         LoadNpcs();
+        if (runStartupCogs)
+            StartLevel();
+    }
+
+    /// <summary>
+    /// Dispatches the <c>startup</c> message to all loaded level COGs once (idempotent).
+    /// Useful when constructing <see cref="WorldSimulation"/> with <c>runStartupCogs: false</c>
+    /// so event listeners and player state can be wired before <c>startup:</c> executes.
+    /// </summary>
+    public void StartLevel()
+    {
+        if (_startupRun)
+            return;
+
+        _startupRun = true;
         RunStartupCogs();
+    }
+
+    /// <summary>
+    /// Read-only inspection helper that retrieves a symbol's runtime <see cref="CogValue"/>
+    /// from the first loaded COG instance matching <paramref name="scriptName"/>.
+    /// </summary>
+    public bool TryGetCogSymbolValue(string scriptName, string symbolName, out CogValue value)
+    {
+        foreach (var inst in _cogVm.Instances)
+        {
+            if (string.Equals(inst.Script.Name, scriptName, StringComparison.OrdinalIgnoreCase))
+            {
+                value = inst.GetSymbolValue(symbolName);
+                return value.Type != CogValueType.Null || inst.SymbolSlots.ContainsKey(symbolName);
+            }
+        }
+
+        value = CogValue.Null;
+        return false;
     }
 
     private void InitializeGeoModes()
@@ -444,7 +495,7 @@ public sealed class WorldSimulation : ICogWorldContext
 
     private void RunStartupCogs()
     {
-        foreach (var instance in _cogVm.Instances)
+        foreach (var instance in _cogVm.Instances.ToArray())
         {
             if (!instance.Program.Labels.ContainsKey("startup"))
                 continue;
@@ -641,6 +692,8 @@ public sealed class WorldSimulation : ICogWorldContext
         }
 
         UpdateLifeleftTimers(dt);
+        UpdateThingTimersAndPulses(dt);
+        UpdateThingRotVels(dt);
         Inventory.UpdateForceMana(dt);
         UpdateThingVelocities(dt);
 
@@ -669,6 +722,8 @@ public sealed class WorldSimulation : ICogWorldContext
         UpdateNpcs(dt, playerPos);
         UpdateProjectiles(dt, playerPos);
         UpdateSparks(dt);
+        UpdateLightAnimations(dt);
+        UpdateScreenColorEffects(dt);
         _soundEvents.Clear();
 
         if (!IsPlayerFrozen && _sectorThrusts.TryGetValue(playerSector, out var playerThrust) && playerThrust.LengthSquared() > 1e-6f)
@@ -923,7 +978,7 @@ public sealed class WorldSimulation : ICogWorldContext
                     continue;
 
                 _pickupCogs[thing.ThingIndex] = cog;
-                SafeSendMessage(cog, "touched", senderRef: thing.ThingIndex, senderId: 0, sourceRef: _localPlayerThingIndex);
+                SafeSendMessage(cog, "touched", senderRef: thing.ThingIndex, senderId: 0, sourceRef: _localPlayerThingIndex, senderType: 3);
                 continue;
             }
 
@@ -946,7 +1001,7 @@ public sealed class WorldSimulation : ICogWorldContext
                     continue;
 
                 int symLinkId = GetSymbolLinkId(cog, CogSymbolType.Thing, thing.ThingIndex);
-                SafeSendMessage(cog, "touched", senderRef: thing.ThingIndex, senderId: symLinkId, sourceRef: _localPlayerThingIndex);
+                SafeSendMessage(cog, "touched", senderRef: thing.ThingIndex, senderId: symLinkId, sourceRef: _localPlayerThingIndex, senderType: 3);
             }
         }
     }
@@ -1024,7 +1079,7 @@ public sealed class WorldSimulation : ICogWorldContext
                     continue;
 
                 int linkId = GetSymbolLinkId(cog, CogSymbolType.Thing, thingId);
-                SafeSendMessage(cog, "sighted", senderRef: thingId, senderId: linkId, sourceRef: _localPlayerThingIndex);
+                SafeSendMessage(cog, "sighted", senderRef: thingId, senderId: linkId, sourceRef: _localPlayerThingIndex, senderType: 3);
             }
         }
     }
@@ -1105,7 +1160,8 @@ public sealed class WorldSimulation : ICogWorldContext
             {
                 if (cog.Program.Labels.ContainsKey("touched"))
                 {
-                    SafeSendMessage(cog, "touched", senderRef: surface.SurfaceIndex, senderId: -1, sourceRef: _localPlayerThingIndex);
+                    int symLinkId = GetSymbolLinkId(cog, CogSymbolType.Surface, surface.SurfaceIndex);
+                    SafeSendMessage(cog, "touched", senderRef: surface.SurfaceIndex, senderId: symLinkId, sourceRef: _localPlayerThingIndex, senderType: 6);
                 }
             }
         }
@@ -1118,6 +1174,8 @@ public sealed class WorldSimulation : ICogWorldContext
 
         int prevSector = _prevPlayerSector;
         _prevPlayerSector = curSector;
+
+        UpdateSectorAmbientSound(curSector);
 
         if (prevSector >= 0 && prevSector < _level.Sectors.Count && curSector >= 0 && curSector < _level.Sectors.Count)
         {
@@ -1133,13 +1191,26 @@ public sealed class WorldSimulation : ICogWorldContext
             }
         }
 
+        if (prevSector >= 0 && _sectorToCogs.TryGetValue(prevSector, out var prevSectorCogs))
+        {
+            foreach (var cog in prevSectorCogs)
+            {
+                if (cog.Program.Labels.ContainsKey("exited"))
+                {
+                    int symLinkId = GetSymbolLinkId(cog, CogSymbolType.Sector, prevSector);
+                    SafeSendMessage(cog, "exited", senderRef: prevSector, senderId: symLinkId, sourceRef: _localPlayerThingIndex, senderType: 5);
+                }
+            }
+        }
+
         if (curSector >= 0 && _sectorToCogs.TryGetValue(curSector, out var sectorCogs))
         {
             foreach (var cog in sectorCogs)
             {
                 if (cog.Program.Labels.ContainsKey("entered"))
                 {
-                    SafeSendMessage(cog, "entered", senderRef: curSector, senderId: -1, sourceRef: _localPlayerThingIndex);
+                    int symLinkId = GetSymbolLinkId(cog, CogSymbolType.Sector, curSector);
+                    SafeSendMessage(cog, "entered", senderRef: curSector, senderId: symLinkId, sourceRef: _localPlayerThingIndex, senderType: 5);
                 }
             }
         }
@@ -1152,14 +1223,15 @@ public sealed class WorldSimulation : ICogWorldContext
 
         foreach (var cog in cogs)
         {
+            int symLinkId = GetSymbolLinkId(cog, CogSymbolType.Surface, surfaceIndex);
             if (cog.Program.Labels.ContainsKey("crossed"))
             {
-                SafeSendMessage(cog, "crossed", senderRef: surfaceIndex, senderId: -1, sourceRef: _localPlayerThingIndex);
+                SafeSendMessage(cog, "crossed", senderRef: surfaceIndex, senderId: symLinkId, sourceRef: _localPlayerThingIndex, senderType: 6);
             }
 
             if (cog.Program.Labels.ContainsKey("entered"))
             {
-                SafeSendMessage(cog, "entered", senderRef: surfaceIndex, senderId: -1, sourceRef: _localPlayerThingIndex);
+                SafeSendMessage(cog, "entered", senderRef: surfaceIndex, senderId: symLinkId, sourceRef: _localPlayerThingIndex, senderType: 6);
             }
         }
     }
@@ -1171,14 +1243,15 @@ public sealed class WorldSimulation : ICogWorldContext
         foreach (var (thingId, motion) in _thingMotions)
         {
             motion.LastDeltaZ = 0f;
-            if (!motion.IsMoving || thingId < 0 || thingId >= _level.Things.Count)
+            if (!motion.IsMoving || motion.IsPaused || thingId < 0 || thingId >= _level.Things.Count)
                 continue;
 
             var thing = _level.Things[thingId];
             Vector3 prevPos = thing.Position;
+            Vector3 prevPyr = thing.PitchYawRoll;
 
             // Check if a closing door (moving toward frame 0) is blocked by the player inside its sector
-            if (motion.TargetFrame == 0 && playerSector == thing.SectorIndex &&
+            if (!motion.IsPivotRotation && motion.TargetFrame == 0 && playerSector == thing.SectorIndex &&
                 Vector3.DistanceSquared(playerPos, thing.Position) < 0.09f)
             {
                 if (_thingToCogs.TryGetValue(thingId, out var doorCogs))
@@ -1187,7 +1260,7 @@ public sealed class WorldSimulation : ICogWorldContext
                     {
                         if (cog.Program.Labels.ContainsKey("blocked"))
                         {
-                            SafeSendMessage(cog, "blocked", thingId);
+                            SafeSendMessage(cog, "blocked", thingId, senderType: 3);
                         }
                     }
                 }
@@ -1195,16 +1268,51 @@ public sealed class WorldSimulation : ICogWorldContext
 
             motion.Elapsed += dt;
             float t = motion.Duration > 1e-5f ? Math.Clamp(motion.Elapsed / motion.Duration, 0f, 1f) : 1f;
+            SithMatrix34 prevRotMat = SithMatrix34.Build34(prevPyr, Vector3.Zero);
 
-            thing.Position = Vector3.Lerp(motion.StartPos, motion.TargetPos, t);
-            thing.PitchYawRoll = new Vector3(
-                LerpAngleDegrees(motion.StartPyr.X, motion.TargetPyr.X, t),
-                LerpAngleDegrees(motion.StartPyr.Y, motion.TargetPyr.Y, t),
-                LerpAngleDegrees(motion.StartPyr.Z, motion.TargetPyr.Z, t)
-            );
+            if (motion.IsPivotRotation)
+            {
+                Vector3 curAngleDelta = motion.TargetDeltaPyr * t;
+                SithMatrix34 deltaRot = SithMatrix34.Build34(curAngleDelta, Vector3.Zero);
+                SithMatrix34 startRot = SithMatrix34.Build34(motion.StartPyr, Vector3.Zero);
+                SithMatrix34 curRot = SithMatrix34.Multiply(deltaRot, startRot);
+                thing.Position = motion.PivotWorldPos + deltaRot.TransformNormal(motion.StartOffsetFromPivot);
+                thing.PitchYawRoll = SithMatrix34.ExtractPyr(curRot);
+            }
+            else
+            {
+                thing.Position = Vector3.Lerp(motion.StartPos, motion.TargetPos, t);
+                thing.PitchYawRoll = new Vector3(
+                    LerpAngleDegrees(motion.StartPyr.X, motion.TargetPyr.X, t),
+                    LerpAngleDegrees(motion.StartPyr.Y, motion.TargetPyr.Y, t),
+                    LerpAngleDegrees(motion.StartPyr.Z, motion.TargetPyr.Z, t)
+                );
+            }
+
+            if (t >= 1f)
+            {
+                if (!motion.IsPivotRotation)
+                {
+                    thing.Position = motion.TargetPos;
+                    thing.PitchYawRoll = motion.TargetPyr;
+                }
+                else
+                {
+                    SithMatrix34 finalDeltaRot = SithMatrix34.Build34(motion.TargetDeltaPyr, Vector3.Zero);
+                    SithMatrix34 startRot = SithMatrix34.Build34(motion.StartPyr, Vector3.Zero);
+                    SithMatrix34 finalRot = SithMatrix34.Multiply(finalDeltaRot, startRot);
+                    thing.Position = motion.PivotWorldPos + finalDeltaRot.TransformNormal(motion.StartOffsetFromPivot);
+                    thing.PitchYawRoll = SithMatrix34.ExtractPyr(finalRot);
+                }
+            }
 
             Vector3 stepDelta = thing.Position - prevPos;
+            SithMatrix34 curRotMat = SithMatrix34.Build34(thing.PitchYawRoll, Vector3.Zero);
+            SithMatrix34 stepRotMat = SithMatrix34.Multiply(curRotMat, prevRotMat.TransposeRotation());
+            bool hasRotDelta = Vector3.DistanceSquared(prevPyr, thing.PitchYawRoll) > 1e-8f;
             motion.LastDeltaZ = stepDelta.Z;
+
+            PropagateAttachedChildren(thingId, prevPos, thing.Position, stepDelta, stepRotMat, hasRotDelta);
 
             // Carry the player and any NPCs standing on a moving elevator/platform
             bool isElevatorOrPlatform =
@@ -1251,10 +1359,9 @@ public sealed class WorldSimulation : ICogWorldContext
 
             if (t >= 1f)
             {
-                thing.Position = motion.TargetPos;
-                thing.PitchYawRoll = motion.TargetPyr;
                 motion.CurrentFrame = motion.TargetFrame;
                 motion.IsMoving = false;
+                motion.IsPivotRotation = false;
 
                 if (_thingToCogs.TryGetValue(thingId, out var cogs))
                 {
@@ -1262,7 +1369,8 @@ public sealed class WorldSimulation : ICogWorldContext
                     {
                         if (cog.Program.Labels.ContainsKey("arrived"))
                         {
-                            SafeSendMessage(cog, "arrived", thingId);
+                            int linkId = GetSymbolLinkId(cog, CogSymbolType.Thing, thingId);
+                            SafeSendMessage(cog, "arrived", senderRef: thingId, senderId: linkId, sourceRef: thingId, senderType: 3);
                         }
                     }
                 }
@@ -1329,7 +1437,24 @@ public sealed class WorldSimulation : ICogWorldContext
             bool isHostile = npc.Brain.Class.HasInstinct("PrimaryFire")
                 || npc.Brain.Class.HasInstinct("SaberFighting")
                 || npc.Brain.Class.HasInstinct("LookForTarget")
-                || npc.WasDamagedThisTick;
+                || npc.WasDamagedThisTick
+                || npc.OverrideFireTargetId.HasValue;
+            IReadOnlyList<AiTargetCandidate> targets = playerTargetList;
+            if (npc.OverrideFireTargetId is int fireTargetId &&
+                fireTargetId >= 0 &&
+                fireTargetId < _level.Things.Count &&
+                fireTargetId != _localPlayerThingIndex &&
+                !_destroyedThings.Contains(fireTargetId))
+            {
+                bool targetAlive = !_npcs.TryGetValue(fireTargetId, out var tNpc) || tNpc.IsAlive;
+                targets = new[]
+                {
+                    new AiTargetCandidate(fireTargetId, _level.Things[fireTargetId].Position, alignment: 1.0f, isAlive: targetAlive, isVisible: true)
+                };
+                npc.Brain.TargetThingIndex = fireTargetId;
+                npc.Brain.LastKnownTargetPosition = _level.Things[fireTargetId].Position;
+                npc.Brain.Mode |= AiMode.Active | AiMode.TargetVisible;
+            }
             var aiContext = new AiWorldContext
             {
                 SelfPosition = npc.Thing.Position,
@@ -1339,7 +1464,7 @@ public sealed class WorldSimulation : ICogWorldContext
                 WasDamaged = npc.WasDamagedThisTick,
                 DamagedByThingIndex = npc.WasDamagedThisTick ? _localPlayerThingIndex : null,
                 DamageSourcePosition = npc.LastDamageSourcePos,
-                Targets = isHostile ? playerTargetList : Array.Empty<AiTargetCandidate>(),
+                Targets = isHostile ? targets : Array.Empty<AiTargetCandidate>(),
                 Sounds = _soundEvents,
                 LineOfSightCheck = HasNpcLineOfSight
             };
@@ -1368,12 +1493,21 @@ public sealed class WorldSimulation : ICogWorldContext
             {
                 Vector3 moveDir = Vector3.Zero;
                 float speedScale = decision.ShouldFlee ? 1.25f : 1.0f;
+                if (npc.OverrideMoveThingId is int moveThingId &&
+                    moveThingId >= 0 &&
+                    moveThingId < _level.Things.Count &&
+                    !_destroyedThings.Contains(moveThingId))
+                {
+                    npc.OverrideMovePos = _level.Things[moveThingId].Position;
+                }
+
                 if (npc.OverrideMovePos is Vector3 overrideMove)
                 {
                     Vector3 toOverride = new(overrideMove.X - npc.Thing.Position.X, overrideMove.Y - npc.Thing.Position.Y, 0f);
                     if (toOverride.LengthSquared() <= 0.12f * 0.12f)
                     {
                         npc.OverrideMovePos = null;
+                        npc.OverrideMoveThingId = null;
                     }
                     else
                     {
@@ -2348,20 +2482,23 @@ public sealed class WorldSimulation : ICogWorldContext
 
         if (bestSurface != null && bestSurfaceCog != null)
         {
-            SafeSendMessage(bestSurfaceCog, "activate", senderRef: bestSurface.SurfaceIndex, senderId: -1, sourceRef: _localPlayerThingIndex);
+            int linkId = GetSymbolLinkId(bestSurfaceCog, CogSymbolType.Surface, bestSurface.SurfaceIndex);
+            SafeSendMessage(bestSurfaceCog, "activate", senderRef: bestSurface.SurfaceIndex, senderId: linkId, sourceRef: _localPlayerThingIndex, senderType: 6);
             return true;
         }
 
         if (bestThing != null && bestThingCog != null)
         {
-            SafeSendMessage(bestThingCog, "activate", senderRef: bestThing.ThingIndex, senderId: -1, sourceRef: _localPlayerThingIndex);
+            int linkId = GetSymbolLinkId(bestThingCog, CogSymbolType.Thing, bestThing.ThingIndex);
+            SafeSendMessage(bestThingCog, "activate", senderRef: bestThing.ThingIndex, senderId: linkId, sourceRef: _localPlayerThingIndex, senderType: 3);
             return true;
         }
 
         // 3. Fallback for recessed floor-level wall switches (e.g., 0.05m niches below eye height)
         if (TryFindNearbySwitchSurface(playerPos, dir, sithSurfaceCogLinked, out var nearbySurface, out var nearbyCog))
         {
-            SafeSendMessage(nearbyCog!, "activate", senderRef: nearbySurface!.SurfaceIndex, senderId: -1, sourceRef: _localPlayerThingIndex);
+            int linkId = GetSymbolLinkId(nearbyCog!, CogSymbolType.Surface, nearbySurface!.SurfaceIndex);
+            SafeSendMessage(nearbyCog!, "activate", senderRef: nearbySurface!.SurfaceIndex, senderId: linkId, sourceRef: _localPlayerThingIndex, senderType: 6);
             return true;
         }
 
@@ -3007,7 +3144,8 @@ public sealed class WorldSimulation : ICogWorldContext
                 senderRef: surfaceIndex,
                 senderId: symLinkId,
                 sourceRef: _localPlayerThingIndex,
-                parameters);
+                senderType: 6,
+                parameters: parameters);
         }
     }
 
@@ -3124,7 +3262,8 @@ public sealed class WorldSimulation : ICogWorldContext
                     senderRef: thingId,
                     senderId: symLinkId,
                     sourceRef: _localPlayerThingIndex,
-                    currentParams);
+                    senderType: 3,
+                    parameters: currentParams);
 
                 if (ret.Type is CogValueType.Int or CogValueType.Float)
                 {
@@ -3152,7 +3291,8 @@ public sealed class WorldSimulation : ICogWorldContext
                             senderRef: thingId,
                             senderId: 0,
                             sourceRef: _localPlayerThingIndex,
-                            currentParams);
+                            senderType: 3,
+                            parameters: currentParams);
 
                         if (ret.Type is CogValueType.Int or CogValueType.Float)
                             lastReturn = ret;
@@ -3197,11 +3337,11 @@ public sealed class WorldSimulation : ICogWorldContext
     /// </summary>
     public void ApplyThingAnimationState(ThingMeshRenderer renderer) => SyncThingAnimations(renderer);
 
-    private void SafeSendMessage(CogInstance instance, string message, int senderRef = -1)
+    private void SafeSendMessage(CogInstance instance, string message, int senderRef = -1, int senderType = -1)
     {
         try
         {
-            _cogVm.SendMessage(instance, message, senderRef);
+            _cogVm.SendMessage(instance, message, senderRef, -1, -1, senderType, Array.Empty<CogValue>());
         }
         catch (Exception ex)
         {
@@ -3221,11 +3361,11 @@ public sealed class WorldSimulation : ICogWorldContext
         }
     }
 
-    private void SafeSendMessage(CogInstance instance, string message, int senderRef, int senderId, int sourceRef)
+    private void SafeSendMessage(CogInstance instance, string message, int senderRef, int senderId, int sourceRef, int senderType = -1)
     {
         try
         {
-            _cogVm.SendMessage(instance, message, senderRef, senderId, sourceRef);
+            _cogVm.SendMessage(instance, message, senderRef, senderId, sourceRef, senderType, Array.Empty<CogValue>());
         }
         catch (Exception ex)
         {
@@ -3239,11 +3379,12 @@ public sealed class WorldSimulation : ICogWorldContext
         int senderRef,
         int senderId,
         int sourceRef,
+        int senderType = -1,
         params CogValue[]? parameters)
     {
         try
         {
-            return _cogVm.SendMessage(instance, message, senderRef, senderId, sourceRef, parameters);
+            return _cogVm.SendMessage(instance, message, senderRef, senderId, sourceRef, senderType, parameters);
         }
         catch (Exception ex)
         {
@@ -3306,6 +3447,8 @@ public sealed class WorldSimulation : ICogWorldContext
         motion.TargetPyr = target.PitchYawRoll;
         motion.TargetFrame = frame;
         motion.Elapsed = 0f;
+        motion.IsPaused = false;
+        motion.IsPivotRotation = false;
 
         float posDist = Vector3.Distance(motion.StartPos, motion.TargetPos);
         float angleDist = MathF.Max(
@@ -3402,22 +3545,29 @@ public sealed class WorldSimulation : ICogWorldContext
 
     public int PlaySoundThing(string sound, int thingId, float volume, float minRad, float maxRad, int flags)
     {
-        if (string.IsNullOrWhiteSpace(sound) || _audio == null)
-            return 1;
+        if (string.IsNullOrWhiteSpace(sound))
+            return 0;
 
         bool looping = (flags & 0x01) != 0;
-        if (looping)
+        string loopKey = looping ? $"{thingId}:{sound}" : string.Empty;
+        if (looping && _activeLoopingSounds.TryGetValue(loopKey, out int existingChannel))
+            return existingChannel;
+
+        if (_audio == null || !_audio.IsAvailable)
         {
-            string loopKey = $"{thingId}:{sound}";
-            if (!_activeLoopingSounds.Add(loopKey))
-                return 1;
+            int synthetic = _nextHeadlessSoundChannel++;
+            if (looping)
+                _activeLoopingSounds[loopKey] = synthetic;
+            return synthetic;
         }
 
         Vector3 pos = GetThingPos(thingId);
         float minR = minRad > 0f ? minRad : 0.5f;
         float maxR = maxRad > minR ? maxRad : 8.0f;
-        _audio.PlaySoundPos(sound, pos, volume, minR, maxR, looping);
-        return 1;
+        int channel = _audio.PlaySoundPos(sound, pos, volume, minR, maxR, looping);
+        if (looping && channel > 0)
+            _activeLoopingSounds[loopKey] = channel;
+        return channel;
     }
 
     public void PlaySoundLocal(string sound, float volume = 1.0f)
@@ -3432,16 +3582,26 @@ public sealed class WorldSimulation : ICogWorldContext
 
     public int PlaySoundLocal(string sound, float volume, float pan, int flags)
     {
-        _audio?.PlaySoundLocal(sound, volume, (flags & 0x01) != 0);
-        return 1;
+        if (string.IsNullOrWhiteSpace(sound))
+            return 0;
+
+        if (_audio == null || !_audio.IsAvailable)
+            return _nextHeadlessSoundChannel++;
+
+        return _audio.PlaySoundLocal(sound, volume, (flags & 0x01) != 0);
     }
 
     public int PlaySoundPos(string sound, Vector3 pos, float volume, float minRad, float maxRad, int flags)
     {
+        if (string.IsNullOrWhiteSpace(sound))
+            return 0;
+
+        if (_audio == null || !_audio.IsAvailable)
+            return _nextHeadlessSoundChannel++;
+
         float minR = minRad > 0f ? minRad : 0.5f;
         float maxR = maxRad > minR ? maxRad : 8.0f;
-        _audio?.PlaySoundPos(sound, pos, volume, minR, maxR, (flags & 0x01) != 0);
-        return 1;
+        return _audio.PlaySoundPos(sound, pos, volume, minR, maxR, (flags & 0x01) != 0);
     }
 
     public int SendMessage(int cogId, string message)
@@ -3845,7 +4005,7 @@ public sealed class WorldSimulation : ICogWorldContext
 
         if (cog != null && cog.Program.Labels.ContainsKey("taken"))
         {
-            SafeSendMessage(cog, "taken", senderRef: itemThingId, senderId: 0, sourceRef: playerThingId);
+            SafeSendMessage(cog, "taken", senderRef: itemThingId, senderId: 0, sourceRef: playerThingId, senderType: 3);
         }
     }
 
@@ -3910,21 +4070,6 @@ public sealed class WorldSimulation : ICogWorldContext
 
     public bool IsJointAmputated(int thingId, int jointIdx) =>
         _amputatedJoints.TryGetValue(thingId, out var joints) && joints.Contains(jointIdx);
-
-    public void AttachThingToThingEx(int thingId, int attachToThingId, int attachFlags)
-    {
-        if (thingId >= 0 && thingId < _level.Things.Count && attachToThingId >= 0 && attachToThingId < _level.Things.Count)
-            _thingParents[thingId] = attachToThingId;
-    }
-
-    public void DetachThing(int thingId) => _thingParents.Remove(thingId);
-
-    public int GetThingParent(int thingId) => _thingParents.GetValueOrDefault(thingId, -1);
-
-    public void StopSound(int channel, float fadeOut)
-    {
-        // Channel-level stop/fade hook for COG scripts
-    }
 
     public void ThingLight(int thingId, float light, float fadeTime) => _thingLights[thingId] = light;
 
@@ -4072,17 +4217,6 @@ public sealed class WorldSimulation : ICogWorldContext
         OnSurfaceScroll?.Invoke(surfaceId, new Vector2(dir.X, dir.Y), speed);
     }
 
-    public int SurfaceAnim(int surfaceId, float fps, int flags)
-    {
-        if (surfaceId < 0 || surfaceId >= _level.Surfaces.Count)
-            return 0;
-
-        _surfaceAnims[surfaceId] = (fps, flags);
-        return _surfaceAnims.Count;
-    }
-
-    public void StopSurfaceAnim(int surfaceId) => _surfaceAnims.Remove(surfaceId);
-
     public Vector3 SurfaceCenter(int surfaceId)
     {
         if (surfaceId >= 0 && surfaceId < _level.Surfaces.Count)
@@ -4216,25 +4350,32 @@ public sealed class WorldSimulation : ICogWorldContext
 
     public void JkPrintUniString(int player, int strId)
     {
-        StatusMessage = strId switch
+        if (_strings.TryGetCogString(strId, out string localized))
         {
-            2 => "BRYAR PISTOL",
-            3 => "STORMTROOPER RIFLE",
-            4 => "THERMAL DETONATORS",
-            10 => "LIGHTSABER",
-            11 => "ENERGY CELL",
-            12 => "POWER CELL",
-            13 => "BATTERY",
-            40 => "BACTA TANK",
-            41 => "IR GOGGLES",
-            60 => "SHIELD RECHARGE",
-            201 => "HEALTH PACK",
-            207 => "ARMOR VEST",
-            209 => "SMUGGLER BACKPACK",
-            350 => "OBJECTIVE COMPLETED",
-            360 => "SECRET AREA FOUND!",
-            _ => $"COG MSG {strId}"
-        };
+            StatusMessage = localized;
+        }
+        else
+        {
+            StatusMessage = strId switch
+            {
+                2 => "BRYAR PISTOL",
+                3 => "STORMTROOPER RIFLE",
+                4 => "THERMAL DETONATORS",
+                10 => "LIGHTSABER",
+                11 => "ENERGY CELL",
+                12 => "POWER CELL",
+                13 => "BATTERY",
+                40 => "BACTA TANK",
+                41 => "IR GOGGLES",
+                60 => "SHIELD RECHARGE",
+                201 => "HEALTH PACK",
+                207 => "ARMOR VEST",
+                209 => "SMUGGLER BACKPACK",
+                350 => "OBJECTIVE COMPLETED",
+                360 => "SECRET AREA FOUND!",
+                _ => $"COG MSG {strId}"
+            };
+        }
         _statusTimer = 3.5f;
         Console.WriteLine($"[HUD] {StatusMessage}");
     }

@@ -208,12 +208,16 @@ public sealed class CogInstance
             case CogSymbolType.Sector:
             case CogSymbolType.Surface:
             case CogSymbolType.Cog:
-            case CogSymbolType.Template:
                 if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out int i))
                     return new CogValue(i);
                 if (float.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out float fi))
                     return new CogValue((int)fi);
                 return new CogValue(-1);
+
+            case CogSymbolType.Template:
+                if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out int tplId) && tplId == -1)
+                    return new CogValue(-1);
+                return new CogValue(raw);
 
             case CogSymbolType.Vector:
                 string vStr = raw.Trim('(', ')', '\'', '"');
