@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Numerics;
 using OpenSith.Client;
+using OpenSith.Core.Simulation;
 using OpenSith.Core.Vfs;
 using OpenSith.Core.World;
 using Xunit;

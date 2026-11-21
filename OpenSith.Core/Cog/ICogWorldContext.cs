@@ -249,8 +249,19 @@ public interface ICogWorldContext
     string LoadSound(string soundName) => soundName ?? string.Empty;
     string LoadTemplate(string templateName) => templateName ?? string.Empty;
     int GetMajorMode() => 0;
+    int GetMajorMode(int thingId) => GetMajorMode();
     int GetDifficulty() => 1;
     int IsMulti() => 0;
+    int IsServer() => 1;
+    int GetNumPlayers() => 1;
+    int GetPlayerThing(int playerIdx) => GetLocalPlayerThing();
+    int GetPlayerTeam(int playerThing) => 0;
+    void SetPlayerTeam(int playerThing, int team) { }
+    int GetPlayerScore(int playerThing) => 0;
+    void SetPlayerScore(int playerThing, int score) { }
+    int GetPlayerKills(int playerThing) => 0;
+    int GetPlayerKilled(int playerThing) => 0;
+    int GetPlayerSuicides(int playerThing) => 0;
     int GetSenderId() => -1;
     int GetSenderType() => 0;
     int GetSourceRef() => -1;

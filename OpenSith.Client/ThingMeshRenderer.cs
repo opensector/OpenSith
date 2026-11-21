@@ -4,6 +4,7 @@ using System.IO;
 using System.Numerics;
 using OpenSith.Core.Animation;
 using OpenSith.Core.Models;
+using OpenSith.Core.Simulation;
 using OpenSith.Core.Vfs;
 using OpenSith.Core.World;
 using Silk.NET.OpenGL;
@@ -585,6 +586,123 @@ public sealed class ThingMeshRenderer : IDisposable
 
         shader.SetUniform("uTint", Vector3.Zero);
     }
+
+    /// <summary>
+    /// Renders camera-facing textured sprite/explosion visual effects (<see cref="WorldSimulation.VisualEffect"/>).
+    /// </summary>
+    public unsafe void RenderVisualEffects(ShaderProgram shader, Camera camera, IReadOnlyList<WorldSimulation.VisualEffect> effects)
+    {
+        if (effects.Count == 0)
+            return;
+
+        bool wasDepthTestEnabled = _gl.IsEnabled(EnableCap.DepthTest);
+        bool wasBlendEnabled = _gl.IsEnabled(EnableCap.Blend);
+        bool wasCullEnabled = _gl.IsEnabled(EnableCap.CullFace);
+        _gl.GetBoolean(GetPName.DepthWritemask, out bool prevDepthMask);
+        _gl.GetInteger(GetPName.BlendSrcRgb, out int prevSrcRgb);
+        _gl.GetInteger(GetPName.BlendDstRgb, out int prevDstRgb);
+        _gl.GetInteger(GetPName.BlendSrcAlpha, out int prevSrcAlpha);
+        _gl.GetInteger(GetPName.BlendDstAlpha, out int prevDstAlpha);
+        _gl.GetInteger(GetPName.VertexArrayBinding, out int prevVao);
+        _gl.GetInteger(GetPName.ActiveTexture, out int prevActiveTexture);
+        _gl.GetInteger(GetPName.TextureBinding2D, out int prevTexture2D);
+
+        try
+        {
+            var quadModel = GetOrCreateEffectQuadModel();
+            _gl.Enable(EnableCap.DepthTest);
+            _gl.Enable(EnableCap.Blend);
+            _gl.Disable(EnableCap.CullFace);
+            _gl.DepthMask(false);
+            _gl.BindVertexArray(quadModel.Vao);
+            _gl.ActiveTexture(TextureUnit.Texture0);
+            shader.SetUniform("uTexture", 0);
+            shader.SetUniform("uAlphaTest", 0.0f);
+
+            Vector3 right = camera.Right;
+            Vector3 up = camera.Up;
+            Vector3 back = -camera.Forward;
+
+            foreach (var fx in effects)
+            {
+                float lifeFrac = Math.Clamp(fx.Age / MathF.Max(0.01f, fx.Duration), 0f, 1f);
+                float alpha = Math.Clamp(1.0f - lifeFrac, 0.05f, 1.0f);
+                float scaleCurve = 0.65f + lifeFrac * 0.55f;
+                float w = MathF.Max(0.05f, fx.Width * scaleCurve);
+                float h = MathF.Max(0.05f, fx.Height * scaleCurve);
+
+                Matrix4x4 billboard = new(
+                    right.X * w, right.Y * w, right.Z * w, 0f,
+                    up.X * h, up.Y * h, up.Z * h, 0f,
+                    back.X, back.Y, back.Z, 0f,
+                    fx.Position.X, fx.Position.Y, fx.Position.Z, 1f);
+
+                var texInfo = _textureManager.GetOrCreateTexture(fx.MaterialName);
+                _gl.BindTexture(TextureTarget.Texture2D, texInfo.Handle);
+                if (fx.IsAdditive)
+                    _gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.One);
+                else
+                    _gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
+
+                shader.SetUniform("uModel", billboard);
+                shader.SetUniform("uTint", fx.ColorTint == Vector3.One ? Vector3.Zero : fx.ColorTint * alpha);
+                shader.SetUniform("uAlpha", alpha);
+
+                _gl.DrawElements(PrimitiveType.Triangles, (uint)quadModel.Batches[0].ElementCount, DrawElementsType.UnsignedInt, (void*)0);
+            }
+        }
+        finally
+        {
+            shader.SetUniform("uModel", Matrix4x4.Identity);
+            shader.SetUniform("uTint", Vector3.Zero);
+            shader.SetUniform("uAlpha", 1.0f);
+            shader.SetUniform("uAlphaTest", 0.0f);
+            _gl.BindVertexArray((uint)prevVao);
+            _gl.ActiveTexture((TextureUnit)prevActiveTexture);
+            _gl.BindTexture(TextureTarget.Texture2D, (uint)prevTexture2D);
+            _gl.DepthMask(prevDepthMask);
+            _gl.BlendFuncSeparate(
+                (BlendingFactor)prevSrcRgb,
+                (BlendingFactor)prevDstRgb,
+                (BlendingFactor)prevSrcAlpha,
+                (BlendingFactor)prevDstAlpha);
+
+            if (wasBlendEnabled)
+                _gl.Enable(EnableCap.Blend);
+            else
+                _gl.Disable(EnableCap.Blend);
+
+            if (wasCullEnabled)
+                _gl.Enable(EnableCap.CullFace);
+            else
+                _gl.Disable(EnableCap.CullFace);
+
+            if (wasDepthTestEnabled)
+                _gl.Enable(EnableCap.DepthTest);
+            else
+                _gl.Disable(EnableCap.DepthTest);
+        }
+    }
+
+    private ThreeDoGpuModel GetOrCreateEffectQuadModel()
+    {
+        if (_effectQuadModel != null)
+            return _effectQuadModel;
+
+        Vertex[] verts =
+        [
+            new(new Vector3(-0.5f, -0.5f, 0f), Vector3.UnitZ, new Vector2(0f, 1f), 1f),
+            new(new Vector3( 0.5f, -0.5f, 0f), Vector3.UnitZ, new Vector2(1f, 1f), 1f),
+            new(new Vector3( 0.5f,  0.5f, 0f), Vector3.UnitZ, new Vector2(1f, 0f), 1f),
+            new(new Vector3(-0.5f,  0.5f, 0f), Vector3.UnitZ, new Vector2(0f, 0f), 1f),
+        ];
+
+        uint[] indices = [0, 1, 2, 0, 2, 3];
+        _effectQuadModel = UploadStaticBoltMesh(verts, indices);
+        return _effectQuadModel;
+    }
+
+    private ThreeDoGpuModel? _effectQuadModel;
 
     private ThreeDoGpuModel GetOrCreateFallbackBoltModel()
     {
@@ -1242,6 +1360,7 @@ public sealed class ThingMeshRenderer : IDisposable
         _viewmodelInstances.Clear();
 
         DeleteBoltModel(ref _fallbackBoltModel);
+        DeleteBoltModel(ref _effectQuadModel);
     }
 
     private void DeleteBoltModel(ref ThreeDoGpuModel? model)

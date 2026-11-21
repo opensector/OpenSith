@@ -12,6 +12,12 @@ public sealed class PlayerInventory
     public const int BinFists = 1;
     public const int BinBryar = 2;
     public const int BinStRifle = 3;
+    public const int BinThermDet = 4;
+    public const int BinBowcaster = 5;
+    public const int BinRepeater = 6;
+    public const int BinRailDet = 7;
+    public const int BinSeqCharge = 8;
+    public const int BinConcRifle = 9;
     public const int BinLightsaber = 10;
     public const int BinEnergy = 11;
     public const int BinPower = 12;
@@ -36,8 +42,12 @@ public sealed class PlayerInventory
     public const int BinForceLightning = 32;
     public const int BinForceDestruction = 33;
     public const int BinForceDeadlySight = 34;
+    public const int BinBacta = 40;
+    public const int BinIrGoggles = 41;
+    public const int BinFieldLight = 42;
     public const int BinShields = 60;
     public const int BinForceArmor = 61;
+    public const int BinPowerBoost = 63;
     public const int BinForceDarkSurge = 64;
     public const int BinForceLightSurge = 65;
     public const int BinSecrets = 70;
@@ -51,6 +61,11 @@ public sealed class PlayerInventory
     private readonly HashSet<int> _availableBins = new();
     private float _health = 100f;
     private float _maxHealth = 100f;
+
+    public PlayerInventory()
+    {
+        _bins[BinPowerBoost] = 1.0f;
+    }
 
     /// <summary>Current player health (0..MaxHealth).</summary>
     public float Health
@@ -90,6 +105,20 @@ public sealed class PlayerInventory
     {
         get => GetInv(BinPower);
         set => SetInv(BinPower, value);
+    }
+
+    /// <summary>Battery charge (0..200), mapped to bin 13.</summary>
+    public float Battery
+    {
+        get => GetInv(BinBattery);
+        set => SetInv(BinBattery, value);
+    }
+
+    /// <summary>Rail detonator charges (0..30), mapped to bin 15.</summary>
+    public float RailCharges
+    {
+        get => GetInv(BinRailCharges);
+        set => SetInv(BinRailCharges, value);
     }
 
     /// <summary>Current Force mana (0..400), mapped to bin 14.</summary>
@@ -262,6 +291,7 @@ public sealed class PlayerInventory
     /// <summary>Gets the minimum allowed value for an inventory bin.</summary>
     public static float GetInvMin(int bin) => bin switch
     {
+        63 => 1.0f,
         74 => -40f,
         75 => -100f,
         _ => 0f

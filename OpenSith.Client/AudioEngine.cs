@@ -12,7 +12,7 @@ namespace OpenSith.Client;
 /// Cross-platform OpenAL audio engine for playing looping music/ambience and 2D/3D WAV SFX from the VFS.
 /// Gracefully degrades to a silent no-op if no OpenAL native library or audio device is available.
 /// </summary>
-public sealed unsafe class AudioEngine : IDisposable
+public sealed unsafe class AudioEngine : IAudioSink, IDisposable
 {
     private const int MaxOneShotSources = 32;
 

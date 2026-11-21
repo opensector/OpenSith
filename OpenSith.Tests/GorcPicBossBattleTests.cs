@@ -5,6 +5,7 @@ using System.Numerics;
 using System.Text;
 using OpenSith.Client;
 using OpenSith.Core.AI;
+using OpenSith.Core.Simulation;
 using OpenSith.Core.Vfs;
 using OpenSith.Core.World;
 using Xunit;

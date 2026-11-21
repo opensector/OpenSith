@@ -325,6 +325,7 @@ public sealed class CogVm
     public ICogWorldContext Context => _context;
     public IReadOnlyList<CogInstance> Instances => _instances;
     public int MasterCogId => _masterCogId;
+    public Action<CogInstance, Action>? InstanceScopeRunner { get; set; }
 
     public CogVm(ICogWorldContext context)
     {
@@ -336,6 +337,19 @@ public sealed class CogVm
         _instances.Add(instance);
         if (instance.CogId >= 0)
             _instancesById[instance.CogId] = instance;
+    }
+
+    public bool RemoveInstance(CogInstance instance)
+    {
+        bool removed = _instances.Remove(instance);
+        if (instance.CogId >= 0 &&
+            _instancesById.TryGetValue(instance.CogId, out var existing) &&
+            ReferenceEquals(existing, instance))
+        {
+            _instancesById.Remove(instance.CogId);
+        }
+        _extendedTimers.Remove(instance);
+        return removed;
     }
 
     public CogValue SendMessage(int cogId, string message, int senderRef = -1, params CogValue[]? parameters)
@@ -396,75 +410,88 @@ public sealed class CogVm
         var list = _instances.ToArray();
         foreach (var instance in list)
         {
-            // Snapshot existing extended timers before sleep wakeup so newly created timers are not decremented on the wakeup tick.
-            ExtendedTimer[]? existingTimers = _extendedTimers.TryGetValue(instance, out var extList) && extList.Count > 0
-                ? extList.ToArray()
-                : null;
+            if (instance.CogId >= 0
+                ? (!_instancesById.TryGetValue(instance.CogId, out var current) || !ReferenceEquals(current, instance))
+                : !_instances.Contains(instance))
+                continue;
 
-            // 1. Coroutine sleep resumption
-            if (instance.IsSleeping && instance.SuspendedContext != null)
+            void StepInstance()
             {
-                instance.SleepTimeLeft -= dt;
-                if (instance.SleepTimeLeft <= 0f)
-                {
-                    instance.IsSleeping = false;
-                    var ctx = instance.SuspendedContext;
-                    instance.SuspendedContext = null;
-                    Execute(ctx);
-                }
-            }
+                // Snapshot existing extended timers before sleep wakeup so newly created timers are not decremented on the wakeup tick.
+                ExtendedTimer[]? existingTimers = _extendedTimers.TryGetValue(instance, out var extList) && extList.Count > 0
+                    ? extList.ToArray()
+                    : null;
 
-            // 1b. WaitForStop resumption
-            if (instance.WaitingForStopThingId >= 0 && instance.SuspendedContext != null)
-            {
-                if (!_context.IsThingMoving(instance.WaitingForStopThingId))
+                // 1. Coroutine sleep resumption
+                if (instance.IsSleeping && instance.SuspendedContext != null)
                 {
-                    instance.WaitingForStopThingId = -1;
-                    var ctx = instance.SuspendedContext;
-                    instance.SuspendedContext = null;
-                    Execute(ctx);
-                }
-            }
-
-            // 2. Timer
-            if (instance.TimerActive)
-            {
-                instance.TimerTimeLeft -= dt;
-                if (instance.TimerTimeLeft <= 0f)
-                {
-                    instance.TimerActive = false;
-                    instance.TimerTimeLeft = -1f;
-                    SendMessage(instance, "timer");
-                }
-            }
-
-            // 2b. Extended multi-ID timers (SetTimerEx)
-            if (existingTimers != null && _extendedTimers.TryGetValue(instance, out var currentExtList))
-            {
-                foreach (var timer in existingTimers)
-                {
-                    if (!currentExtList.Contains(timer))
-                        continue;
-
-                    timer.TimeLeft -= dt;
-                    if (timer.TimeLeft <= 0f)
+                    instance.SleepTimeLeft -= dt;
+                    if (instance.SleepTimeLeft <= 0f)
                     {
-                        currentExtList.Remove(timer);
-                        SendMessage(instance, "timer", senderRef: -1, senderId: timer.TimerId, sourceRef: -1, timer.Param0, timer.Param1);
+                        instance.IsSleeping = false;
+                        var ctx = instance.SuspendedContext;
+                        instance.SuspendedContext = null;
+                        Execute(ctx);
+                    }
+                }
+
+                // 1b. WaitForStop resumption
+                if (instance.WaitingForStopThingId >= 0 && instance.SuspendedContext != null)
+                {
+                    if (!_context.IsThingMoving(instance.WaitingForStopThingId))
+                    {
+                        instance.WaitingForStopThingId = -1;
+                        var ctx = instance.SuspendedContext;
+                        instance.SuspendedContext = null;
+                        Execute(ctx);
+                    }
+                }
+
+                // 2. Timer
+                if (instance.TimerActive)
+                {
+                    instance.TimerTimeLeft -= dt;
+                    if (instance.TimerTimeLeft <= 0f)
+                    {
+                        instance.TimerActive = false;
+                        instance.TimerTimeLeft = -1f;
+                        SendMessage(instance, "timer");
+                    }
+                }
+
+                // 2b. Extended multi-ID timers (SetTimerEx)
+                if (existingTimers != null && _extendedTimers.TryGetValue(instance, out var currentExtList))
+                {
+                    foreach (var timer in existingTimers)
+                    {
+                        if (!currentExtList.Contains(timer))
+                            continue;
+
+                        timer.TimeLeft -= dt;
+                        if (timer.TimeLeft <= 0f)
+                        {
+                            currentExtList.Remove(timer);
+                            SendMessage(instance, "timer", senderRef: -1, senderId: timer.TimerId, sourceRef: -1, timer.Param0, timer.Param1);
+                        }
+                    }
+                }
+
+                // 3. Pulse
+                if (instance.PulseActive && instance.PulseInterval > 0f)
+                {
+                    instance.PulseTimeLeft -= dt;
+                    if (instance.PulseTimeLeft <= 0f)
+                    {
+                        instance.PulseTimeLeft += instance.PulseInterval;
+                        SendMessage(instance, "pulse");
                     }
                 }
             }
 
-            // 3. Pulse
-            if (instance.PulseActive && instance.PulseInterval > 0f)
-            {
-                instance.PulseTimeLeft -= dt;
-                if (instance.PulseTimeLeft <= 0f)
-                {
-                    instance.PulseTimeLeft += instance.PulseInterval;
-                    SendMessage(instance, "pulse");
-                }
-            }
+            if (InstanceScopeRunner != null)
+                InstanceScopeRunner(instance, StepInstance);
+            else
+                StepInstance();
         }
     }
 
@@ -2033,7 +2060,9 @@ public sealed class CogVm
                 return true;
 
             case "getmajormode":
-                result = new CogValue(_context.GetMajorMode());
+                result = args.Count > 0
+                    ? new CogValue(_context.GetMajorMode(Arg(0).AsInt))
+                    : new CogValue(_context.GetMajorMode());
                 return true;
 
             case "getdifficulty":
@@ -2042,6 +2071,48 @@ public sealed class CogVm
 
             case "ismulti":
                 result = new CogValue(_context.IsMulti());
+                return true;
+
+            case "isserver":
+                result = new CogValue(_context.IsServer());
+                return true;
+
+            case "getnumplayers":
+                result = new CogValue(_context.GetNumPlayers());
+                return true;
+
+            case "getplayerthing":
+                result = new CogValue(_context.GetPlayerThing(Arg(0).AsInt));
+                return true;
+
+            case "getplayerteam":
+                result = new CogValue(_context.GetPlayerTeam(Arg(0).AsInt));
+                return true;
+
+            case "setplayerteam":
+                _context.SetPlayerTeam(Arg(0).AsInt, Arg(1).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "getplayerscore":
+                result = new CogValue(_context.GetPlayerScore(Arg(0).AsInt));
+                return true;
+
+            case "setplayerscore":
+                _context.SetPlayerScore(Arg(0).AsInt, Arg(1).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "getplayerkills":
+                result = new CogValue(_context.GetPlayerKills(Arg(0).AsInt));
+                return true;
+
+            case "getplayerkilled":
+                result = new CogValue(_context.GetPlayerKilled(Arg(0).AsInt));
+                return true;
+
+            case "getplayersuicides":
+                result = new CogValue(_context.GetPlayerSuicides(Arg(0).AsInt));
                 return true;
 
             case "randvec":
@@ -2267,7 +2338,10 @@ public sealed class CogVm
         "jksetpersuasioninfo", "jksetpovmodel", "jkplaypovkey", "jkstoppovkey", "jksetwaggle",
         "jkgetsabercam", "jksettarget", "jkendtarget", "jksettargetcolors", "jkbegincutscene",
         "jkendcutscene", "jksetsuperflags", "jkclearsuperflags", "jkgetsuperflags", "jkgetchoice",
-        "getmajormode", "getdifficulty", "ismulti", "randvec",
+        "getmajormode", "getdifficulty", "ismulti", "isserver",
+        "getnumplayers", "getplayerthing", "getplayerteam", "setplayerteam",
+        "getplayerscore", "setplayerscore", "getplayerkills", "getplayerkilled", "getplayersuicides",
+        "randvec",
         "vectorset", "vectoradd", "vectorsub", "vectorscale", "vectordist", "vectordot",
         "vectorcross", "vectornorm", "vectorlen", "vectorx", "vectory", "vectorz",
         "bittest", "bitset", "bitclear"

@@ -48,6 +48,17 @@ public sealed class PlayerPhysics
     public Vector3 PelvisPosition => Position + new Vector3(0, 0, PelvisOffset);
     public Vector3 EyePosition => Position + new Vector3(0, 0, EyeHeight);
 
+    /// <summary>
+    /// Applies an external velocity impulse (e.g. Force Jump or explosion knockback),
+    /// detaching from ground state when launching upward.
+    /// </summary>
+    public void ApplyExternalVelocity(Vector3 velocity)
+    {
+        Velocity = velocity;
+        if (velocity.Z > 0.05f)
+            IsGrounded = false;
+    }
+
     public PlayerPhysics(Vector3 spawnPosition, int startSector)
     {
         Position = spawnPosition;

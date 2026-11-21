@@ -8,7 +8,7 @@ using OpenSith.Core.Cog;
 using OpenSith.Core.Models;
 using OpenSith.Core.World;
 
-namespace OpenSith.Client;
+namespace OpenSith.Core.Simulation;
 
 public sealed partial class WorldSimulation
 {
@@ -23,24 +23,12 @@ public sealed partial class WorldSimulation
     private readonly Dictionary<int, int> _cameraFocus = new();
 
     private int _currentCamera;
-    private int _superFlags;
     private int _mapModeFlags;
-
-    /// <summary>
-    /// Optional explicit Light (1) / Dark (2) campaign alignment choice for <see cref="JkGetChoice"/>.
-    /// When unset, falls back to alignment inventory bin 75 (&lt; 0 = Dark, &gt;= 0 = Light).
-    /// </summary>
-    public int? PlayerAlignmentChoice { get; set; }
 
     /// <summary>
     /// Invoked when <c>TeleportThing</c> moves the local player to a new position, PYR, and sector.
     /// </summary>
     public event Action<Vector3, Vector3, int>? OnPlayerTeleported;
-
-    /// <summary>
-    /// Invoked when <c>AssignWeapon</c> equips a weapon bin for the local player.
-    /// </summary>
-    public event Action<int>? OnPlayerWeaponAssigned;
 
     private void UpdateThingTimersAndPulses(float dt)
     {
@@ -299,6 +287,8 @@ public sealed partial class WorldSimulation
     {
         _thingParents.Remove(thingId);
         _thingAttachFlags.Remove(thingId);
+        if (_playersByThing.TryGetValue(thingId, out var player))
+            player.IsGrounded = false;
     }
 
     public int GetThingParent(int thingId) => _thingParents.GetValueOrDefault(thingId, -1);
@@ -306,7 +296,13 @@ public sealed partial class WorldSimulation
     public void SetThingAttachFlags(int thingId, int flags) =>
         _thingAttachFlags[thingId] = GetAttachFlags(thingId) | flags;
 
-    public int GetAttachFlags(int thingId) => _thingAttachFlags.GetValueOrDefault(thingId, 0);
+    public int GetAttachFlags(int thingId)
+    {
+        int flags = _thingAttachFlags.GetValueOrDefault(thingId, 0);
+        if (_playersByThing.TryGetValue(thingId, out var player) && player.IsGrounded)
+            flags |= 0x1;
+        return flags;
+    }
 
     // -------------------------------------------------------------------------
     // Teleport, Physics, Orientation & Thing Timer COG Verbs
@@ -330,10 +326,13 @@ public sealed partial class WorldSimulation
 
         _thingVelocities.Remove(thingId);
 
-        if (thingId == _localPlayerThingIndex)
+        if (_playersByThing.TryGetValue(thingId, out var player))
         {
-            UpdatePlayerSectorTransitions(thing.SectorIndex);
-            OnPlayerTeleported?.Invoke(dest.Position, dest.PitchYawRoll, thing.SectorIndex);
+            player.WorldPosition = dest.Position;
+            player.HasInputPosition = true;
+            UpdatePlayerSectorTransitions(player, thing.SectorIndex);
+            if (thingId == _localPlayerThingIndex)
+                OnPlayerTeleported?.Invoke(dest.Position, dest.PitchYawRoll, thing.SectorIndex);
         }
     }
 
@@ -433,11 +432,19 @@ public sealed partial class WorldSimulation
         if ((flags & (uint)(SithThingFlags.Disabled | SithThingFlags.Destroyed | SithThingFlags.Invisible)) != 0)
             return 0;
 
-        return HasLOS(_localPlayerThingIndex, thingId);
+        if (_localPlayerThingIndex >= 0)
+            return HasLOS(_localPlayerThingIndex, thingId);
+
+        foreach (var player in _players)
+        {
+            if (HasLOS(player.ThingIndex, thingId) != 0)
+                return 1;
+        }
+        return 0;
     }
 
     // -------------------------------------------------------------------------
-    // AI, Force SuperFlags, Weapons, Audio, Camera & Cutscene COG Verbs
+    // AI, Audio, Camera & Cutscene COG Verbs
     // -------------------------------------------------------------------------
 
     public void AISetMoveThing(int thingId, int targetThingId)
@@ -456,75 +463,10 @@ public sealed partial class WorldSimulation
             npc.OverrideFireTargetId = targetThingId >= 0 ? targetThingId : null;
     }
 
-    public void JkSetSuperFlags(int flags) => _superFlags |= flags;
-
-    public void JkClearSuperFlags(int flags) => _superFlags &= ~flags;
-
-    public int JkGetSuperFlags() => _superFlags;
-
-    public int JkGetChoice()
-    {
-        if (PlayerAlignmentChoice.HasValue)
-            return PlayerAlignmentChoice.Value;
-
-        // Sith alignment bin 75: >= 0 is Light Side (1), < 0 is Dark Side (2)
-        return Inventory.GetInv(75) < 0f ? 2 : 1;
-    }
-
-    public void AssignWeapon(int playerThing, int binIdx)
-    {
-        if (playerThing == _localPlayerThingIndex || playerThing < 0)
-        {
-            Inventory.SetInvAvailable(binIdx, true);
-            if (Inventory.GetInv(binIdx) <= 0f)
-                Inventory.SetInv(binIdx, 1f);
-            SelectWeapon(playerThing, binIdx);
-            OnPlayerWeaponAssigned?.Invoke(binIdx);
-        }
-    }
-
     public int CreateThingNR(string template, int refThing) => CreateThing(template, refThing);
 
     public int CreateThingAtPosNR(string template, int sector, Vector3 pos, Vector3 pyr) =>
         CreateThingAtPos(template, sector, pos, pyr);
-
-    public int FireProjectile(
-        int shooterThing,
-        string projectileTemplate,
-        string fireSound,
-        int mode,
-        Vector3 fireOffset,
-        Vector3 aimError,
-        float scale,
-        int scaleFlags,
-        float autoaimFov,
-        float autoaimMaxDist)
-    {
-        if (shooterThing < 0 || shooterThing >= _level.Things.Count)
-            return -1;
-
-        var shooter = _level.Things[shooterThing];
-        Vector3 forward = GetThingForward(shooterThing);
-        Vector3 spawnPos = shooter.Position + fireOffset;
-        string modelName = !string.IsNullOrWhiteSpace(projectileTemplate)
-            ? _level.ResolveModel3D(projectileTemplate)
-            : "str0.3do";
-        if (string.IsNullOrWhiteSpace(modelName))
-            modelName = "str0.3do";
-
-        if (!string.IsNullOrWhiteSpace(fireSound))
-            _audio?.PlaySoundPos(fireSound, spawnPos, 0.85f, 0.5f, 7.0f);
-
-        SpawnProjectile(
-            spawnPos,
-            forward + aimError * 0.01f,
-            damage: 10.0f * (scale > 0f ? scale : 1.0f),
-            ownerThingIndex: shooterThing,
-            isEnemy: shooterThing != _localPlayerThingIndex,
-            modelName: modelName);
-
-        return _projectiles.Count - 1;
-    }
 
     public void StopSound(int channel, float fadeOut)
     {
@@ -624,11 +566,19 @@ public sealed partial class WorldSimulation
     public void SetCameraFocus(int camIdx, int thingId) => _cameraFocus[camIdx] = thingId;
 
     public int GetPrimaryFocus(int cameraIdx) =>
-        _cameraFocus.TryGetValue(cameraIdx, out int thingId) ? thingId : _localPlayerThingIndex;
+        _cameraFocus.TryGetValue(cameraIdx, out int thingId) ? thingId : GetLocalPlayerThing();
 
-    public void JkBeginCutscene() => SetActorFlags(_localPlayerThingIndex, 0xa00000);
+    public void JkBeginCutscene()
+    {
+        if (_localPlayerThingIndex >= 0)
+            SetActorFlags(_localPlayerThingIndex, 0xa00000);
+    }
 
-    public void JkEndCutscene() => ClearActorFlags(_localPlayerThingIndex, 0xa00000);
+    public void JkEndCutscene()
+    {
+        if (_localPlayerThingIndex >= 0)
+            ClearActorFlags(_localPlayerThingIndex, 0xa00000);
+    }
 
     public void SetMapModeFlags(int flags) => _mapModeFlags |= flags;
 

@@ -12,7 +12,7 @@ using OpenSith.Core.Physics;
 using OpenSith.Core.Vfs;
 using OpenSith.Core.World;
 
-namespace OpenSith.Client;
+namespace OpenSith.Core.Simulation;
 
 /// <summary>
 /// Live world simulation controller bridging COG script execution (<see cref="CogVm"/>),
@@ -49,12 +49,16 @@ public sealed partial class WorldSimulation : ICogWorldContext
     private readonly List<Projectile> _projectiles = [];
     private readonly Dictionary<string, int> _activeLoopingSounds = new(StringComparer.OrdinalIgnoreCase);
     private int _nextHeadlessSoundChannel = 1;
-    private readonly AudioEngine? _audio;
+    private readonly IAudioSink? _audio;
     private bool _startupRun;
 
-    private readonly int _localPlayerThingIndex;
-    private int _prevPlayerSector = -1;
-    private float _statusTimer;
+    private int _localPlayerThingIndex;
+    private int? _activeCogPlayerContext;
+    private readonly Dictionary<int, PlayerState> _playersByThing = new();
+    private readonly List<PlayerState> _players = [];
+    private readonly PlayerInventory _fallbackInventory = new();
+    private string? _globalStatusMessage;
+    private float _globalStatusTimer;
     private float _elapsedLevelTime;
     private int _nextDynamicCogId = 10000;
 
@@ -67,7 +71,6 @@ public sealed partial class WorldSimulation : ICogWorldContext
     private readonly Dictionary<int, int> _thingFlags = new();
     private readonly Dictionary<int, int> _actorFlags = new();
     private readonly Dictionary<int, float> _actorExtraSpeeds = new();
-    private readonly Dictionary<(int ThingId, int Bin), int> _invActivated = new();
     private readonly Dictionary<int, int> _jkFlags = new();
     private readonly Dictionary<int, string> _weaponMeshes = new();
     private readonly Dictionary<int, SaberInfo> _saberInfos = new();
@@ -76,20 +79,14 @@ public sealed partial class WorldSimulation : ICogWorldContext
     private readonly HashSet<int> _hiddenBySim = [];
     private readonly List<int> _viewSearchResults = [];
     private int _viewSearchIndex;
-    private readonly HashSet<string> _startedForceCogs = new(StringComparer.OrdinalIgnoreCase);
-    private Vector3 _lastPlayerAimDir = Vector3.UnitY;
-    private bool _hasLastPlayerAimDir;
     private readonly Dictionary<int, int> _surfaceCels = new();
     private readonly Dictionary<int, Vector3> _sectorThrusts = new();
-    private readonly HashSet<int> _touchedCapturedThings = [];
     private readonly HashSet<int> _sightedThings = [];
     private readonly Dictionary<int, float> _thingUserData = new();
     private readonly Dictionary<int, HashSet<int>> _amputatedJoints = new();
     private readonly Dictionary<int, int> _thingParents = new();
     private readonly Dictionary<int, float> _thingLights = new();
     private readonly Dictionary<int, int> _thingCollideTypes = new();
-    private readonly Dictionary<int, int> _curWeapons = new();
-    private readonly Dictionary<int, int> _curInvWeapons = new();
     private int _nextKeyTrackId = 1;
 
     /// <summary>
@@ -107,11 +104,29 @@ public sealed partial class WorldSimulation : ICogWorldContext
         string WallSparks, string BloodSparks, string SaberSparks);
 
     public int Difficulty { get; set; } = 1;
-    public PlayerInventory Inventory { get; } = new();
-    public string? StatusMessage { get; private set; }
+    public bool IsMultiplayer { get; }
+    public bool IsDedicatedServer { get; }
+    public IReadOnlyList<PlayerState> Players => _players;
+    public PlayerState? LocalPlayer =>
+        _localPlayerThingIndex >= 0 && _playersByThing.TryGetValue(_localPlayerThingIndex, out var p)
+            ? p
+            : null;
+    public PlayerState? GetPlayerByThing(int thingId) => _playersByThing.GetValueOrDefault(thingId);
+    public PlayerInventory Inventory => LocalPlayer?.Inventory ?? _fallbackInventory;
+    public string? StatusMessage
+    {
+        get => LocalPlayer?.StatusMessage ?? _globalStatusMessage;
+        private set
+        {
+            if (LocalPlayer != null)
+                LocalPlayer.StatusMessage = value;
+            else
+                _globalStatusMessage = value;
+        }
+    }
     public bool LevelCompleted { get; private set; }
-    public float PlayerExtraSpeed => _actorExtraSpeeds.GetValueOrDefault(_localPlayerThingIndex, 0f);
-    public bool IsPlayerFrozen => (GetActorFlags(_localPlayerThingIndex) & 0x40000) != 0;
+    public float PlayerExtraSpeed => _localPlayerThingIndex >= 0 ? _actorExtraSpeeds.GetValueOrDefault(_localPlayerThingIndex, 0f) : 0f;
+    public bool IsPlayerFrozen => _localPlayerThingIndex >= 0 && (GetActorFlags(_localPlayerThingIndex) & 0x40000) != 0;
     public bool IsActorFrozen(int thingId) => (GetActorFlags(thingId) & 0x40000) != 0;
     public string GetNpcAiClassName(int thingId) => _npcs.TryGetValue(thingId, out var npc) ? npc.Brain.Class.Name : string.Empty;
     public Vector3 GetSectorThrust(int sector) => _sectorThrusts.GetValueOrDefault(sector, Vector3.Zero);
@@ -138,6 +153,13 @@ public sealed partial class WorldSimulation : ICogWorldContext
         public bool IsEnemy;
         public string ModelName = "bry0.3do";
         public Vector3 BoltColor = BoltColorRed;
+        public bool UseGravity;
+        public bool Bounce;
+        public bool ExplodeOnImpact = true;
+        public string? ExplodeTemplate;
+        public string? FleshHitTemplate;
+        public int DamageClass = 2;
+        public float Radius = 0.02f;
     }
 
     public sealed class ImpactSpark
@@ -212,6 +234,8 @@ public sealed partial class WorldSimulation : ICogWorldContext
         public int? OverrideFireTargetId;
         public Vector3? OverrideLookPos;
         public float OverrideLookTimer;
+        public float BlindTimer;
+        public int LastDamagerThingId = -1;
     }
 
     public int ActiveCogCount => _cogVm.Instances.Count;
@@ -221,29 +245,65 @@ public sealed partial class WorldSimulation : ICogWorldContext
     private readonly List<ImpactSpark> _sparks = [];
     public IReadOnlyList<ImpactSpark> Sparks => _sparks;
 
-    public WorldSimulation(JklLevel level, IVirtualFileSystem vfs, AudioEngine? audio = null, int difficulty = 1, bool runStartupCogs = true)
+    public WorldSimulation(
+        JklLevel level,
+        IVirtualFileSystem vfs,
+        IAudioSink? audio = null,
+        int difficulty = 1,
+        bool runStartupCogs = true,
+        bool isMultiplayer = false,
+        bool isDedicatedServer = false)
     {
         _level = level ?? throw new ArgumentNullException(nameof(level));
         _vfs = vfs ?? throw new ArgumentNullException(nameof(vfs));
         _audio = audio;
         Difficulty = Math.Clamp(difficulty, 0, 2);
+        IsMultiplayer = isMultiplayer;
+        IsDedicatedServer = isDedicatedServer;
         _strings = UniStringTable.LoadFromVfs(_vfs);
         _itemDefinitions = LoadItemDefinitions(_vfs);
         _surfaceToSector = BuildSurfaceToSectorMap(_level);
-        _cogVm = new CogVm(this);
+        _cogVm = new CogVm(this)
+        {
+            InstanceScopeRunner = RunInInstancePlayerScope
+        };
 
-        var spawn = _level.GetPlayerSpawn();
-        _localPlayerThingIndex = spawn?.ThingIndex ?? 0;
-        _prevPlayerSector = spawn?.SectorIndex ?? -1;
-
-        Inventory.Health = 100f;
-        Inventory.Shields = 50f;
-        Inventory.EnergyAmmo = 100f;
-        Inventory.PowerAmmo = 100f;
-        Inventory.HasLightsaber = true;
-        Inventory.HasBryar = true;
-        Inventory.SetInv(PlayerInventory.BinStRifle, 1f);
-        Inventory.SetInv(6, 1f); // Imperial Repeater
+        if (isDedicatedServer)
+        {
+            _localPlayerThingIndex = -1;
+        }
+        else
+        {
+            var spawn = _level.GetPlayerSpawn();
+            _localPlayerThingIndex = spawn?.ThingIndex ?? 0;
+            var localPlayer = new PlayerState
+            {
+                ThingIndex = _localPlayerThingIndex,
+                PlayerSlot = 0,
+                Name = "Player 1",
+                PrevSectorIndex = spawn?.SectorIndex ?? -1,
+                WorldPosition = spawn?.Position ?? Vector3.Zero,
+                HasInputPosition = spawn != null
+            };
+            localPlayer.Inventory.Health = 100f;
+            localPlayer.Inventory.Shields = isMultiplayer ? 100f : 50f;
+            localPlayer.Inventory.EnergyAmmo = isMultiplayer ? 50f : 100f;
+            localPlayer.Inventory.PowerAmmo = 100f;
+            localPlayer.Inventory.Battery = 100f;
+            localPlayer.Inventory.SetInv(PlayerInventory.BinFists, 1f);
+            localPlayer.Inventory.HasBryar = true;
+            localPlayer.Inventory.HasLightsaber = true;
+            localPlayer.Inventory.SetInv(PlayerInventory.BinFieldLight, 1f);
+            localPlayer.Inventory.SetInvAvailable(PlayerInventory.BinFieldLight, true);
+            localPlayer.Inventory.SetInv(PlayerInventory.BinPowerBoost, 1f);
+            if (!isMultiplayer)
+            {
+                localPlayer.Inventory.SetInv(PlayerInventory.BinStRifle, 1f);
+                localPlayer.Inventory.SetInv(PlayerInventory.BinRepeater, 1f);
+            }
+            _playersByThing[_localPlayerThingIndex] = localPlayer;
+            _players.Add(localPlayer);
+        }
 
         InitializeAdjoinSnapshots();
         InitializeGeoModes();
@@ -252,6 +312,186 @@ public sealed partial class WorldSimulation : ICogWorldContext
         LoadNpcs();
         if (runStartupCogs)
             StartLevel();
+    }
+
+    /// <summary>
+    /// Spawns and registers a player slot for multi-player or dedicated-server sessions.
+    /// </summary>
+    public PlayerState AddPlayer(int playerSlot, string name = "", int team = 0)
+    {
+        JklThing? candidateSpawn = null;
+        foreach (var t in _level.Things)
+        {
+            if (t.IsPlayerSpawn && !_playersByThing.ContainsKey(t.ThingIndex))
+            {
+                candidateSpawn = t;
+                break;
+            }
+        }
+
+        int thingIndex;
+        if (candidateSpawn != null)
+        {
+            thingIndex = candidateSpawn.ThingIndex;
+            candidateSpawn.ThingFlags &= ~(uint)(SithThingFlags.Disabled | SithThingFlags.Destroyed | SithThingFlags.Invisible);
+            candidateSpawn.IsNonSolid = false;
+            _thingFlags[thingIndex] = (int)candidateSpawn.ThingFlags;
+        }
+        else
+        {
+            var templateSpawn = _level.GetPlayerSpawn();
+            thingIndex = _level.Things.Count;
+            _level.Things.Add(new JklThing
+            {
+                ThingIndex = thingIndex,
+                TemplateName = templateSpawn?.TemplateName ?? "walkplayer",
+                SectorIndex = templateSpawn?.SectorIndex ?? 0,
+                Position = templateSpawn?.Position ?? Vector3.Zero,
+                PitchYawRoll = templateSpawn?.PitchYawRoll ?? Vector3.Zero,
+                Model3D = "ky.3do",
+                ThingFlags = (uint)(SithThingFlags.EmitLight | SithThingFlags.Captured | SithThingFlags.Splashes)
+            });
+        }
+
+        var spawnThing = _level.Things[thingIndex];
+        var player = new PlayerState
+        {
+            ThingIndex = thingIndex,
+            PlayerSlot = playerSlot,
+            Name = string.IsNullOrWhiteSpace(name) ? $"Player {playerSlot + 1}" : name.Trim(),
+            Team = team,
+            PrevSectorIndex = spawnThing.SectorIndex,
+            WorldPosition = spawnThing.Position,
+            HasInputPosition = true,
+            CurWeaponBin = PlayerInventory.BinBryar,
+            CurInvWeaponBin = PlayerInventory.BinBryar
+        };
+
+        player.Inventory.Health = 100f;
+        player.Inventory.Shields = 100f;
+        player.Inventory.EnergyAmmo = 50f;
+        player.Inventory.Battery = 100f;
+        player.Inventory.SetInv(PlayerInventory.BinFists, 1f);
+        player.Inventory.HasBryar = true;
+        player.Inventory.HasLightsaber = true;
+        player.Inventory.SetInv(PlayerInventory.BinFieldLight, 1f);
+        player.Inventory.SetInvAvailable(PlayerInventory.BinFieldLight, true);
+        player.Inventory.SetInv(PlayerInventory.BinPowerBoost, 1f);
+
+        _destroyedThings.Remove(thingIndex);
+        _playersByThing[thingIndex] = player;
+        _players.Add(player);
+
+        if (IsMultiplayer)
+        {
+            var classCog = GetOrCreatePlayerClassCog(player);
+            if (classCog != null && classCog.Program.Labels.ContainsKey("newplayer"))
+            {
+                WithPlayerCogContext(player.ThingIndex, () =>
+                    SafeSendMessage(classCog, "newplayer", senderRef: player.ThingIndex, senderId: 0, sourceRef: player.ThingIndex, senderType: 3));
+            }
+        }
+
+        return player;
+    }
+
+    /// <summary>
+    /// Removes a player from the active session and clears its thing state.
+    /// </summary>
+    public bool RemovePlayer(int thingIndex)
+    {
+        if (!_playersByThing.Remove(thingIndex, out var player))
+            return false;
+
+        if (player.ClassCog != null)
+        {
+            _playerCogOwners.Remove(player.ClassCog);
+            _cogVm.RemoveInstance(player.ClassCog);
+            player.ClassCog = null;
+        }
+
+        foreach (var binCog in player.BinCogs.Values)
+        {
+            _playerCogOwners.Remove(binCog);
+            _cogVm.RemoveInstance(binCog);
+        }
+        player.BinCogs.Clear();
+        player.ActiveBinFireTimers.Clear();
+
+        _players.Remove(player);
+        _activeCogPlayerContext = _activeCogPlayerContext == thingIndex ? null : _activeCogPlayerContext;
+        if (_localPlayerThingIndex == thingIndex)
+            _localPlayerThingIndex = -1;
+
+        if (thingIndex >= 0 && thingIndex < _level.Things.Count)
+            DestroyThing(thingIndex);
+
+        return true;
+    }
+
+    /// <summary>
+    /// Updates authoritative per-player spatial and input state prior to <see cref="StepWorld"/>.
+    /// </summary>
+    public void UpdatePlayerInput(
+        int playerThingId,
+        Vector3 pos,
+        int sector,
+        Vector3? aimDir = null,
+        Vector3? thrust = null,
+        bool isGrounded = true,
+        bool isUnderwater = false)
+    {
+        if (playerThingId < 0 || !_playersByThing.TryGetValue(playerThingId, out var player))
+            return;
+
+        player.WorldPosition = pos;
+        player.HasInputPosition = true;
+        if (playerThingId < _level.Things.Count)
+        {
+            var thing = _level.Things[playerThingId];
+            thing.Position = pos;
+            thing.SectorIndex = sector;
+        }
+
+        if (aimDir is Vector3 dir && dir.LengthSquared() > 1e-6f)
+        {
+            player.AimDirection = Vector3.Normalize(dir);
+            player.HasAimDirection = true;
+            if (playerThingId < _level.Things.Count)
+            {
+                float yaw = MathF.Atan2(-player.AimDirection.X, player.AimDirection.Y) * (180f / MathF.PI);
+                var cur = _level.Things[playerThingId].PitchYawRoll;
+                _level.Things[playerThingId].PitchYawRoll = new Vector3(cur.X, yaw, cur.Z);
+            }
+        }
+
+        if (thrust is Vector3 t)
+            player.Thrust = t;
+        player.IsGrounded = isGrounded;
+        player.IsUnderwater = isUnderwater;
+    }
+
+    public Vector3 ConsumePlayerPlatformDelta(int playerThingId)
+    {
+        if (!_playersByThing.TryGetValue(playerThingId, out var player))
+            return Vector3.Zero;
+
+        Vector3 delta = player.PendingPlatformDelta;
+        player.PendingPlatformDelta = Vector3.Zero;
+        return delta;
+    }
+
+    public bool TryConsumePlayerVelocityOverride(int playerThingId, out Vector3 velocity)
+    {
+        if (_playersByThing.TryGetValue(playerThingId, out var player) && player.HasVelocityOverride)
+        {
+            velocity = player.VelocityOverride;
+            player.HasVelocityOverride = false;
+            return true;
+        }
+
+        velocity = Vector3.Zero;
+        return false;
     }
 
     /// <summary>
@@ -521,7 +761,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
 
     private bool TrySpawnNpcRuntime(JklThing thing)
     {
-        if (thing.ThingIndex == _localPlayerThingIndex || thing.IsPlayerSpawn)
+        if (_playersByThing.ContainsKey(thing.ThingIndex) || thing.IsPlayerSpawn)
             return false;
 
         if ((thing.ThingFlags & (uint)(SithThingFlags.Disabled | SithThingFlags.Destroyed)) != 0)
@@ -671,44 +911,86 @@ public sealed partial class WorldSimulation : ICogWorldContext
     }
 
     /// <summary>
-    /// Advances COG timers, moving doors/elevators, player sector/adjoin triggers, and NPC AI brains.
-    /// Returns any vertical/horizontal platform displacement to apply to the player when riding an elevator.
+    /// Advances COG timers, moving doors/elevators, player sector/adjoin triggers, weapons, VFX, and NPC AI brains.
+    /// Returns any vertical/horizontal platform displacement to apply to the local player when riding an elevator.
     /// </summary>
     public Vector3 Update(float dt, Vector3 playerPos, int playerSector, Vector3? aimDir = null)
     {
         if (dt <= 0f)
             return Vector3.Zero;
 
+        if (_localPlayerThingIndex >= 0 && LocalPlayer is { } localPlayer)
+        {
+            UpdatePlayerInput(
+                _localPlayerThingIndex,
+                playerPos,
+                playerSector,
+                aimDir,
+                localPlayer.Thrust,
+                localPlayer.IsGrounded,
+                localPlayer.IsUnderwater);
+        }
+
+        StepWorld(dt);
+        return _localPlayerThingIndex >= 0 ? ConsumePlayerPlatformDelta(_localPlayerThingIndex) : Vector3.Zero;
+    }
+
+    /// <summary>
+    /// Advances the entire headless world simulation by <paramref name="dt"/> seconds across all connected players.
+    /// </summary>
+    public void StepWorld(float dt)
+    {
+        if (dt <= 0f)
+            return;
+
         _elapsedLevelTime += dt;
 
-        if (_statusTimer > 0f)
+        if (_globalStatusTimer > 0f)
         {
-            _statusTimer -= dt;
-            if (_statusTimer <= 0f)
+            _globalStatusTimer -= dt;
+            if (_globalStatusTimer <= 0f)
             {
-                _statusTimer = 0f;
-                StatusMessage = null;
+                _globalStatusTimer = 0f;
+                _globalStatusMessage = null;
             }
+        }
+
+        foreach (var player in _players)
+        {
+            if (player.StatusTimer > 0f)
+            {
+                player.StatusTimer -= dt;
+                if (player.StatusTimer <= 0f)
+                {
+                    player.StatusTimer = 0f;
+                    player.StatusMessage = null;
+                }
+            }
+            player.Inventory.UpdateForceMana(dt);
         }
 
         UpdateLifeleftTimers(dt);
         UpdateThingTimersAndPulses(dt);
         UpdateThingRotVels(dt);
-        Inventory.UpdateForceMana(dt);
         UpdateThingVelocities(dt);
 
-        if (_localPlayerThingIndex >= 0 && _localPlayerThingIndex < _level.Things.Count)
+        foreach (var player in _players.ToArray())
         {
-            var playerThing = _level.Things[_localPlayerThingIndex];
-            playerThing.Position = playerPos;
-            playerThing.SectorIndex = playerSector;
+            if (player.ThingIndex < 0 || player.ThingIndex >= _level.Things.Count)
+                continue;
+
+            var thing = _level.Things[player.ThingIndex];
+            UpdatePlayerSectorTransitions(player, thing.SectorIndex);
+            if (!player.Inventory.IsDead)
+            {
+                CheckDeathFloorSurfaces(player, thing.Position, thing.SectorIndex);
+                CheckPickupTouches(player, thing.Position);
+                CheckSightedCogs(player, thing.Position, player.HasAimDirection ? player.AimDirection : null);
+            }
         }
 
-        UpdatePlayerSectorTransitions(playerSector);
-        CheckDeathFloorSurfaces(playerPos, playerSector);
-        CheckPickupTouches(playerPos);
-        CheckSightedCogs(playerPos, aimDir);
-        Vector3 elevatorDelta = UpdateThingMotions(dt, playerPos, playerSector);
+        UpdatePlayerWeapons(dt);
+        UpdateThingMotions(dt);
 
         try
         {
@@ -719,122 +1001,23 @@ public sealed partial class WorldSimulation : ICogWorldContext
             Console.WriteLine($"[COG] VM Update error: {ex.Message}");
         }
 
-        UpdateNpcs(dt, playerPos);
-        UpdateProjectiles(dt, playerPos);
+        UpdateNpcs(dt);
+        UpdateProjectiles(dt);
         UpdateSparks(dt);
+        UpdateVisualEffects(dt);
         UpdateLightAnimations(dt);
         UpdateScreenColorEffects(dt);
         _soundEvents.Clear();
 
-        if (!IsPlayerFrozen && _sectorThrusts.TryGetValue(playerSector, out var playerThrust) && playerThrust.LengthSquared() > 1e-6f)
+        foreach (var player in _players)
         {
-            elevatorDelta += playerThrust * dt;
+            if (player.ThingIndex < 0 || player.ThingIndex >= _level.Things.Count || IsActorFrozen(player.ThingIndex))
+                continue;
+
+            int sec = _level.Things[player.ThingIndex].SectorIndex;
+            if (_sectorThrusts.TryGetValue(sec, out var thrust) && thrust.LengthSquared() > 1e-6f)
+                player.PendingPlatformDelta += thrust * dt;
         }
-
-        return elevatorDelta;
-    }
-
-    /// <summary>
-    /// Activates a Jedi Force power by inventory bin, dispatching to its retail <c>force_*.cog</c>
-    /// and applying Force Pull velocity to nearby items/weapons when activating Force Pull.
-    /// </summary>
-    public bool ActivateForcePower(int forceBin, Vector3 aimDir)
-    {
-        if (aimDir.LengthSquared() > 1e-6f)
-        {
-            _lastPlayerAimDir = Vector3.Normalize(aimDir);
-            _hasLastPlayerAimDir = true;
-        }
-
-        string? cogName = GetForceCogName(forceBin);
-        if (cogName == null)
-            return false;
-
-        var cog = GetOrCreateTemplateCog(cogName);
-        if (cog != null)
-        {
-            if (_startedForceCogs.Add(cogName) && cog.Program.Labels.ContainsKey("startup"))
-            {
-                SafeSendMessage(cog, "startup", senderRef: _localPlayerThingIndex, senderId: 0, sourceRef: _localPlayerThingIndex);
-            }
-
-            SafeSendMessage(cog, "activated", senderRef: _localPlayerThingIndex, senderId: 0, sourceRef: _localPlayerThingIndex);
-        }
-
-        bool pulledAny = false;
-        if (forceBin == PlayerInventory.BinForcePull)
-        {
-            pulledAny = ApplyForcePullToNearbyItems(aimDir);
-        }
-
-        return cog != null || pulledAny;
-    }
-
-    private static string? GetForceCogName(int forceBin) => forceBin switch
-    {
-        PlayerInventory.BinForceJump => "force_jump.cog",
-        PlayerInventory.BinForceSpeed => "force_speed.cog",
-        PlayerInventory.BinForceSeeing => "force_seeing.cog",
-        PlayerInventory.BinForcePull => "force_pull.cog",
-        PlayerInventory.BinForceHeal => "force_heal.cog",
-        PlayerInventory.BinForceBlinding => "force_blinding.cog",
-        PlayerInventory.BinForceAbsorb => "force_absorb.cog",
-        PlayerInventory.BinForceThrow => "force_throw.cog",
-        PlayerInventory.BinForceGrip => "force_grip.cog",
-        PlayerInventory.BinForceLightning => "force_lightning.cog",
-        PlayerInventory.BinForceDestruction => "force_destruction.cog",
-        _ => null
-    };
-
-    private bool ApplyForcePullToNearbyItems(Vector3 aimDir)
-    {
-        if (_localPlayerThingIndex < 0 || _localPlayerThingIndex >= _level.Things.Count)
-            return false;
-
-        Vector3 playerPos = GetThingPos(_localPlayerThingIndex);
-        Vector3 forward = aimDir.LengthSquared() > 1e-6f ? Vector3.Normalize(aimDir) : _lastPlayerAimDir;
-        Vector3 eyeOffset = new(0f, 0f, 0.12f);
-        const float maxPullDist = 8.0f;
-        const float minViewDot = 0.5f;
-        bool pulledAny = false;
-
-        for (int i = 0; i < _level.Things.Count; i++)
-        {
-            if (i == _localPlayerThingIndex || _destroyedThings.Contains(i) ||
-                _thingMotions.ContainsKey(i) || _npcs.ContainsKey(i))
-                continue;
-
-            var thing = _level.Things[i];
-            if (thing.IsPlayerSpawn ||
-                (thing.ThingFlags & (uint)(SithThingFlags.Disabled | SithThingFlags.Destroyed)) != 0)
-                continue;
-
-            string? type = ResolveTemplateParam(thing.TemplateName, "type");
-            string? itemCog = ResolveTemplateParam(thing.TemplateName, "cog");
-            bool isPullable = string.Equals(type, "item", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(type, "weapon", StringComparison.OrdinalIgnoreCase) ||
-                (!string.IsNullOrEmpty(itemCog) && itemCog.StartsWith("pow_", StringComparison.OrdinalIgnoreCase));
-
-            if (!isPullable)
-                continue;
-
-            Vector3 toThing = thing.Position - playerPos;
-            float dist = toThing.Length();
-            if (dist <= 0.01f || dist > maxPullDist)
-                continue;
-
-            if (Vector3.Dot(forward, toThing / dist) < minViewDot)
-                continue;
-
-            if (!HasLineOfSight(playerPos + eyeOffset, thing.Position + eyeOffset))
-                continue;
-
-            Vector3 pullDir = Vector3.Normalize(playerPos - thing.Position);
-            SetThingVel(i, pullDir * 3.5f + new Vector3(0f, 0f, 0.8f));
-            pulledAny = true;
-        }
-
-        return pulledAny;
     }
 
     private void UpdateThingVelocities(float dt)
@@ -844,7 +1027,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
             for (int i = 0; i < _level.Things.Count; i++)
             {
                 var t = _level.Things[i];
-                if (t.ThingIndex == _localPlayerThingIndex ||
+                if (_playersByThing.ContainsKey(t.ThingIndex) ||
                     _destroyedThings.Contains(t.ThingIndex) ||
                     _npcs.ContainsKey(t.ThingIndex) ||
                     _thingMotions.ContainsKey(t.ThingIndex) ||
@@ -871,7 +1054,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
         {
             if (thingId < 0 || thingId >= _level.Things.Count ||
                 _destroyedThings.Contains(thingId) ||
-                thingId == _localPlayerThingIndex ||
+                _playersByThing.ContainsKey(thingId) ||
                 _thingMotions.ContainsKey(thingId))
             {
                 _thingVelocities.Remove(thingId);
@@ -925,23 +1108,46 @@ public sealed partial class WorldSimulation : ICogWorldContext
     /// <summary>
     /// Resets player health and shields for respawn while preserving level progress and inventory.
     /// </summary>
-    public void RespawnPlayer()
+    public void RespawnPlayer(int thingId = -1)
     {
-        Inventory.ResetForRespawn();
-        StatusMessage = null;
-        _statusTimer = 0f;
+        if (!TryResolvePlayer(thingId, out var player))
+            return;
+
+        player.Inventory.ResetForRespawn();
+        player.StatusMessage = null;
+        player.StatusTimer = 0f;
+        player.ActiveFireMode = -1;
+        player.FireWait = 0f;
+        player.MountWait = 0f;
+        player.SaberDamageActive = false;
 
         var spawn = _level.GetPlayerSpawn();
-        _prevPlayerSector = spawn?.SectorIndex ?? -1;
+        player.PrevSectorIndex = spawn?.SectorIndex ?? -1;
+
+        if (IsMultiplayer)
+        {
+            var classCog = GetOrCreatePlayerClassCog(player);
+            if (classCog != null && classCog.Program.Labels.ContainsKey("newplayer"))
+            {
+                WithPlayerCogContext(player.ThingIndex, () =>
+                    SafeSendMessage(classCog, "newplayer", senderRef: player.ThingIndex, senderId: 0, sourceRef: player.ThingIndex, senderType: 3));
+            }
+        }
     }
 
     /// <summary>
-    /// Checks for nearby item/powerup things overlapping the player's body capsule and dispatches
+    /// Checks for nearby item/powerup things overlapping the local player's body capsule and dispatches
     /// "touched" to their template COG (removing/hiding the pickup if taken).
     /// </summary>
     public void CheckPickupTouches(Vector3 playerPos)
     {
-        if (Inventory.IsDead)
+        if (LocalPlayer != null)
+            CheckPickupTouches(LocalPlayer, playerPos);
+    }
+
+    private void CheckPickupTouches(PlayerState player, Vector3 playerPos)
+    {
+        if (player.Inventory.IsDead)
             return;
 
         const float playerRadius = 0.065f;
@@ -952,6 +1158,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
         {
             var thing = _level.Things[i];
             if (thing.IsPlayerSpawn ||
+                _playersByThing.ContainsKey(thing.ThingIndex) ||
                 _destroyedThings.Contains(thing.ThingIndex) ||
                 (thing.ThingFlags & (uint)(SithThingFlags.Disabled | SithThingFlags.Destroyed)) != 0 ||
                 !JklThing.ShouldSpawnForDifficulty(thing.ThingFlags, Difficulty) ||
@@ -962,7 +1169,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
             float touchRadius = playerRadius + MathF.Max(0.02f, itemSize);
             if (DistanceSqPointToSegment(thing.Position, playerPos, playerTop, out _) > touchRadius * touchRadius)
             {
-                _touchedCapturedThings.Remove(thing.ThingIndex);
+                player.TouchedCapturedThings.Remove(thing.ThingIndex);
                 continue;
             }
 
@@ -978,7 +1185,8 @@ public sealed partial class WorldSimulation : ICogWorldContext
                     continue;
 
                 _pickupCogs[thing.ThingIndex] = cog;
-                SafeSendMessage(cog, "touched", senderRef: thing.ThingIndex, senderId: 0, sourceRef: _localPlayerThingIndex, senderType: 3);
+                WithPlayerCogContext(player.ThingIndex, () =>
+                    SafeSendMessage(cog, "touched", senderRef: thing.ThingIndex, senderId: 0, sourceRef: player.ThingIndex, senderType: 3));
                 continue;
             }
 
@@ -990,7 +1198,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
             if (!_thingToCogs.TryGetValue(thing.ThingIndex, out var linkedCogs))
                 continue;
 
-            if (!_touchedCapturedThings.Add(thing.ThingIndex))
+            if (!player.TouchedCapturedThings.Add(thing.ThingIndex))
                 continue;
 
             foreach (var cog in linkedCogs)
@@ -1001,12 +1209,13 @@ public sealed partial class WorldSimulation : ICogWorldContext
                     continue;
 
                 int symLinkId = GetSymbolLinkId(cog, CogSymbolType.Thing, thing.ThingIndex);
-                SafeSendMessage(cog, "touched", senderRef: thing.ThingIndex, senderId: symLinkId, sourceRef: _localPlayerThingIndex, senderType: 3);
+                WithPlayerCogContext(player.ThingIndex, () =>
+                    SafeSendMessage(cog, "touched", senderRef: thing.ThingIndex, senderId: symLinkId, sourceRef: player.ThingIndex, senderType: 3));
             }
         }
     }
 
-    private void CheckSightedCogs(Vector3 playerPos, Vector3? aimDir)
+    private void CheckSightedCogs(PlayerState player, Vector3 playerPos, Vector3? aimDir)
     {
         if (_thingToCogs.Count == 0)
             return;
@@ -1079,7 +1288,8 @@ public sealed partial class WorldSimulation : ICogWorldContext
                     continue;
 
                 int linkId = GetSymbolLinkId(cog, CogSymbolType.Thing, thingId);
-                SafeSendMessage(cog, "sighted", senderRef: thingId, senderId: linkId, sourceRef: _localPlayerThingIndex, senderType: 3);
+                WithPlayerCogContext(player.ThingIndex, () =>
+                    SafeSendMessage(cog, "sighted", senderRef: thingId, senderId: linkId, sourceRef: player.ThingIndex, senderType: 3));
             }
         }
     }
@@ -1129,9 +1339,9 @@ public sealed partial class WorldSimulation : ICogWorldContext
         }
     }
 
-    private void CheckDeathFloorSurfaces(Vector3 playerPos, int playerSector)
+    private void CheckDeathFloorSurfaces(PlayerState player, Vector3 playerPos, int playerSector)
     {
-        if (Inventory.IsDead || playerSector < 0 || playerSector >= _level.Sectors.Count)
+        if (player.Inventory.IsDead || playerSector < 0 || playerSector >= _level.Sectors.Count)
             return;
 
         var sector = _level.Sectors[playerSector];
@@ -1161,21 +1371,23 @@ public sealed partial class WorldSimulation : ICogWorldContext
                 if (cog.Program.Labels.ContainsKey("touched"))
                 {
                     int symLinkId = GetSymbolLinkId(cog, CogSymbolType.Surface, surface.SurfaceIndex);
-                    SafeSendMessage(cog, "touched", senderRef: surface.SurfaceIndex, senderId: symLinkId, sourceRef: _localPlayerThingIndex, senderType: 6);
+                    WithPlayerCogContext(player.ThingIndex, () =>
+                        SafeSendMessage(cog, "touched", senderRef: surface.SurfaceIndex, senderId: symLinkId, sourceRef: player.ThingIndex, senderType: 6));
                 }
             }
         }
     }
 
-    private void UpdatePlayerSectorTransitions(int curSector)
+    private void UpdatePlayerSectorTransitions(PlayerState player, int curSector)
     {
-        if (_prevPlayerSector == curSector)
+        if (player.PrevSectorIndex == curSector)
             return;
 
-        int prevSector = _prevPlayerSector;
-        _prevPlayerSector = curSector;
+        int prevSector = player.PrevSectorIndex;
+        player.PrevSectorIndex = curSector;
 
-        UpdateSectorAmbientSound(curSector);
+        if (player.ThingIndex == _localPlayerThingIndex)
+            UpdateSectorAmbientSound(curSector);
 
         if (prevSector >= 0 && prevSector < _level.Sectors.Count && curSector >= 0 && curSector < _level.Sectors.Count)
         {
@@ -1185,9 +1397,9 @@ public sealed partial class WorldSimulation : ICogWorldContext
                 if (!surf.IsPortal || surf.MirrorSector?.SectorIndex != curSector)
                     continue;
 
-                DispatchSurfaceCrossed(surf.SurfaceIndex);
+                DispatchSurfaceCrossed(player, surf.SurfaceIndex);
                 if (surf.MirrorSurface != null)
-                    DispatchSurfaceCrossed(surf.MirrorSurface.SurfaceIndex);
+                    DispatchSurfaceCrossed(player, surf.MirrorSurface.SurfaceIndex);
             }
         }
 
@@ -1198,7 +1410,8 @@ public sealed partial class WorldSimulation : ICogWorldContext
                 if (cog.Program.Labels.ContainsKey("exited"))
                 {
                     int symLinkId = GetSymbolLinkId(cog, CogSymbolType.Sector, prevSector);
-                    SafeSendMessage(cog, "exited", senderRef: prevSector, senderId: symLinkId, sourceRef: _localPlayerThingIndex, senderType: 5);
+                    WithPlayerCogContext(player.ThingIndex, () =>
+                        SafeSendMessage(cog, "exited", senderRef: prevSector, senderId: symLinkId, sourceRef: player.ThingIndex, senderType: 5));
                 }
             }
         }
@@ -1210,13 +1423,14 @@ public sealed partial class WorldSimulation : ICogWorldContext
                 if (cog.Program.Labels.ContainsKey("entered"))
                 {
                     int symLinkId = GetSymbolLinkId(cog, CogSymbolType.Sector, curSector);
-                    SafeSendMessage(cog, "entered", senderRef: curSector, senderId: symLinkId, sourceRef: _localPlayerThingIndex, senderType: 5);
+                    WithPlayerCogContext(player.ThingIndex, () =>
+                        SafeSendMessage(cog, "entered", senderRef: curSector, senderId: symLinkId, sourceRef: player.ThingIndex, senderType: 5));
                 }
             }
         }
     }
 
-    private void DispatchSurfaceCrossed(int surfaceIndex)
+    private void DispatchSurfaceCrossed(PlayerState player, int surfaceIndex)
     {
         if (!_surfaceToCogs.TryGetValue(surfaceIndex, out var cogs))
             return;
@@ -1226,20 +1440,20 @@ public sealed partial class WorldSimulation : ICogWorldContext
             int symLinkId = GetSymbolLinkId(cog, CogSymbolType.Surface, surfaceIndex);
             if (cog.Program.Labels.ContainsKey("crossed"))
             {
-                SafeSendMessage(cog, "crossed", senderRef: surfaceIndex, senderId: symLinkId, sourceRef: _localPlayerThingIndex, senderType: 6);
+                WithPlayerCogContext(player.ThingIndex, () =>
+                    SafeSendMessage(cog, "crossed", senderRef: surfaceIndex, senderId: symLinkId, sourceRef: player.ThingIndex, senderType: 6));
             }
 
             if (cog.Program.Labels.ContainsKey("entered"))
             {
-                SafeSendMessage(cog, "entered", senderRef: surfaceIndex, senderId: symLinkId, sourceRef: _localPlayerThingIndex, senderType: 6);
+                WithPlayerCogContext(player.ThingIndex, () =>
+                    SafeSendMessage(cog, "entered", senderRef: surfaceIndex, senderId: symLinkId, sourceRef: player.ThingIndex, senderType: 6));
             }
         }
     }
 
-    private Vector3 UpdateThingMotions(float dt, Vector3 playerPos, int playerSector)
+    private void UpdateThingMotions(float dt)
     {
-        Vector3 playerElevatorDelta = Vector3.Zero;
-
         foreach (var (thingId, motion) in _thingMotions)
         {
             motion.LastDeltaZ = 0f;
@@ -1250,18 +1464,29 @@ public sealed partial class WorldSimulation : ICogWorldContext
             Vector3 prevPos = thing.Position;
             Vector3 prevPyr = thing.PitchYawRoll;
 
-            // Check if a closing door (moving toward frame 0) is blocked by the player inside its sector
-            if (!motion.IsPivotRotation && motion.TargetFrame == 0 && playerSector == thing.SectorIndex &&
-                Vector3.DistanceSquared(playerPos, thing.Position) < 0.09f)
+            // Check if a closing door (moving toward frame 0) is blocked by any player inside its sector
+            if (!motion.IsPivotRotation && motion.TargetFrame == 0)
             {
-                if (_thingToCogs.TryGetValue(thingId, out var doorCogs))
+                bool blockedByPlayer = false;
+                foreach (var player in _players)
+                {
+                    if (player.Inventory.IsDead || player.ThingIndex < 0 || player.ThingIndex >= _level.Things.Count)
+                        continue;
+                    var pThing = _level.Things[player.ThingIndex];
+                    if (pThing.SectorIndex == thing.SectorIndex &&
+                        Vector3.DistanceSquared(pThing.Position, thing.Position) < 0.09f)
+                    {
+                        blockedByPlayer = true;
+                        break;
+                    }
+                }
+
+                if (blockedByPlayer && _thingToCogs.TryGetValue(thingId, out var doorCogs))
                 {
                     foreach (var cog in doorCogs)
                     {
                         if (cog.Program.Labels.ContainsKey("blocked"))
-                        {
                             SafeSendMessage(cog, "blocked", thingId, senderType: 3);
-                        }
                     }
                 }
             }
@@ -1321,13 +1546,18 @@ public sealed partial class WorldSimulation : ICogWorldContext
 
             if (isElevatorOrPlatform)
             {
-                float horizDistSq = Vector2.DistanceSquared(
-                    new Vector2(playerPos.X, playerPos.Y),
-                    new Vector2(prevPos.X, prevPos.Y));
-
-                if (horizDistSq < 0.16f && MathF.Abs(playerPos.Z - prevPos.Z) < 0.22f)
+                foreach (var player in _players)
                 {
-                    playerElevatorDelta += stepDelta;
+                    if (player.ThingIndex < 0 || player.ThingIndex >= _level.Things.Count)
+                        continue;
+
+                    Vector3 pPos = _level.Things[player.ThingIndex].Position;
+                    float horizDistSq = Vector2.DistanceSquared(
+                        new Vector2(pPos.X, pPos.Y),
+                        new Vector2(prevPos.X, prevPos.Y));
+
+                    if (horizDistSq < 0.16f && MathF.Abs(pPos.Z - prevPos.Z) < 0.22f)
+                        player.PendingPlatformDelta += stepDelta;
                 }
             }
 
@@ -1376,8 +1606,6 @@ public sealed partial class WorldSimulation : ICogWorldContext
                 }
             }
         }
-
-        return playerElevatorDelta;
     }
 
     private static Vector3 GetThingForward(JklThing thing)
@@ -1386,17 +1614,31 @@ public sealed partial class WorldSimulation : ICogWorldContext
         return new Vector3(-MathF.Sin(yawRad), MathF.Cos(yawRad), 0f);
     }
 
-    private void UpdateNpcs(float dt, Vector3 playerPos)
+    private void UpdateNpcs(float dt)
     {
-        bool playerVisible = (GetActorFlags(_localPlayerThingIndex) & 0x80) == 0;
-        var playerCandidate = new AiTargetCandidate(_localPlayerThingIndex, playerPos, alignment: 1.0f, isAlive: !Inventory.IsDead, isVisible: playerVisible);
-        var playerTargetList = new[] { playerCandidate };
+        var playerCandidates = new List<AiTargetCandidate>(_players.Count);
+        foreach (var p in _players)
+        {
+            if (p.ThingIndex < 0 || p.ThingIndex >= _level.Things.Count)
+                continue;
+
+            bool pVisible = (GetActorFlags(p.ThingIndex) & 0x80) == 0;
+            playerCandidates.Add(new AiTargetCandidate(
+                p.ThingIndex,
+                _level.Things[p.ThingIndex].Position,
+                alignment: 1.0f,
+                isAlive: !p.Inventory.IsDead,
+                isVisible: pVisible));
+        }
 
         foreach (var npc in _npcs.Values)
         {
             npc.LastDistanceMoved = 0f;
             if (!npc.IsAlive)
                 continue;
+
+            if (npc.BlindTimer > 0f)
+                npc.BlindTimer = MathF.Max(0f, npc.BlindTimer - dt);
 
             if (npc.BlockAnimTimer > 0f)
                 npc.BlockAnimTimer = MathF.Max(0f, npc.BlockAnimTimer - dt);
@@ -1405,7 +1647,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
             if (npc.HitAnimTimer > 0f)
                 npc.HitAnimTimer = MathF.Max(0f, npc.HitAnimTimer - dt);
 
-            if (npc.Brain.IsAiPaused || IsActorFrozen(npc.Thing.ThingIndex))
+            if (npc.Brain.IsAiPaused || IsActorFrozen(npc.Thing.ThingIndex) || npc.BlindTimer > 0f)
             {
                 npc.AnimAction = "stand";
                 npc.AnimMode = 0;
@@ -1439,11 +1681,11 @@ public sealed partial class WorldSimulation : ICogWorldContext
                 || npc.Brain.Class.HasInstinct("LookForTarget")
                 || npc.WasDamagedThisTick
                 || npc.OverrideFireTargetId.HasValue;
-            IReadOnlyList<AiTargetCandidate> targets = playerTargetList;
+            IReadOnlyList<AiTargetCandidate> targets = playerCandidates;
             if (npc.OverrideFireTargetId is int fireTargetId &&
                 fireTargetId >= 0 &&
                 fireTargetId < _level.Things.Count &&
-                fireTargetId != _localPlayerThingIndex &&
+                !_playersByThing.ContainsKey(fireTargetId) &&
                 !_destroyedThings.Contains(fireTargetId))
             {
                 bool targetAlive = !_npcs.TryGetValue(fireTargetId, out var tNpc) || tNpc.IsAlive;
@@ -1462,7 +1704,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
                 Health = npc.Health,
                 MaxHealth = npc.MaxHealth,
                 WasDamaged = npc.WasDamagedThisTick,
-                DamagedByThingIndex = npc.WasDamagedThisTick ? _localPlayerThingIndex : null,
+                DamagedByThingIndex = npc.WasDamagedThisTick ? (npc.LastDamagerThingId >= 0 ? npc.LastDamagerThingId : (_localPlayerThingIndex >= 0 ? _localPlayerThingIndex : null)) : null,
                 DamageSourcePosition = npc.LastDamageSourcePos,
                 Targets = isHostile ? targets : Array.Empty<AiTargetCandidate>(),
                 Sounds = _soundEvents,
@@ -1472,6 +1714,17 @@ public sealed partial class WorldSimulation : ICogWorldContext
             npc.WasDamagedThisTick = false;
 
             var decision = npc.Brain.Update(dt, aiContext);
+
+            // Resolve active target player for combat checks
+            PlayerState? targetPlayer = null;
+            if (npc.Brain.TargetThingIndex is int targetId && _playersByThing.TryGetValue(targetId, out var targeted))
+                targetPlayer = targeted;
+            else
+                targetPlayer = FindNearestAlivePlayer(npc.Thing.Position);
+
+            Vector3 targetPos = targetPlayer != null && targetPlayer.ThingIndex < _level.Things.Count
+                ? _level.Things[targetPlayer.ThingIndex].Position
+                : decision.DesiredLookTarget;
 
             // Smoothly turn toward desired look target (or COG AISetLookPos override)
             Vector3 desiredLookTarget = npc.OverrideLookPos ?? decision.DesiredLookTarget;
@@ -1557,7 +1810,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
 
                 if (isMeleeNpc)
                 {
-                    if (Vector3.Distance(npc.Thing.Position, playerPos) <= 0.45f)
+                    if (targetPlayer != null && Vector3.Distance(npc.Thing.Position, targetPos) <= 0.45f)
                     {
                         npc.FireAnimTimer = 0.45f;
                         npc.FireAnimAction = "fire";
@@ -1571,7 +1824,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
                     npc.FireAnimAction = "fire";
                     npc.LoopAnim = false;
                     Vector3 muzzle = npc.Thing.Position + new Vector3(0f, 0f, 0.10f);
-                    Vector3 aimTarget = playerPos + new Vector3(0f, 0f, 0.10f);
+                    Vector3 aimTarget = targetPos + new Vector3(0f, 0f, 0.10f);
                     Vector3 fireDir = aimTarget - muzzle;
                     if (fireDir.LengthSquared() > 1e-6f)
                     {
@@ -1598,11 +1851,12 @@ public sealed partial class WorldSimulation : ICogWorldContext
                 _audio?.PlaySoundPos("ltsaberswing01.wav", npc.Thing.Position, 0.85f, 0.5f, 5.0f);
 
                 float attRange = MathF.Max(npc.Brain.SaberAttackRange, 0.25f);
-                if (!Inventory.IsDead &&
-                    Vector3.Distance(npc.Thing.Position, playerPos) <= attRange &&
-                    HasNpcLineOfSight(npc.Thing.Position, playerPos))
+                if (targetPlayer != null &&
+                    !targetPlayer.Inventory.IsDead &&
+                    Vector3.Distance(npc.Thing.Position, targetPos) <= attRange &&
+                    HasNpcLineOfSight(npc.Thing.Position, targetPos))
                 {
-                    ApplyDamageToPlayer(npc.Thing.ThingIndex, npc.Brain.SaberAttackDamage, "ltsaberbodyhit01.wav");
+                    ApplyDamageToPlayer(targetPlayer, npc.Thing.ThingIndex, npc.Brain.SaberAttackDamage, "ltsaberbodyhit01.wav");
                 }
             }
 
@@ -1613,28 +1867,30 @@ public sealed partial class WorldSimulation : ICogWorldContext
                 npc.LoopAnim = false;
                 _audio?.PlaySoundPos("ltsaberswing02.wav", npc.Thing.Position, 0.9f, 0.5f, 6.0f);
 
-                Vector3 toPlayerXY = new Vector3(playerPos.X - npc.Thing.Position.X, playerPos.Y - npc.Thing.Position.Y, 0f);
-                if (toPlayerXY.LengthSquared() > 1e-6f)
+                Vector3 toTargetXY = new Vector3(targetPos.X - npc.Thing.Position.X, targetPos.Y - npc.Thing.Position.Y, 0f);
+                if (toTargetXY.LengthSquared() > 1e-6f)
                 {
-                    Vector3 lungeDir = Vector3.Normalize(toPlayerXY);
-                    TryMoveNpc(npc, lungeDir, MathF.Min(0.35f, toPlayerXY.Length()), npc.UseGravity ? null : playerPos.Z);
+                    Vector3 lungeDir = Vector3.Normalize(toTargetXY);
+                    TryMoveNpc(npc, lungeDir, MathF.Min(0.35f, toTargetXY.Length()), npc.UseGravity ? null : targetPos.Z);
                 }
 
                 float specialRange = MathF.Max(npc.Brain.Class.Saberfighting?.Att1Range ?? 0.35f, 0.35f);
-                if (!Inventory.IsDead &&
-                    Vector3.Distance(npc.Thing.Position, playerPos) <= specialRange &&
-                    HasNpcLineOfSight(npc.Thing.Position, playerPos))
+                if (targetPlayer != null &&
+                    !targetPlayer.Inventory.IsDead &&
+                    Vector3.Distance(npc.Thing.Position, targetPos) <= specialRange &&
+                    HasNpcLineOfSight(npc.Thing.Position, targetPos))
                 {
-                    ApplyDamageToPlayer(npc.Thing.ThingIndex, npc.Brain.SpecialAttackDamage, "ltsaberbodyhit01.wav");
+                    ApplyDamageToPlayer(targetPlayer, npc.Thing.ThingIndex, npc.Brain.SpecialAttackDamage, "ltsaberbodyhit01.wav");
                 }
             }
 
             if (npc.Brain.ForcePowerRequested > 0)
             {
+                int targetThingIdx = targetPlayer?.ThingIndex ?? _localPlayerThingIndex;
                 DispatchThingCogMessage(
                     npc.Thing.ThingIndex,
                     "user0",
-                    new CogValue(_localPlayerThingIndex),
+                    new CogValue(targetThingIdx),
                     new CogValue(npc.Brain.ForcePowerRequested));
             }
 
@@ -1951,7 +2207,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
             if ((thing.ThingFlags & (uint)(SithThingFlags.Disabled | SithThingFlags.Destroyed)) != 0)
                 continue;
 
-            if (thing.ThingIndex == _localPlayerThingIndex || thing.IsPlayerSpawn || _npcs.ContainsKey(thing.ThingIndex))
+            if (_playersByThing.ContainsKey(thing.ThingIndex) || thing.IsPlayerSpawn || _npcs.ContainsKey(thing.ThingIndex))
                 continue;
 
             bool isFramed = _thingFrames.ContainsKey(thing.ThingIndex);
@@ -2374,7 +2630,29 @@ public sealed partial class WorldSimulation : ICogWorldContext
     /// <c>SITH_SURFACE_COG_LINKED</c> surface or <c>SITH_TF_CAPTURED</c> thing, with a
     /// nearby floor-level switch fallback for recessed wall switches.
     /// </summary>
-    public bool ActivateNearestDoor(Vector3 playerPos, Vector3 aimDir)
+    private PlayerState? FindNearestAlivePlayer(Vector3 pos)
+    {
+        PlayerState? best = null;
+        float bestDistSq = float.MaxValue;
+        foreach (var p in _players)
+        {
+            if (p.Inventory.IsDead || p.ThingIndex < 0 || p.ThingIndex >= _level.Things.Count)
+                continue;
+
+            float dSq = Vector3.DistanceSquared(pos, _level.Things[p.ThingIndex].Position);
+            if (dSq < bestDistSq)
+            {
+                bestDistSq = dSq;
+                best = p;
+            }
+        }
+        return best;
+    }
+
+    public bool ActivateNearestDoor(Vector3 playerPos, Vector3 aimDir) =>
+        ActivateNearestDoor(_localPlayerThingIndex, playerPos, aimDir);
+
+    public bool ActivateNearestDoor(int playerThingId, Vector3 playerPos, Vector3 aimDir)
     {
         const int sithSurfaceCogLinked = 0x2;
         const float sphereRadius = 0.025f;
@@ -2450,7 +2728,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
         Vector3 spherePad = new(sphereRadius);
         foreach (var thing in _level.Things)
         {
-            if (thing.ThingIndex == _localPlayerThingIndex || _destroyedThings.Contains(thing.ThingIndex))
+            if (_playersByThing.ContainsKey(thing.ThingIndex) || _destroyedThings.Contains(thing.ThingIndex))
                 continue;
 
             uint flags = (uint)GetThingFlags(thing.ThingIndex);
@@ -2480,17 +2758,20 @@ public sealed partial class WorldSimulation : ICogWorldContext
             }
         }
 
+        int activatorRef = playerThingId >= 0 ? playerThingId : _localPlayerThingIndex;
         if (bestSurface != null && bestSurfaceCog != null)
         {
             int linkId = GetSymbolLinkId(bestSurfaceCog, CogSymbolType.Surface, bestSurface.SurfaceIndex);
-            SafeSendMessage(bestSurfaceCog, "activate", senderRef: bestSurface.SurfaceIndex, senderId: linkId, sourceRef: _localPlayerThingIndex, senderType: 6);
+            WithPlayerCogContext(activatorRef, () =>
+                SafeSendMessage(bestSurfaceCog, "activate", senderRef: bestSurface.SurfaceIndex, senderId: linkId, sourceRef: activatorRef, senderType: 6));
             return true;
         }
 
         if (bestThing != null && bestThingCog != null)
         {
             int linkId = GetSymbolLinkId(bestThingCog, CogSymbolType.Thing, bestThing.ThingIndex);
-            SafeSendMessage(bestThingCog, "activate", senderRef: bestThing.ThingIndex, senderId: linkId, sourceRef: _localPlayerThingIndex, senderType: 3);
+            WithPlayerCogContext(activatorRef, () =>
+                SafeSendMessage(bestThingCog, "activate", senderRef: bestThing.ThingIndex, senderId: linkId, sourceRef: activatorRef, senderType: 3));
             return true;
         }
 
@@ -2498,7 +2779,8 @@ public sealed partial class WorldSimulation : ICogWorldContext
         if (TryFindNearbySwitchSurface(playerPos, dir, sithSurfaceCogLinked, out var nearbySurface, out var nearbyCog))
         {
             int linkId = GetSymbolLinkId(nearbyCog!, CogSymbolType.Surface, nearbySurface!.SurfaceIndex);
-            SafeSendMessage(nearbyCog!, "activate", senderRef: nearbySurface!.SurfaceIndex, senderId: linkId, sourceRef: _localPlayerThingIndex, senderType: 6);
+            WithPlayerCogContext(activatorRef, () =>
+                SafeSendMessage(nearbyCog!, "activate", senderRef: nearbySurface!.SurfaceIndex, senderId: linkId, sourceRef: activatorRef, senderType: 6));
             return true;
         }
 
@@ -2817,22 +3099,50 @@ public sealed partial class WorldSimulation : ICogWorldContext
         }
 
         _audio?.PlaySoundPos("ltsaberbodyhit01.wav", _level.Things[hitThingId].Position, 0.9f, 0.5f, 5.0f);
-        ApplyNpcDamage(hitThingId, damage, rayOrigin, isMelee ? 16 : 2);
+        ApplyNpcDamage(hitThingId, damage, rayOrigin, isMelee ? 16 : 2, _localPlayerThingIndex);
         return hitThingId;
     }
 
     private bool CanNpcBlock(NpcRuntime npc) =>
         npc.IsAlive && (npc.TypeFlags & 0x200) != 0 && (JkGetFlags(npc.Thing.ThingIndex) & 0x1) != 0;
 
-    private void ApplyDamageToPlayer(int attackerThingId, float damage, string hitSound)
+    private void ApplyDamageToPlayer(PlayerState victim, int attackerThingId, float damage, string hitSound)
     {
-        _audio?.PlaySoundLocal(hitSound, 0.85f);
-        bool wasDead = Inventory.IsDead;
-        Inventory.ApplyDamage(damage);
-        if (!wasDead && Inventory.IsDead)
-            _audio?.PlaySoundLocal("kdie01.wav", 0.9f);
+        if (victim.ThingIndex == _localPlayerThingIndex)
+            _audio?.PlaySoundLocal(hitSound, 0.85f);
+        else if (victim.ThingIndex >= 0 && victim.ThingIndex < _level.Things.Count)
+            _audio?.PlaySoundPos(hitSound, _level.Things[victim.ThingIndex].Position, 0.85f, 0.5f, 6.0f);
 
-        Console.WriteLine($"[COMBAT] Player hit by Thing {attackerThingId} for {damage:F0} dmg (HP={Inventory.Health:F0}, Shields={Inventory.Shields:F0})");
+        bool wasDead = victim.Inventory.IsDead;
+        victim.Inventory.ApplyDamage(damage);
+        if (!wasDead && victim.Inventory.IsDead)
+        {
+            if (victim.ThingIndex == _localPlayerThingIndex)
+                _audio?.PlaySoundLocal("kdie01.wav", 0.9f);
+            else if (victim.ThingIndex >= 0 && victim.ThingIndex < _level.Things.Count)
+                _audio?.PlaySoundPos("kdie01.wav", _level.Things[victim.ThingIndex].Position, 0.9f, 0.5f, 6.0f);
+
+            RecordPlayerDeath(victim, attackerThingId);
+            DispatchPlayerKilledMessages(victim, attackerThingId);
+        }
+
+        Console.WriteLine($"[COMBAT] Player Thing {victim.ThingIndex} hit by Thing {attackerThingId} for {damage:F0} dmg (HP={victim.Inventory.Health:F0}, Shields={victim.Inventory.Shields:F0})");
+    }
+
+    private void RecordPlayerDeath(PlayerState victim, int attackerThingId)
+    {
+        victim.Killed++;
+        if (attackerThingId == victim.ThingIndex || attackerThingId < 0)
+        {
+            victim.Suicides++;
+            if (victim.Score > 0)
+                victim.Score--;
+        }
+        else if (_playersByThing.TryGetValue(attackerThingId, out var attacker))
+        {
+            attacker.Kills++;
+            attacker.Score += (!IsMultiplayer || attacker.Team == 0 || attacker.Team != victim.Team) ? 1 : -1;
+        }
     }
 
     private void SpawnProjectile(
@@ -2921,12 +3231,12 @@ public sealed partial class WorldSimulation : ICogWorldContext
         return BoltColorRed;
     }
 
-    private void UpdateProjectiles(float dt, Vector3 playerPos)
+    private void UpdateProjectiles(float dt)
     {
         if (_projectiles.Count == 0)
             return;
 
-        Vector3 playerTorso = playerPos + new Vector3(0f, 0f, 0.10f);
+        const float gravity = 3.5f;
 
         for (int i = _projectiles.Count - 1; i >= 0; i--)
         {
@@ -2934,9 +3244,18 @@ public sealed partial class WorldSimulation : ICogWorldContext
             proj.Lifetime -= dt;
             if (proj.Lifetime <= 0f)
             {
+                if (!string.IsNullOrWhiteSpace(proj.ExplodeTemplate) && proj.Bounce)
+                    TriggerExplosion(proj.Position, proj.ExplodeTemplate, proj.OwnerThingIndex);
+
                 _projectiles.RemoveAt(i);
                 continue;
             }
+
+            if (proj.UseGravity)
+                proj.Velocity.Z -= gravity * dt;
+
+            if (proj.Velocity.LengthSquared() > 1e-6f)
+                proj.Direction = Vector3.Normalize(proj.Velocity);
 
             Vector3 start = proj.Position;
             Vector3 nextPos = start + proj.Velocity * dt;
@@ -2944,9 +3263,11 @@ public sealed partial class WorldSimulation : ICogWorldContext
 
             int hitNpcId = -1;
             int hitPropId = -1;
+            PlayerState? hitPlayer = null;
             float bestT = 1.0f;
             Vector3 npcHitPos = endPos;
             Vector3 propHitPos = endPos;
+            Vector3 playerHitPos = endPos;
 
             foreach (var npc in _npcs.Values)
             {
@@ -2956,13 +3277,32 @@ public sealed partial class WorldSimulation : ICogWorldContext
                     continue;
 
                 Vector3 npcCenter = npc.Thing.Position + new Vector3(0f, 0f, 0.10f);
-                float hitRadius = MathF.Max(npc.Radius * 1.6f, 0.09f);
+                float hitRadius = MathF.Max(npc.Radius * 1.6f, 0.09f) + proj.Radius;
                 float distSq = DistanceSqPointToSegment(npcCenter, start, endPos, out float segT);
                 if (distSq <= hitRadius * hitRadius && segT < bestT)
                 {
                     bestT = segT;
                     hitNpcId = npc.Thing.ThingIndex;
                     npcHitPos = Vector3.Lerp(start, endPos, segT);
+                }
+            }
+
+            foreach (var targetPlayer in _players)
+            {
+                if (targetPlayer.Inventory.IsDead || targetPlayer.ThingIndex == proj.OwnerThingIndex)
+                    continue;
+                if (targetPlayer.ThingIndex < 0 || targetPlayer.ThingIndex >= _level.Things.Count)
+                    continue;
+
+                Vector3 targetTorso = _level.Things[targetPlayer.ThingIndex].Position + new Vector3(0f, 0f, 0.13f);
+                float hitRadius = 0.08f + proj.Radius;
+                float distSq = DistanceSqPointToSegment(targetTorso, start, endPos, out float segT);
+                if (distSq <= hitRadius * hitRadius && segT < bestT)
+                {
+                    bestT = segT;
+                    hitPlayer = targetPlayer;
+                    hitNpcId = -1;
+                    playerHitPos = Vector3.Lerp(start, endPos, segT);
                 }
             }
 
@@ -2979,15 +3319,15 @@ public sealed partial class WorldSimulation : ICogWorldContext
                     bestT = segT;
                     hitPropId = thingId;
                     hitNpcId = -1;
+                    hitPlayer = null;
                     propHitPos = Vector3.Lerp(start, endPos, segT);
                 }
             }
 
             if (hitPropId >= 0)
             {
-                _audio?.PlaySoundPos("shothit01.wav", propHitPos, 0.85f, 0.5f, 6.0f);
-                SpawnSparks(propHitPos, -proj.Direction, count: 10);
-                DispatchThingCogMessage(hitPropId, "damaged", new CogValue(proj.Damage), new CogValue(2));
+                DispatchThingCogMessageFromSource(hitPropId, proj.OwnerThingIndex, "damaged", new CogValue(proj.Damage), new CogValue(proj.DamageClass));
+                TriggerExplosion(propHitPos, proj.ExplodeTemplate, proj.OwnerThingIndex, directHitThingId: hitPropId, fallbackSound: "shothit01.wav");
                 _projectiles.RemoveAt(i);
                 continue;
             }
@@ -3035,31 +3375,47 @@ public sealed partial class WorldSimulation : ICogWorldContext
                     }
                 }
 
-                _audio?.PlaySoundPos("shothit01.wav", npcHitPos, 0.85f, 0.5f, 6.0f);
-                SpawnSparks(npcHitPos, -proj.Direction, count: 10);
-                ApplyNpcDamage(hitNpcId, proj.Damage, start, damageType: 2);
+                if (proj.Damage > 0f)
+                    ApplyNpcDamage(hitNpcId, proj.Damage, start, proj.DamageClass, proj.OwnerThingIndex);
+
+                TriggerExplosion(npcHitPos, proj.FleshHitTemplate ?? proj.ExplodeTemplate, proj.OwnerThingIndex, directHitThingId: hitNpcId, fallbackSound: "shothit01.wav");
                 _projectiles.RemoveAt(i);
                 continue;
             }
 
-            if (proj.IsEnemy)
+            if (hitPlayer != null)
             {
-                const float playerHitRadius = 0.08f;
-                if (DistanceSqPointToSegment(playerTorso, start, endPos, out _) <= playerHitRadius * playerHitRadius)
-                {
-                    ApplyDamageToPlayer(proj.OwnerThingIndex, proj.Damage, "kbodyhit01.wav");
-                    _projectiles.RemoveAt(i);
-                    continue;
-                }
+                if (proj.Damage > 0f)
+                    ApplyDamageToPlayer(hitPlayer, proj.OwnerThingIndex, proj.Damage, "kbodyhit01.wav");
+
+                TriggerExplosion(playerHitPos, proj.FleshHitTemplate ?? proj.ExplodeTemplate, proj.OwnerThingIndex, directHitThingId: hitPlayer.ThingIndex, fallbackSound: "kbodyhit01.wav");
+                _projectiles.RemoveAt(i);
+                continue;
             }
 
             if (hitWall)
             {
-                if (hitSurfaceId >= 0)
-                    DispatchSurfaceDamaged(hitSurfaceId, proj.Damage, damageType: 2);
+                if (proj.Bounce && !proj.ExplodeOnImpact)
+                {
+                    Vector3 normal = hitSurfaceId >= 0 && hitSurfaceId < _level.Surfaces.Count
+                        ? _level.Surfaces[hitSurfaceId].Normal
+                        : Vector3.UnitZ;
+                    Vector3 reflected = Vector3.Reflect(proj.Velocity, normal) * 0.55f;
+                    if (reflected.LengthSquared() < 0.04f)
+                        reflected = Vector3.Zero;
 
-                _audio?.PlaySoundPos("ricochet01.wav", endPos, 0.65f, 0.4f, 5.0f);
-                SpawnSparks(endPos, -proj.Direction, count: 10);
+                    proj.Velocity = reflected;
+                    proj.Position = endPos + normal * 0.015f;
+                    if (reflected.LengthSquared() > 1e-6f)
+                        proj.Direction = Vector3.Normalize(reflected);
+                    _audio?.PlaySoundPos("ThermClick01.wav", endPos, 0.45f, 0.3f, 4.0f);
+                    continue;
+                }
+
+                if (hitSurfaceId >= 0)
+                    DispatchSurfaceDamaged(hitSurfaceId, proj.Damage, proj.DamageClass, proj.OwnerThingIndex);
+
+                TriggerExplosion(endPos, proj.ExplodeTemplate, proj.OwnerThingIndex, fallbackSound: "ricochet01.wav");
                 _projectiles.RemoveAt(i);
                 continue;
             }
@@ -3072,7 +3428,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
     {
         if (thingId < 0 || thingId >= _level.Things.Count)
             return false;
-        if (thingId == _localPlayerThingIndex || _npcs.ContainsKey(thingId) || _destroyedThings.Contains(thingId))
+        if (_playersByThing.ContainsKey(thingId) || _npcs.ContainsKey(thingId) || _destroyedThings.Contains(thingId))
             return false;
 
         var thing = _level.Things[thingId];
@@ -3122,7 +3478,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
         return false;
     }
 
-    private void DispatchSurfaceDamaged(int surfaceIndex, float damage, int damageType)
+    private void DispatchSurfaceDamaged(int surfaceIndex, float damage, int damageType, int sourceRefOverride = -1)
     {
         if (surfaceIndex < 0 || surfaceIndex >= _level.Surfaces.Count)
             return;
@@ -3131,6 +3487,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
         if (!_surfaceToCogs.TryGetValue(surfaceIndex, out var cogs))
             return;
 
+        int sourceRef = sourceRefOverride >= 0 ? sourceRefOverride : _localPlayerThingIndex;
         var parameters = new CogValue[] { new(damage), new(damageType) };
         foreach (var cog in cogs)
         {
@@ -3143,7 +3500,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
                 "damaged",
                 senderRef: surfaceIndex,
                 senderId: symLinkId,
-                sourceRef: _localPlayerThingIndex,
+                sourceRef: sourceRef,
                 senderType: 6,
                 parameters: parameters);
         }
@@ -3200,13 +3557,15 @@ public sealed partial class WorldSimulation : ICogWorldContext
         return Vector3.DistanceSquared(p, closest);
     }
 
-    private void ApplyNpcDamage(int thingId, float damage, Vector3 attackerPos, int damageType = 16)
+    private void ApplyNpcDamage(int thingId, float damage, Vector3 attackerPos, int damageType = 16, int attackerThingId = -1)
     {
         if (!_npcs.TryGetValue(thingId, out var npc) || !npc.IsAlive)
             return;
 
-        CogValue damagedResult = DispatchThingCogMessage(
+        int source = attackerThingId >= 0 ? attackerThingId : _localPlayerThingIndex;
+        CogValue damagedResult = DispatchThingCogMessageFromSource(
             thingId,
+            source,
             "damaged",
             new CogValue(damage),
             new CogValue(damageType));
@@ -3216,6 +3575,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
 
         npc.Health -= finalDamage;
         npc.WasDamagedThisTick = true;
+        npc.LastDamagerThingId = source;
         npc.LastDamageSourcePos = attackerPos;
         npc.HitAnimTimer = 0.35f;
 
@@ -3234,7 +3594,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
                 ? "gonkdie1.wav"
                 : "bodyfall03.wav";
             _audio?.PlaySoundPos(deathSound, npc.Thing.Position, 0.9f, 0.5f, 6.0f);
-            DispatchThingCogMessage(thingId, "killed");
+            DispatchThingCogMessageFromSource(thingId, source, "killed");
         }
         else
         {
@@ -3242,11 +3602,15 @@ public sealed partial class WorldSimulation : ICogWorldContext
         }
     }
 
-    private CogValue DispatchThingCogMessage(int thingId, string message, params CogValue[] parameters)
+    private CogValue DispatchThingCogMessage(int thingId, string message, params CogValue[] parameters) =>
+        DispatchThingCogMessageFromSource(thingId, _localPlayerThingIndex, message, parameters);
+
+    private CogValue DispatchThingCogMessageFromSource(int thingId, int sourceRefOverride, string message, params CogValue[] parameters)
     {
         bool isDamaged = string.Equals(message, "damaged", StringComparison.OrdinalIgnoreCase) && parameters.Length > 0;
         CogValue[]? currentParams = parameters.Length > 0 ? (CogValue[])parameters.Clone() : null;
         CogValue lastReturn = CogValue.Null;
+        int sourceRef = sourceRefOverride >= 0 ? sourceRefOverride : _localPlayerThingIndex;
 
         if (_thingToCogs.TryGetValue(thingId, out var cogs))
         {
@@ -3261,7 +3625,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
                     message,
                     senderRef: thingId,
                     senderId: symLinkId,
-                    sourceRef: _localPlayerThingIndex,
+                    sourceRef: sourceRef,
                     senderType: 3,
                     parameters: currentParams);
 
@@ -3290,7 +3654,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
                             message,
                             senderRef: thingId,
                             senderId: 0,
-                            sourceRef: _localPlayerThingIndex,
+                            sourceRef: sourceRef,
                             senderType: 3,
                             parameters: currentParams);
 
@@ -3321,21 +3685,21 @@ public sealed partial class WorldSimulation : ICogWorldContext
     }
 
     /// <summary>
-    /// Synchronizes all NPC animation states and movement distances with <see cref="ThingMeshRenderer"/>.
+    /// Populates <paramref name="destination"/> with the current animation state snapshots for all active NPCs.
     /// </summary>
-    public void SyncThingAnimations(ThingMeshRenderer renderer)
+    public void GetThingAnimationSnapshots(List<ThingAnimationSnapshot> destination)
     {
+        destination.Clear();
         foreach (var npc in _npcs.Values)
         {
-            renderer.SetThingAnimation(npc.Thing.ThingIndex, npc.AnimAction, npc.AnimMode, npc.LoopAnim);
-            renderer.SetThingDistanceMoved(npc.Thing.ThingIndex, npc.LastDistanceMoved);
+            destination.Add(new ThingAnimationSnapshot(
+                npc.Thing.ThingIndex,
+                npc.AnimAction,
+                npc.AnimMode,
+                npc.LoopAnim,
+                npc.LastDistanceMoved));
         }
     }
-
-    /// <summary>
-    /// Applies all NPC animation states and movement distances to <see cref="ThingMeshRenderer"/>.
-    /// </summary>
-    public void ApplyThingAnimationState(ThingMeshRenderer renderer) => SyncThingAnimations(renderer);
 
     private void SafeSendMessage(CogInstance instance, string message, int senderRef = -1, int senderType = -1)
     {
@@ -3494,7 +3858,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
         return _thingMotions.TryGetValue(thingId, out var motion) ? motion.CurrentFrame : 0;
     }
 
-    public int GetLocalPlayerThing() => _localPlayerThingIndex;
+    public int GetLocalPlayerThing() => _activeCogPlayerContext ?? _localPlayerThingIndex;
 
     public float GetLevelTime() => _elapsedLevelTime;
 
@@ -3545,7 +3909,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
 
     public int PlaySoundThing(string sound, int thingId, float volume, float minRad, float maxRad, int flags)
     {
-        if (string.IsNullOrWhiteSpace(sound))
+        if (string.IsNullOrWhiteSpace(sound) || sound.Trim() == "-1")
             return 0;
 
         bool looping = (flags & 0x01) != 0;
@@ -3660,6 +4024,24 @@ public sealed partial class WorldSimulation : ICogWorldContext
             ThingFlags = 0
         };
         _level.Things.Add(thing);
+        if (!string.IsNullOrWhiteSpace(template))
+        {
+            string? type = ResolveTemplateParam(template, "type");
+            string? sprite = ResolveTemplateParam(template, "sprite");
+            if (string.Equals(type, "explosion", StringComparison.OrdinalIgnoreCase))
+            {
+                float dmg = ParseTemplateFloat(template, "damage", 0f);
+                float rng = ParseTemplateFloat(template, "range", 0f);
+                if (dmg > 0f && rng > 0f)
+                    TriggerExplosion(pos, template, _activeCogPlayerContext ?? _localPlayerThingIndex);
+                else
+                    SpawnVisualEffectFromTemplate(template, pos);
+            }
+            else if (!string.IsNullOrWhiteSpace(sprite))
+            {
+                SpawnVisualEffectFromTemplate(template, pos);
+            }
+        }
         if (TrySpawnNpcRuntime(thing))
             DispatchThingCogMessage(newId, "created");
 
@@ -3722,22 +4104,17 @@ public sealed partial class WorldSimulation : ICogWorldContext
         if (damage <= 0f)
             return 0f;
 
-        if (thingId == _localPlayerThingIndex)
+        if (_playersByThing.TryGetValue(thingId, out var player))
         {
-            float before = Inventory.Health;
-            bool wasDead = Inventory.IsDead;
-            Inventory.ApplyDamage(damage);
-            if (!wasDead && Inventory.IsDead)
-            {
-                _audio?.PlaySoundLocal("kdie01.wav", 0.9f);
-            }
-            return before - Inventory.Health;
+            float before = player.Inventory.Health;
+            ApplyDamageToPlayer(player, damager, damage, "kbodyhit01.wav");
+            return before - player.Inventory.Health;
         }
 
         if (_npcs.TryGetValue(thingId, out var npc) && npc.IsAlive)
         {
             float before = npc.Health;
-            ApplyNpcDamage(thingId, damage, GetThingPos(damager), flags);
+            ApplyNpcDamage(thingId, damage, GetThingPos(damager), flags, damager);
             return MathF.Max(0f, before - npc.Health);
         }
 
@@ -3749,9 +4126,9 @@ public sealed partial class WorldSimulation : ICogWorldContext
         if (amount <= 0f)
             return;
 
-        if (thingId == _localPlayerThingIndex)
+        if (_playersByThing.TryGetValue(thingId, out var player))
         {
-            Inventory.Heal(amount);
+            player.Inventory.Heal(amount);
         }
         else if (_npcs.TryGetValue(thingId, out var npc) && npc.IsAlive)
         {
@@ -3761,16 +4138,16 @@ public sealed partial class WorldSimulation : ICogWorldContext
 
     public float GetThingHealth(int thingId)
     {
-        if (thingId == _localPlayerThingIndex)
-            return Inventory.Health;
+        if (_playersByThing.TryGetValue(thingId, out var player))
+            return player.Inventory.Health;
 
         return _npcs.TryGetValue(thingId, out var npc) ? npc.Health : 0f;
     }
 
     public float GetThingMaxHealth(int thingId)
     {
-        if (thingId == _localPlayerThingIndex)
-            return Inventory.MaxHealth;
+        if (_playersByThing.TryGetValue(thingId, out var player))
+            return player.Inventory.MaxHealth;
 
         return _npcs.TryGetValue(thingId, out var npc) ? npc.MaxHealth : 100f;
     }
@@ -3782,10 +4159,23 @@ public sealed partial class WorldSimulation : ICogWorldContext
         return string.Empty;
     }
 
-    public void SetThingVel(int thingId, Vector3 vel) => _thingVelocities[thingId] = vel;
+    public void SetThingVel(int thingId, Vector3 vel)
+    {
+        _thingVelocities[thingId] = vel;
+        if (_playersByThing.TryGetValue(thingId, out var player))
+        {
+            player.VelocityOverride = vel;
+            player.HasVelocityOverride = true;
+        }
+    }
 
-    public void AddThingVel(int thingId, Vector3 vel) =>
-        _thingVelocities[thingId] = GetThingVel(thingId) + vel;
+    public void AddThingVel(int thingId, Vector3 vel)
+    {
+        Vector3 baseVel = _playersByThing.TryGetValue(thingId, out var player) && player.HasVelocityOverride
+            ? player.VelocityOverride
+            : GetThingVel(thingId);
+        SetThingVel(thingId, baseVel + vel);
+    }
 
     public Vector3 GetThingVel(int thingId) => _thingVelocities.GetValueOrDefault(thingId, Vector3.Zero);
 
@@ -3816,7 +4206,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
         if (thingId < 0 || thingId >= _level.Things.Count)
             return 0;
 
-        if (thingId == _localPlayerThingIndex)
+        if (_playersByThing.ContainsKey(thingId))
             return 10;
 
         if (_npcs.ContainsKey(thingId))
@@ -3934,61 +4324,42 @@ public sealed partial class WorldSimulation : ICogWorldContext
         }
     }
 
-    public int GetCurSector() => _prevPlayerSector;
+    public int GetCurSector()
+    {
+        int pId = GetLocalPlayerThing();
+        if (pId >= 0 && _playersByThing.TryGetValue(pId, out var p))
+            return p.PrevSectorIndex;
+        return -1;
+    }
 
     public float ChangeInv(int thingId, int bin, float delta) =>
-        thingId == _localPlayerThingIndex ? Inventory.ChangeInv(bin, delta) : 0f;
+        _playersByThing.TryGetValue(thingId, out var player) ? player.Inventory.ChangeInv(bin, delta) : 0f;
 
     public float GetInv(int thingId, int bin) =>
-        thingId == _localPlayerThingIndex ? Inventory.GetInv(bin) : 0f;
+        _playersByThing.TryGetValue(thingId, out var player) ? player.Inventory.GetInv(bin) : 0f;
 
     public void SetInv(int thingId, int bin, float val)
     {
-        if (thingId == _localPlayerThingIndex)
-            Inventory.SetInv(bin, val);
+        if (_playersByThing.TryGetValue(thingId, out var player))
+            player.Inventory.SetInv(bin, val);
     }
 
     public float GetInvMax(int thingId, int bin) => PlayerInventory.GetInvMax(bin);
 
-    public void ActivateBin(int playerThing, float delay, int binIdx) =>
-        SetInvActivated(playerThing, binIdx, 1);
-
-    public float DeactivateBin(int playerThing, int binIdx)
-    {
-        bool wasActive = IsInvActivated(playerThing, binIdx) != 0;
-        SetInvActivated(playerThing, binIdx, 0);
-        return wasActive ? 1f : 0f;
-    }
-
-    public int IsInvActivated(int playerThing, int binIdx) =>
-        _invActivated.GetValueOrDefault((playerThing, binIdx), 0);
-
-    public void SetInvActivated(int playerThing, int binIdx, int activated) =>
-        _invActivated[(playerThing, binIdx)] = activated != 0 ? 1 : 0;
-
-    public void SetInvAvailable(int playerThing, int binIdx, int available)
-    {
-        if (playerThing == _localPlayerThingIndex)
-            Inventory.SetInvAvailable(binIdx, available != 0);
-    }
-
-    public int IsInvAvailable(int playerThing, int binIdx) =>
-        playerThing == _localPlayerThingIndex && Inventory.IsInvAvailable(binIdx) ? 1 : 0;
-
     public void SetGoalFlags(int thingId, int goalIdx, int flags)
     {
-        if (thingId == _localPlayerThingIndex)
-            Inventory.SetGoalFlags(goalIdx, flags);
+        if (_playersByThing.TryGetValue(thingId, out var player))
+            player.Inventory.SetGoalFlags(goalIdx, flags);
     }
 
     public void ClearGoalFlags(int thingId, int goalIdx, int flags)
     {
-        if (thingId == _localPlayerThingIndex)
-            Inventory.ClearGoalFlags(goalIdx, flags);
+        if (_playersByThing.TryGetValue(thingId, out var player))
+            player.Inventory.ClearGoalFlags(goalIdx, flags);
     }
 
     public int GetGoalFlags(int thingId, int goalIdx) =>
-        thingId == _localPlayerThingIndex ? Inventory.GetGoalFlags(goalIdx) : 0;
+        _playersByThing.TryGetValue(thingId, out var player) ? player.Inventory.GetGoalFlags(goalIdx) : 0;
 
     public void TakeItem(int itemThingId, int playerThingId)
     {
@@ -4005,7 +4376,8 @@ public sealed partial class WorldSimulation : ICogWorldContext
 
         if (cog != null && cog.Program.Labels.ContainsKey("taken"))
         {
-            SafeSendMessage(cog, "taken", senderRef: itemThingId, senderId: 0, sourceRef: playerThingId, senderType: 3);
+            WithPlayerCogContext(playerThingId >= 0 ? playerThingId : _localPlayerThingIndex, () =>
+                SafeSendMessage(cog, "taken", senderRef: itemThingId, senderId: 0, sourceRef: playerThingId, senderType: 3));
         }
     }
 
@@ -4021,36 +4393,21 @@ public sealed partial class WorldSimulation : ICogWorldContext
             : -1;
     }
 
-    public int GetAutoReload() => 1;
+    public int IsMulti() => IsMultiplayer ? 1 : 0;
 
-    public int AutoSelectWeapon(int thingId, int mode)
+    public int GetMajorMode() => GetMajorMode(GetLocalPlayerThing());
+
+    public int GetMajorMode(int thingId) =>
+        TryResolvePlayer(thingId, out var player) && player.IsUnderwater ? 5 : 0;
+
+    public Vector3 GetThingThrust(int thingId) =>
+        _playersByThing.TryGetValue(thingId, out var player) ? player.Thrust : Vector3.Zero;
+
+    public void SetArmedMode(int thingId, int mode)
     {
-        if (Inventory.EnergyAmmo > 0f)
-        {
-            if (Inventory.GetInv(6) > 0f)
-                return 6;
-            if (Inventory.GetInv(PlayerInventory.BinStRifle) > 0f)
-                return PlayerInventory.BinStRifle;
-            if (Inventory.HasBryar)
-                return PlayerInventory.BinBryar;
-        }
-
-        return Inventory.HasLightsaber ? PlayerInventory.BinLightsaber : PlayerInventory.BinFists;
+        if (_playersByThing.TryGetValue(thingId, out var player))
+            player.ArmedMode = mode;
     }
-
-    public void SelectWeapon(int thingId, int weapon)
-    {
-        _curWeapons[thingId] = weapon;
-        _curInvWeapons[thingId] = weapon;
-    }
-
-    public int GetCurWeapon(int thingId) => _curWeapons.GetValueOrDefault(thingId, PlayerInventory.BinFists);
-
-    public void SetCurWeapon(int playerThing, int binIdx) => _curWeapons[playerThing] = binIdx;
-
-    public void SetCurInvWeapon(int thingId, int weapon) => _curInvWeapons[thingId] = weapon;
-
-    public int GetCurInvWeapon(int thingId) => _curInvWeapons.GetValueOrDefault(thingId, -1);
 
     public float GetThingUserData(int thingId) => _thingUserData.GetValueOrDefault(thingId, 0f);
 
@@ -4077,7 +4434,11 @@ public sealed partial class WorldSimulation : ICogWorldContext
 
     public void SetThingHealth(int thingId, float health)
     {
-        if (_npcs.TryGetValue(thingId, out var npc))
+        if (_playersByThing.TryGetValue(thingId, out var player))
+        {
+            player.Inventory.Health = MathF.Max(0f, health);
+        }
+        else if (_npcs.TryGetValue(thingId, out var npc))
         {
             npc.Health = MathF.Max(0f, health);
             npc.IsAlive = npc.Health > 0f;
@@ -4300,30 +4661,13 @@ public sealed partial class WorldSimulation : ICogWorldContext
     public int NextThingInView() =>
         _viewSearchIndex < _viewSearchResults.Count ? _viewSearchResults[_viewSearchIndex++] : -1;
 
-    public float SkillTarget(int targetThing, int sourceThing, float param0, float param1)
-    {
-        if (targetThing < 0 || targetThing >= _level.Things.Count)
-        {
-            targetThing = FirstThingInView(sourceThing, 30f, 12f, 0);
-            if (targetThing < 0)
-                return -1f;
-        }
-
-        int bin = (int)MathF.Round(param0);
-        if (bin == PlayerInventory.BinForcePull)
-        {
-            Vector3 dir = GetThingPos(sourceThing) - GetThingPos(targetThing);
-            Vector3 pullDir = dir.LengthSquared() > 1e-5f ? Vector3.Normalize(dir) : Vector3.Zero;
-            SetThingVel(targetThing, pullDir * 3.5f + new Vector3(0f, 0f, 0.8f));
-        }
-
-        return 1f;
-    }
-
     private Vector3 GetThingForward(int thingId)
     {
-        if (thingId == _localPlayerThingIndex && _hasLastPlayerAimDir)
-            return _lastPlayerAimDir;
+        if (_playersByThing.TryGetValue(thingId, out var player) && player.HasAimDirection)
+            return player.AimDirection;
+
+        if (thingId < 0 || thingId >= _level.Things.Count)
+            return Vector3.UnitY;
 
         var pyr = _level.Things[thingId].PitchYawRoll;
         float yawRad = pyr.Y * (MathF.PI / 180f);
@@ -4337,8 +4681,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
     public void JkEndLevel(int success)
     {
         LevelCompleted = success != 0;
-        StatusMessage = LevelCompleted ? "LEVEL COMPLETED!" : "MISSION FAILED!";
-        _statusTimer = 10.0f;
+        ShowStatusMessage(LevelCompleted ? "LEVEL COMPLETED!" : "MISSION FAILED!", 10.0f);
 
         var snapshot = new List<CogInstance>(_cogVm.Instances);
         foreach (var instance in snapshot)
@@ -4350,13 +4693,14 @@ public sealed partial class WorldSimulation : ICogWorldContext
 
     public void JkPrintUniString(int player, int strId)
     {
+        string text;
         if (_strings.TryGetCogString(strId, out string localized))
         {
-            StatusMessage = localized;
+            text = localized;
         }
         else
         {
-            StatusMessage = strId switch
+            text = strId switch
             {
                 2 => "BRYAR PISTOL",
                 3 => "STORMTROOPER RIFLE",
@@ -4376,8 +4720,18 @@ public sealed partial class WorldSimulation : ICogWorldContext
                 _ => $"COG MSG {strId}"
             };
         }
-        _statusTimer = 3.5f;
-        Console.WriteLine($"[HUD] {StatusMessage}");
+
+        if (TryResolvePlayer(player, out var targetPlayer))
+        {
+            targetPlayer.StatusMessage = text;
+            targetPlayer.StatusTimer = 3.5f;
+        }
+        else
+        {
+            _globalStatusMessage = text;
+            _globalStatusTimer = 3.5f;
+        }
+        Console.WriteLine($"[HUD] {text}");
     }
 
     public void JkSetFlags(int thingId, int flags) =>
@@ -4436,12 +4790,23 @@ public sealed partial class WorldSimulation : ICogWorldContext
 
     public void ShowStatusMessage(string message, float duration = 4.0f)
     {
-        StatusMessage = message;
-        _statusTimer = duration;
+        if (LocalPlayer != null)
+        {
+            LocalPlayer.StatusMessage = message;
+            LocalPlayer.StatusTimer = duration;
+        }
+        else
+        {
+            _globalStatusMessage = message;
+            _globalStatusTimer = duration;
+        }
     }
 
     public int PlayKey(int thingId, string keyName, int priority, int flags)
     {
+        if (thingId < 0)
+            return -1;
+
         if (!string.IsNullOrWhiteSpace(keyName))
         {
             bool loop = (flags & 0x14) == 0;
@@ -4451,7 +4816,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
         return _nextKeyTrackId++;
     }
 
-    public bool IsInCutscene => (GetActorFlags(_localPlayerThingIndex) & 0xa00000) != 0;
+    public bool IsInCutscene => _localPlayerThingIndex >= 0 && (GetActorFlags(_localPlayerThingIndex) & 0xa00000) != 0;
 
     /// <summary>
     /// Fast-forwards active COG sleep timers until the intro/cutscene lock (0xa00000) clears.

@@ -5,7 +5,7 @@ using OpenSith.Core.Data;
 using OpenSith.Core.Vfs;
 using OpenSith.Core.World;
 
-namespace OpenSith.Client;
+namespace OpenSith.Core.Simulation;
 
 public sealed partial class WorldSimulation
 {
@@ -187,9 +187,10 @@ public sealed partial class WorldSimulation
 
         Vector3 tint = _dynamicTint + _dynamicAdd;
 
-        if (_prevPlayerSector >= 0 && _prevPlayerSector < _level.Sectors.Count)
+        int curSector = LocalPlayer?.PrevSectorIndex ?? -1;
+        if (curSector >= 0 && curSector < _level.Sectors.Count)
         {
-            Vector3 secTint = _level.Sectors[_prevPlayerSector].Tint;
+            Vector3 secTint = _level.Sectors[curSector].Tint;
             tint += new Vector3(
                 Math.Clamp(secTint.X, 0f, 1f),
                 Math.Clamp(secTint.Y, 0f, 1f),
@@ -492,7 +493,7 @@ public sealed partial class WorldSimulation
         else
             _sectorSounds[sectorId] = (sound, volume);
 
-        if (sectorId == _prevPlayerSector)
+        if (sectorId == (LocalPlayer?.PrevSectorIndex ?? -1))
             UpdateSectorAmbientSound(sectorId);
     }
 

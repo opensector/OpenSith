@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using OpenSith.Core.Cog;
 using OpenSith.Core.Materials;
 using OpenSith.Core.Vfs;
 using Silk.NET.OpenGL;
@@ -151,7 +152,11 @@ public sealed class HudRenderer : IDisposable
         int ammo,
         int selectedWeapon,
         bool isDead,
-        string? statusMessage = null)
+        string? statusMessage = null,
+        float forceMana = 0f,
+        float maxForceMana = 0f,
+        float battery = 200f,
+        bool fieldLightOn = false)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -200,7 +205,7 @@ public sealed class HudRenderer : IDisposable
                 DrawCrosshair(screenWidth * 0.5f, screenHeight * 0.5f, hudScale, selectedWeapon);
 
             DrawBottomLeftStatus(screenHeight, hudScale, health, maxHealth, shields);
-            DrawBottomRightStatus(screenWidth, screenHeight, hudScale, ammo, selectedWeapon);
+            DrawBottomRightStatus(screenWidth, screenHeight, hudScale, ammo, selectedWeapon, forceMana, maxForceMana, battery, fieldLightOn);
             DrawStatusMessages(screenWidth, hudScale, isDead, statusMessage);
         }
         finally
@@ -290,7 +295,11 @@ public sealed class HudRenderer : IDisposable
         int screenHeight,
         float hudScale,
         int ammo,
-        int selectedWeapon)
+        int selectedWeapon,
+        float forceMana,
+        float maxForceMana,
+        float battery,
+        bool fieldLightOn)
     {
         if (_statusRight is null)
             return;
@@ -301,9 +310,12 @@ public sealed class HudRenderer : IDisposable
 
         if (_stBat is { Frames.Length: > 0 })
         {
+            int frameCount = _stBat.Frames.Length;
+            float batFrac = Math.Clamp(battery / 200.0f, 0f, 1f);
+            int batFrame = Math.Clamp((int)MathF.Round((frameCount - 1) * (1f - batFrac)), 0, frameCount - 1);
             DrawSprite(
                 _stBat,
-                _stBat.Frames.Length - 1,
+                batFrame,
                 rightX + _stBat.XPos * hudScale,
                 rightY + _stBat.YPos * hudScale,
                 hudScale);
@@ -311,9 +323,10 @@ public sealed class HudRenderer : IDisposable
 
         if (_stFieldLite is { Frames.Length: > 0 })
         {
+            int fieldFrame = fieldLightOn && _stFieldLite.Frames.Length > 1 ? 1 : 0;
             DrawSprite(
                 _stFieldLite,
-                0,
+                fieldFrame,
                 rightX + _stFieldLite.XPos * hudScale,
                 rightY + _stFieldLite.YPos * hudScale,
                 hudScale);
@@ -321,9 +334,12 @@ public sealed class HudRenderer : IDisposable
 
         if (_stFrc is { Frames.Length: > 0 })
         {
+            int frameCount = _stFrc.Frames.Length;
+            float manaFrac = maxForceMana > 0f ? Math.Clamp(forceMana / maxForceMana, 0f, 1f) : 0f;
+            int forceFrame = Math.Clamp((int)MathF.Round((frameCount - 1) * (1f - manaFrac)), 0, frameCount - 1);
             DrawSprite(
                 _stFrc,
-                0,
+                forceFrame,
                 rightX + _stFrc.XPos * hudScale,
                 rightY + _stFrc.YPos * hudScale,
                 hudScale);
@@ -331,7 +347,8 @@ public sealed class HudRenderer : IDisposable
 
         if (_amoNums is not null)
         {
-            string ammoText = selectedWeapon == 1 ? ":::" : $"{Math.Clamp(ammo, 0, 999):D3}";
+            bool noAmmoDisplay = selectedWeapon == PlayerInventory.BinFists || selectedWeapon == PlayerInventory.BinLightsaber;
+            string ammoText = noAmmoDisplay ? ":::" : $"{Math.Clamp(ammo, 0, 999):D3}";
             DrawSftText(_amoNums, ammoText, rightX + 13.0f * hudScale, rightY + 19.0f * hudScale, hudScale);
         }
     }
@@ -379,7 +396,7 @@ public sealed class HudRenderer : IDisposable
         float armLen = 3.0f * pixel;
         float gap = 2.0f * pixel;
 
-        Vector4 color = selectedWeapon == 1
+        Vector4 color = selectedWeapon == PlayerInventory.BinLightsaber
             ? new Vector4(0.55f, 1.00f, 0.80f, 0.85f)
             : new Vector4(0.95f, 0.96f, 0.85f, 0.85f);
         Vector4 shadow = new Vector4(0.0f, 0.0f, 0.0f, 0.50f);

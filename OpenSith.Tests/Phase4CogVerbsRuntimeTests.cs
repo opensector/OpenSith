@@ -7,6 +7,7 @@ using OpenSith.Client;
 using OpenSith.Core.Cog;
 using OpenSith.Core.Models;
 using OpenSith.Core.Physics;
+using OpenSith.Core.Simulation;
 using OpenSith.Core.Vfs;
 using OpenSith.Core.World;
 using Xunit;

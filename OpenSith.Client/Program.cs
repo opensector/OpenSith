@@ -6,6 +6,7 @@ using OpenSith.Core.Cog;
 using OpenSith.Core.Materials;
 using OpenSith.Core.Models;
 using OpenSith.Core.Physics;
+using OpenSith.Core.Simulation;
 using OpenSith.Core.Vfs;
 using OpenSith.Core.World;
 using Silk.NET.Input;
@@ -49,18 +50,12 @@ public static class Program
     private static bool _firstMouseMove = true;
     private static bool _flyMode = false;
     private static bool _thirdPerson = false;
-    private static int _selectedWeapon = 2; // 1 = Lightsaber (sabv.3do), 2 = Bryar (bryv.3do), 3 = StRifle (strv.3do), 4 = Repeater (rptv.3do)
-    private static float _weaponAnimTime = 0.0f;
-    private static float _weaponFireTimer = 0.0f;
-    private static float _weaponFireCooldown = 0.35f;
-    private const float SaberIgniteDuration = 0.35f;
+    private const float SaberIgniteDuration = 0.70f;
     private static float _saberIgniteTimer = 0.0f;
-    private static int _saberSlashIndex = 0;
-    private static string _activeSaberPovKey = "sabvsnp1.key";
-    private static string _activeSaberExtKey = "kysnap1.key";
     private static float _playerMoveBobTime = 0.0f;
     private static bool _playerMoving = false;
     private static bool _mouseLeftDown = false;
+    private static bool _mouseRightDown = false;
     private static readonly bool[] _keys = new bool[512];
 
     public static void Main(string[] args)
@@ -115,9 +110,10 @@ public static class Program
         Console.WriteLine("  • F: Toggle Fly/Noclip mode");
         Console.WriteLine("  • V / F1: Toggle 1st-person / 3rd-person camera");
         Console.WriteLine("  • E: Activate / open nearby door");
-        Console.WriteLine("  • 1 / 2 / 3 / 4: Switch weapon (1=Lightsaber, 2=Bryar Pistol, 3=Stormtrooper Rifle, 4=Repeater)");
-        Console.WriteLine("  • F5 / F6 / F7 / F8 / F9: Force Jump / Speed / Pull / Heal / Seeing");
-        Console.WriteLine("  • Left Click / Ctrl / Enter: Fire / Swing weapon");
+        Console.WriteLine("  • 1..9 / 0: Switch weapon (1=Fists, 2=Bryar, 3=StRifle, 4=ThermDet, 5=Bowcaster, 6=Repeater, 7=RailDet, 8=SeqChg, 9=ConcRifle, 0=Lightsaber)");
+        Console.WriteLine("  • H / I / L: Use Bacta Tank / Toggle IR Goggles / Toggle Field Light");
+        Console.WriteLine("  • F5..F12: Force Jump / Speed / Pull / Heal / Seeing / Throw / Grip / Destruction");
+        Console.WriteLine("  • Left Click / Ctrl / Enter: Primary Fire | Right Click / Z: Secondary Fire");
         Console.WriteLine("  • B: Toggle Texture Filtering (Retro Point vs Direct3D Bilinear)");
         Console.WriteLine("  • P / F3: Log current Sector & XYZ position (console + opensith_positions.log)");
         Console.WriteLine("  • Mouse / Arrow Keys: Look around");
@@ -217,7 +213,8 @@ public static class Program
                     return;
                 }
 
-                if ((int)key < _keys.Length) _keys[(int)key] = true;
+                bool wasDown = (uint)key < (uint)_keys.Length && _keys[(int)key];
+                if ((uint)key < (uint)_keys.Length) _keys[(int)key] = true;
                 if (key == Key.Escape)
                 {
                     OpenMenu(MenuScreen.PauseMenu);
@@ -251,63 +248,70 @@ public static class Program
                 if (key == Key.F) _flyMode = !_flyMode;
                 if (key == Key.P || key == Key.F3) LogPlayerPosition();
                 if (key == Key.Space && _worldSim?.IsInCutscene == true) _worldSim.SkipActiveCutscene();
-                if (key == Key.E && _player != null)
+
+                int localPlayerId = _worldSim?.GetLocalPlayerThing() ?? -1;
+                if (key == Key.E && _player != null && _worldSim != null)
                 {
-                    _worldSim?.ActivateNearestDoor(_player.Position, _camera.Forward);
+                    _worldSim.ActivateNearestDoor(localPlayerId, _player.Position, _camera.Forward);
                 }
-                int forceBin = key switch
+
+                if (!wasDown && _worldSim != null && localPlayerId >= 0)
                 {
-                    Key.F5 => PlayerInventory.BinForceJump,
-                    Key.F6 => PlayerInventory.BinForceSpeed,
-                    Key.F7 => PlayerInventory.BinForcePull,
-                    Key.F8 => PlayerInventory.BinForceHeal,
-                    Key.F9 => PlayerInventory.BinForceSeeing,
-                    _ => -1
-                };
-                if (forceBin >= 0)
-                {
-                    _worldSim?.ActivateForcePower(forceBin, _camera.Forward);
+                    int forceBin = MapKeyToForceBin(key);
+                    if (forceBin >= 0)
+                        _worldSim.BeginForcePower(localPlayerId, forceBin, _camera.Forward);
+
+                    int itemBin = key switch
+                    {
+                        Key.H => PlayerInventory.BinBacta,
+                        Key.I => PlayerInventory.BinIrGoggles,
+                        Key.L => PlayerInventory.BinFieldLight,
+                        _ => -1
+                    };
+                    if (itemBin >= 0)
+                        _worldSim.UseItem(localPlayerId, itemBin);
+
+                    int weaponBin = key switch
+                    {
+                        Key.Number1 => PlayerInventory.BinFists,
+                        Key.Number2 => PlayerInventory.BinBryar,
+                        Key.Number3 => PlayerInventory.BinStRifle,
+                        Key.Number4 => PlayerInventory.BinThermDet,
+                        Key.Number5 => PlayerInventory.BinBowcaster,
+                        Key.Number6 => PlayerInventory.BinRepeater,
+                        Key.Number7 => PlayerInventory.BinRailDet,
+                        Key.Number8 => PlayerInventory.BinSeqCharge,
+                        Key.Number9 => PlayerInventory.BinConcRifle,
+                        Key.Number0 => PlayerInventory.BinLightsaber,
+                        _ => -1
+                    };
+                    if (weaponBin > 0)
+                        _worldSim.SelectWeapon(localPlayerId, weaponBin);
+
+                    if (key == Key.ControlLeft || key == Key.ControlRight || key == Key.Enter)
+                        _worldSim.BeginWeaponFire(localPlayerId, 0);
+                    else if (key == Key.Z)
+                        _worldSim.BeginWeaponFire(localPlayerId, 1);
                 }
-                if (key == Key.Number1)
-                {
-                    bool wasSaber = _selectedWeapon == 1;
-                    _selectedWeapon = 1;
-                    _weaponFireTimer = 0f;
-                    _weaponAnimTime = 0f;
-                    if (!wasSaber)
-                        _saberIgniteTimer = SaberIgniteDuration;
-                    _audio?.PlaySoundLocal("ltsaberon01.wav", 0.7f);
-                    Console.WriteLine("Weapon: Lightsaber");
-                }
-                if (key == Key.Number2)
-                {
-                    _selectedWeapon = 2;
-                    _weaponFireTimer = 0f;
-                    _weaponAnimTime = 0f;
-                    _audio?.PlaySoundLocal("df_bry_ready.wav", 0.7f);
-                    Console.WriteLine("Weapon: Bryar Pistol");
-                }
-                if (key == Key.Number3)
-                {
-                    _selectedWeapon = 3;
-                    _weaponFireTimer = 0f;
-                    _weaponAnimTime = 0f;
-                    _audio?.PlaySoundLocal("df_rif_ready.wav", 0.7f);
-                    Console.WriteLine("Weapon: Stormtrooper Rifle");
-                }
-                if (key == Key.Number4)
-                {
-                    _selectedWeapon = 4;
-                    _weaponFireTimer = 0f;
-                    _weaponAnimTime = 0f;
-                    _audio?.PlaySoundLocal("df_bry_ready.wav", 0.7f);
-                    Console.WriteLine("Weapon: Imperial Repeater");
-                }
-                if (key == Key.ControlLeft || key == Key.ControlRight || key == Key.Enter) FireCurrentWeapon();
             };
             keyboard.KeyUp += (k, key, code) =>
             {
-                if ((int)key < _keys.Length) _keys[(int)key] = false;
+                if ((uint)key < (uint)_keys.Length) _keys[(int)key] = false;
+                if (_worldSim == null)
+                    return;
+
+                int localPlayerId = _worldSim.GetLocalPlayerThing();
+                if (localPlayerId < 0)
+                    return;
+
+                int forceBin = MapKeyToForceBin(key);
+                if (forceBin >= 0)
+                    _worldSim.EndForcePower(localPlayerId, forceBin);
+
+                if (key == Key.ControlLeft || key == Key.ControlRight || key == Key.Enter)
+                    _worldSim.EndWeaponFire(localPlayerId, 0);
+                else if (key == Key.Z)
+                    _worldSim.EndWeaponFire(localPlayerId, 1);
             };
         }
 
@@ -329,17 +333,40 @@ public static class Program
                     return;
                 }
 
+                if (_worldSim == null || _worldSim.Inventory.IsDead)
+                    return;
+
+                int localPlayerId = _worldSim.GetLocalPlayerThing();
+                if (localPlayerId < 0)
+                    return;
+
                 if (button == MouseButton.Left)
                 {
                     _mouseLeftDown = true;
-                    FireCurrentWeapon();
+                    _worldSim.BeginWeaponFire(localPlayerId, 0);
+                }
+                else if (button == MouseButton.Right)
+                {
+                    _mouseRightDown = true;
+                    _worldSim.BeginWeaponFire(localPlayerId, 1);
                 }
             };
 
             mouse.MouseUp += (m, button) =>
             {
+                int localPlayerId = _worldSim?.GetLocalPlayerThing() ?? -1;
                 if (button == MouseButton.Left)
+                {
                     _mouseLeftDown = false;
+                    if (localPlayerId >= 0)
+                        _worldSim?.EndWeaponFire(localPlayerId, 0);
+                }
+                else if (button == MouseButton.Right)
+                {
+                    _mouseRightDown = false;
+                    if (localPlayerId >= 0)
+                        _worldSim?.EndWeaponFire(localPlayerId, 1);
+                }
             };
 
             mouse.MouseMove += (m, pos) =>
@@ -446,7 +473,6 @@ public static class Program
 
         _player.ConfigureFromModel(GetOrLoadModel("ky.3do"));
         _player.ModelResolver = name => string.IsNullOrEmpty(name) ? null : GetOrLoadModel(name);
-        _selectedWeapon = 2;
 
         _worldSim = new WorldSimulation(_level, _vfs, _audio, _currentDifficulty, runStartupCogs: false);
         _worldSim.OnSectorLightChanged += (sectorId, light) =>
@@ -473,26 +499,27 @@ public static class Program
         };
         _worldSim.OnPlayerWeaponAssigned += binIdx =>
         {
-            int mapped = binIdx == 10 ? 1 : binIdx;
-            if (mapped is >= 1 and <= 4)
-                _selectedWeapon = mapped;
+            if (binIdx == PlayerInventory.BinLightsaber)
+                _saberIgniteTimer = SaberIgniteDuration;
         };
         _worldSim.StartLevel();
+
+        if (_worldSim.LocalPlayer != null &&
+            _worldSim.LocalPlayer.CurWeaponBin == PlayerInventory.BinBryar &&
+            _worldSim.Inventory.HasBryar)
+        {
+            _worldSim.SelectWeapon(_worldSim.GetLocalPlayerThing(), PlayerInventory.BinBryar);
+        }
 
         if (string.Equals(normalizedFile, "01narshadda.jkl", StringComparison.OrdinalIgnoreCase))
             _audio.PlayLoopingMusic("01cantinaband02.wav", 0.35f);
 
         Console.WriteLine($"WorldSimulation ready: {_worldSim.ActiveCogCount} COGs, {_worldSim.FramedThingCount} framed entities, {_worldSim.ActiveNpcCount} AI NPCs.");
-        _weaponAnimTime = 0.0f;
-        _weaponFireTimer = 0.0f;
-        _weaponFireCooldown = 0.35f;
         _saberIgniteTimer = 0.0f;
-        _saberSlashIndex = 0;
-        _activeSaberPovKey = "sabvsnp1.key";
-        _activeSaberExtKey = "kysnap1.key";
         _playerMoveBobTime = 0.0f;
         _playerMoving = false;
         _mouseLeftDown = false;
+        _mouseRightDown = false;
         Array.Clear(_keys);
 
         if (_window != null)
@@ -553,10 +580,31 @@ public static class Program
         if (_menuRenderer != null)
             _menuRenderer.CurrentScreen = screen;
 
+        int localPlayerId = _worldSim?.GetLocalPlayerThing() ?? -1;
+        if (localPlayerId >= 0)
+        {
+            if (_mouseLeftDown) _worldSim?.EndWeaponFire(localPlayerId, 0);
+            if (_mouseRightDown) _worldSim?.EndWeaponFire(localPlayerId, 1);
+        }
+
         _mouseLeftDown = false;
+        _mouseRightDown = false;
         Array.Clear(_keys);
         SetCursorMode(CursorMode.Normal);
     }
+
+    private static int MapKeyToForceBin(Key key) => key switch
+    {
+        Key.F5 => PlayerInventory.BinForceJump,
+        Key.F6 => PlayerInventory.BinForceSpeed,
+        Key.F7 => PlayerInventory.BinForcePull,
+        Key.F8 => PlayerInventory.BinForceHeal,
+        Key.F9 => PlayerInventory.BinForceSeeing,
+        Key.F10 => PlayerInventory.BinForceThrow,
+        Key.F11 => PlayerInventory.BinForceGrip,
+        Key.F12 => PlayerInventory.BinForceDestruction,
+        _ => -1
+    };
 
     private static void SetCursorMode(CursorMode mode)
     {
@@ -592,78 +640,6 @@ public static class Program
         return _vfs.FileExists(lower) ? lower : null;
     }
 
-    private static void FireCurrentWeapon()
-    {
-        if (_worldSim == null || _player == null || _worldSim.Inventory.IsDead || _weaponFireTimer > 0f)
-            return;
-
-        bool isSaber = _selectedWeapon == 1;
-        if (!isSaber && _worldSim.Inventory.EnergyAmmo < 1f)
-            return;
-
-        (float cooldown, float range, float damage, string boltModel, string fireSound, float boltSpeed) = _selectedWeapon switch
-        {
-            1 => (0.53f, 0.45f, 35.0f, string.Empty, string.Empty, 0f),
-            3 => (0.15f, 10.0f, 20.0f, "str0.3do", "trprsht2.wav", 9.0f),
-            4 => (0.10f, 10.0f, 18.0f, "rpt0.3do", "repeat-1.wav", 12.0f),
-            _ => (0.35f, 10.0f, 25.0f, "bry0.3do", "pistol-1.wav", 8.0f)
-        };
-
-        _weaponFireCooldown = cooldown;
-        _weaponFireTimer = cooldown;
-        _weaponAnimTime = 0f;
-
-        if (isSaber)
-        {
-            SelectSaberSlashKeyframes();
-        }
-
-        Vector3 rayOrigin = _thirdPerson ? _player.EyePosition : _camera.Position;
-        _worldSim.FireWeaponRay(rayOrigin, _camera.Forward, range, damage, isMelee: isSaber, boltModel, fireSound, boltSpeed);
-    }
-
-    private static void SelectSaberSlashKeyframes()
-    {
-        bool fwd = _keys[(int)Key.W];
-        bool back = _keys[(int)Key.S];
-        bool left = _keys[(int)Key.A];
-        bool right = _keys[(int)Key.D];
-
-        int slash = _saberSlashIndex;
-        _saberSlashIndex = (_saberSlashIndex + 1) % 3;
-
-        if (right && !left)
-        {
-            _activeSaberPovKey = "sabvr1.key";
-            _activeSaberExtKey = "kysabrr1.key";
-        }
-        else if (left && !right)
-        {
-            _activeSaberPovKey = "sabvl1.key";
-            _activeSaberExtKey = "kysabrl1.key";
-        }
-        else if (back && !fwd)
-        {
-            bool even = (slash & 1) == 0;
-            _activeSaberPovKey = even ? "sabvb1.key" : "sabvb2.key";
-            _activeSaberExtKey = even ? "kysabrb1.key" : "kysabrb2.key";
-        }
-        else if (fwd && !back)
-        {
-            (_activeSaberPovKey, _activeSaberExtKey) = slash switch
-            {
-                1 => ("sabvf2.key", "kysabrf2.key"),
-                _ => ("sabvf1.key", "kysabrf1.key")
-            };
-        }
-        else
-        {
-            bool even = (slash & 1) == 0;
-            _activeSaberPovKey = even ? "sabvsnp1.key" : "sabvsnp2.key";
-            _activeSaberExtKey = even ? "kysnap1.key" : "kysnap2.key";
-        }
-    }
-
     private static void OnUpdate(double deltaTime)
     {
         if (_menuRenderer != null && _menuRenderer.CurrentScreen != MenuScreen.None)
@@ -676,9 +652,10 @@ public static class Program
         float dt = MathF.Min((float)deltaTime, 0.05f);
         _meshRenderer?.Update(dt);
 
-        bool isDead = _worldSim?.Inventory.IsDead == true;
+        bool isDead = _worldSim.Inventory.IsDead;
+        bool isFrozen = _worldSim.IsPlayerFrozen;
 
-        if (!isDead)
+        if (!isDead && !isFrozen)
         {
             const float keyTurnSpeed = 120.0f;
             if (_keys[(int)Key.Left]) _camera.Yaw += keyTurnSpeed * dt;
@@ -687,23 +664,23 @@ public static class Program
             if (_keys[(int)Key.Down]) _camera.Pitch = Math.Clamp(_camera.Pitch - keyTurnSpeed * dt, -89.0f, 89.0f);
         }
 
-        _weaponAnimTime += dt;
-        if (_weaponFireTimer > 0f)
-            _weaponFireTimer = MathF.Max(0f, _weaponFireTimer - dt);
         if (_saberIgniteTimer > 0f)
             _saberIgniteTimer = MathF.Max(0f, _saberIgniteTimer - dt);
 
-        if (!isDead && (_mouseLeftDown || _keys[(int)Key.ControlLeft] || _keys[(int)Key.ControlRight] || _keys[(int)Key.Enter]))
-            FireCurrentWeapon();
-
         Vector2 oldPlayerXY = _player != null ? new Vector2(_player.Position.X, _player.Position.Y) : Vector2.Zero;
+        Vector3 localThrust = Vector3.Zero;
 
-        if (isDead)
+        if (isDead || isFrozen)
         {
             _playerMoving = false;
         }
         else
         {
+            float fwdInput = (_keys[(int)Key.W] ? 1f : 0f) - (_keys[(int)Key.S] ? 1f : 0f);
+            float rightInput = (_keys[(int)Key.D] ? 1f : 0f) - (_keys[(int)Key.A] ? 1f : 0f);
+            float upInput = (_keys[(int)Key.Space] ? 1f : 0f) - (_keys[(int)Key.C] ? 1f : 0f);
+            localThrust = new Vector3(rightInput, fwdInput, upInput);
+
             bool isUnderwater = _player != null && _player.IsUnderwater;
             Vector3 wishDir = Vector3.Zero;
             if (isUnderwater)
@@ -749,7 +726,8 @@ public static class Program
             else
             {
                 bool wishJump = _keys[(int)Key.Space];
-                _player!.MoveSpeed = _keys[(int)Key.ShiftLeft] ? 4.0f : 2.0f;
+                float baseSpeed = _keys[(int)Key.ShiftLeft] ? 4.0f : 2.0f;
+                _player!.MoveSpeed = baseSpeed * MathF.Max(0.25f, 1.0f + _worldSim.PlayerExtraSpeed);
                 _player.Update(
                     dt,
                     wishDir,
@@ -759,47 +737,61 @@ public static class Program
             }
         }
 
-        if (_worldSim != null && _player != null)
+        int localPlayerId = _worldSim.GetLocalPlayerThing();
+        if (_player != null)
         {
-            Vector3 elevDelta = _worldSim.Update(dt, _player.Position, _player.CurrentSectorIndex, _camera.Forward);
-            if (!isDead && elevDelta != Vector3.Zero && !_flyMode)
+            if (localPlayerId >= 0)
             {
-                _player.Position += elevDelta;
+                _worldSim.UpdatePlayerInput(
+                    localPlayerId,
+                    _player.Position,
+                    _player.CurrentSectorIndex,
+                    _camera.Forward,
+                    localThrust,
+                    _player.IsGrounded,
+                    _player.IsUnderwater);
+            }
+
+            _worldSim.StepWorld(dt);
+
+            if (localPlayerId >= 0)
+            {
+                Vector3 elevDelta = _worldSim.ConsumePlayerPlatformDelta(localPlayerId);
+                if (!isDead && elevDelta != Vector3.Zero && !_flyMode)
+                    _player.Position += elevDelta;
+
+                if (!isDead && !_flyMode && _worldSim.TryConsumePlayerVelocityOverride(localPlayerId, out Vector3 velOverride))
+                    _player.ApplyExternalVelocity(velOverride);
             }
 
             if (_thingRenderer != null)
                 _worldSim.SyncThingAnimations(_thingRenderer);
         }
 
-        // Sync Kyle (Thing 0, ky.3do) position, yaw, and puppet animation
-        if (_level != null && _level.Things.Count > 0 && _player != null)
+        // Sync player Thing position, yaw, and puppet animation
+        int renderPlayerId = localPlayerId >= 0 ? localPlayerId : 0;
+        var lpState = _worldSim.LocalPlayer;
+        bool usingSaber = lpState?.CurWeaponBin == PlayerInventory.BinLightsaber;
+        bool isFiring = lpState != null && (lpState.ActiveFireMode >= 0 || lpState.FireWait > 0f);
+        if (_level != null && renderPlayerId >= 0 && renderPlayerId < _level.Things.Count && _player != null)
         {
-            var kyle = _level.Things[0];
+            var kyle = _level.Things[renderPlayerId];
             kyle.Position = _player.PelvisPosition;
             kyle.PitchYawRoll = new Vector3(0f, _camera.Yaw, 0f);
             kyle.SectorIndex = _player.CurrentSectorIndex;
 
             int kyMode = _player.IsUnderwater
-                ? (_selectedWeapon == 1 ? 5 : 4)
-                : (_selectedWeapon == 1 ? 2 : 1);
-            if (!isDead && _selectedWeapon == 1 && _weaponFireTimer > 0f)
-            {
-                // ky.pup Mode=2 inherits fire=kypnchl0.key (fist punch) from Mode=0;
-                // weap_saber.cog drives saber slashes explicitly via PlayKey (kysnap*/kysabrf*).
-                _thingRenderer?.SetThingKeyframe(0, _activeSaberExtKey, mode: kyMode, loop: false);
-            }
-            else
-            {
-                string kyAction = isDead
-                    ? "death"
-                    : (_weaponFireTimer > 0f ? "fire" : (_playerMoving ? "run" : "stand"));
-                _thingRenderer?.SetThingAnimation(0, kyAction, kyMode, loop: !isDead);
-            }
+                ? (usingSaber ? 5 : 4)
+                : (usingSaber ? 2 : 1);
+            string kyAction = isDead
+                ? "death"
+                : (isFiring ? "fire" : (_playerMoving ? "run" : "stand"));
+            _thingRenderer?.SetThingAnimation(renderPlayerId, kyAction, kyMode, loop: !isDead);
 
             float dist = isDead
                 ? 0f
                 : Vector2.Distance(oldPlayerXY, new Vector2(_player.Position.X, _player.Position.Y));
-            _thingRenderer?.SetThingDistanceMoved(0, dist);
+            _thingRenderer?.SetThingDistanceMoved(renderPlayerId, dist);
         }
 
         _thingRenderer?.Update(dt);
@@ -864,19 +856,26 @@ public static class Program
 
             _meshRenderer!.Render(_shader);
 
-            // Render 3DO entities (pass -1 in 3rd-person so Kyle Thing 0 is rendered)
-            _thingRenderer?.RenderThings(_shader, _level!, playerThingIndex: _thirdPerson ? -1 : 0);
+            int localPlayerId = _worldSim!.GetLocalPlayerThing();
+            int renderPlayerId = localPlayerId >= 0 ? localPlayerId : 0;
+            var lpState = _worldSim.LocalPlayer;
+            int activeWeaponBin = lpState?.CurWeaponBin ?? PlayerInventory.BinBryar;
+            bool isSaber = activeWeaponBin == PlayerInventory.BinLightsaber;
+            bool isSaberActive = isSaber && ((_worldSim.JkGetFlags(renderPlayerId) & 0x85) != 0 || _saberIgniteTimer > 0f);
+
+            // Render 3DO entities (pass -1 in 3rd-person so player Thing is rendered)
+            _thingRenderer?.RenderThings(_shader, _level!, playerThingIndex: _thirdPerson ? -1 : renderPlayerId);
 
             // Render 3rd-person lightsaber blade from Kyle's right hand (ky.3do node 12 / k_rhand)
             Vector3 saberColor = new(0.12f, 1.00f, 0.32f);
-            if (_thirdPerson && _selectedWeapon == 1 && _saberRenderer != null &&
-                _level!.Things.Count > 0 && _worldSim!.Inventory.IsDead != true)
+            if (_thirdPerson && isSaberActive && _saberRenderer != null &&
+                renderPlayerId >= 0 && renderPlayerId < _level!.Things.Count && _worldSim.Inventory.IsDead != true)
             {
-                var kyle = _level.Things[0];
+                var kyle = _level.Things[renderPlayerId];
                 Matrix4x4 kyleWorld = SithMatrix34.Build34(kyle.PitchYawRoll, kyle.Position).ToMatrix4x4();
                 Vector3 handWorldPos;
                 Vector3 bladeDir;
-                if (_thingRenderer?.TryGetThingNodeTransform(0, 12, out Matrix4x4 rightHandLocal) == true)
+                if (_thingRenderer?.TryGetThingNodeTransform(renderPlayerId, 12, out Matrix4x4 rightHandLocal) == true)
                 {
                     Matrix4x4 rightHandWorld = rightHandLocal * kyleWorld;
                     handWorldPos = Vector3.Transform(Vector3.Zero, rightHandWorld);
@@ -898,7 +897,7 @@ public static class Program
             {
                 foreach (var npcThing in _level.Things)
                 {
-                    if (npcThing.ThingIndex == 0 ||
+                    if (npcThing.ThingIndex == renderPlayerId ||
                         (npcThing.ThingFlags & (uint)(SithThingFlags.Disabled | SithThingFlags.Destroyed | SithThingFlags.Invisible)) != 0 ||
                         (_worldSim.JkGetFlags(npcThing.ThingIndex) & 0x1) == 0 ||
                         !_worldSim.TryGetThingSaberInfo(npcThing.ThingIndex, out var npcSaber))
@@ -934,32 +933,20 @@ public static class Program
                 }
             }
 
-            // Render active 3D blaster projectiles and wall impact sparks
+            // Render active 3D projectiles, wall impact sparks, and sprite/explosion VFX
             _thingRenderer?.RenderProjectiles(_shader, _worldSim!.Projectiles);
             _thingRenderer?.RenderSparks(_shader, _worldSim!.Sparks);
+            _thingRenderer?.RenderVisualEffects(_shader, _camera, _worldSim!.VisualEffects);
 
-            // Render first-person weapon viewmodel when in 1st-person view
-            if (!_thirdPerson && _thingRenderer != null && _worldSim!.Inventory.IsDead != true)
+            // Render first-person COG-driven weapon viewmodel when in 1st-person view
+            if (!_thirdPerson && _thingRenderer != null && lpState != null && !_worldSim!.Inventory.IsDead)
             {
-                bool isSaber = _selectedWeapon == 1;
-                bool isIgnitingSaber = isSaber && _saberIgniteTimer > 0f && _weaponFireTimer <= 0f;
-                (string weaponModel, string weaponKey) = _selectedWeapon switch
-                {
-                    1 => ("sabv.3do", _weaponFireTimer > 0f ? _activeSaberPovKey : (isIgnitingSaber ? "sabvmnt.key" : "sabvhold.key")),
-                    3 => ("strv.3do", "strvpst1.key"),
-                    4 => ("rptv.3do", "rptvpst1.key"),
-                    _ => ("bryv.3do", "bryvpst1.key")
-                };
-
-                float animTime = _weaponFireTimer > 0f
-                    ? _weaponAnimTime
-                    : (isIgnitingSaber ? (SaberIgniteDuration - _saberIgniteTimer) : 0.0f);
+                string weaponModel = string.IsNullOrWhiteSpace(lpState.PovModel) ? "bryv.3do" : lpState.PovModel;
+                string weaponKey = string.IsNullOrWhiteSpace(lpState.PovKey) ? "bryvpst1.key" : lpState.PovKey;
+                float animTime = lpState.PovKeyTime;
                 float bobX = _playerMoving ? MathF.Cos(_playerMoveBobTime * 8.0f) * 0.0012f : 0f;
                 float bobZ = _playerMoving ? MathF.Sin(_playerMoveBobTime * 16.0f) * 0.0012f : 0f;
-                float recoilY = (!isSaber && _weaponFireTimer > 0f && _weaponFireCooldown > 0f)
-                    ? -0.004f * (_weaponFireTimer / _weaponFireCooldown)
-                    : 0f;
-                Vector3 localOffset = GetViewmodelBaseOffset(isSaber) + new Vector3(bobX, recoilY, bobZ);
+                Vector3 localOffset = GetViewmodelBaseOffset(isSaber) + new Vector3(bobX, 0f, bobZ) + lpState.PovShakePos;
 
                 // Authentic jkPlayer_DrawPov -eyeOffset placement (slightly right-of-center & low)
                 _thingRenderer.RenderViewmodel(
@@ -971,7 +958,7 @@ public static class Program
                     aspect,
                     localOffset);
 
-                if (isSaber && _saberRenderer != null &&
+                if (isSaberActive && _saberRenderer != null &&
                     _thingRenderer.TryGetViewmodelNodeTransform(weaponModel, weaponKey, animTime, nodeIndex: 5, out Matrix4x4 joint5Local))
                 {
                     float fovRad = MathF.PI / 180.0f * ThingMeshRenderer.ViewmodelVerticalFovDegrees;
@@ -980,8 +967,8 @@ public static class Program
                     Matrix4x4 joint5World = joint5Local * viewmodelWorld;
                     Vector3 bladeBaseWorldPos = Vector3.Transform(Vector3.Zero, joint5World);
                     Vector3 bladeForwardDir = Vector3.Normalize(Vector3.TransformNormal(Vector3.UnitY, joint5World));
-                    float swingProgress = _weaponFireTimer > 0f
-                        ? Math.Clamp(1.0f - (_weaponFireTimer / 0.53f), 0.0f, 1.0f)
+                    float swingProgress = lpState.SaberDamageActive
+                        ? Math.Clamp(lpState.PovKeyTime / 0.45f, 0.0f, 1.0f)
                         : 0.0f;
                     float bladeLengthScale = _saberIgniteTimer > 0f
                         ? Math.Clamp(1.0f - (_saberIgniteTimer / SaberIgniteDuration), 0.05f, 1.0f)
@@ -1002,6 +989,14 @@ public static class Program
             if (_hudRenderer != null)
             {
                 var inv = _worldSim!.Inventory;
+                int displayAmmo = activeWeaponBin switch
+                {
+                    PlayerInventory.BinThermDet => (int)inv.GetInv(PlayerInventory.BinThermDet),
+                    PlayerInventory.BinBowcaster or PlayerInventory.BinRepeater or PlayerInventory.BinConcRifle => (int)inv.PowerAmmo,
+                    PlayerInventory.BinRailDet => (int)inv.RailCharges,
+                    PlayerInventory.BinSeqCharge => (int)inv.GetInv(PlayerInventory.BinSeqCharge),
+                    _ => (int)inv.EnergyAmmo
+                };
                 _hudRenderer.Render(
                     _window.Size.X,
                     _window.Size.Y,
@@ -1009,12 +1004,16 @@ public static class Program
                     inv.MaxHealth,
                     inv.Shields,
                     200.0f,
-                    (int)inv.EnergyAmmo,
-                    _selectedWeapon,
+                    displayAmmo,
+                    activeWeaponBin,
                     inv.IsDead,
                     _worldSim.StatusMessage ?? (inv.IsDead
-                    ? "PRESS R TO RESPAWN"
-                    : (_worldSim.IsInCutscene ? "INTRO - PRESS SPACE TO SKIP" : null)));
+                        ? "PRESS R TO RESPAWN"
+                        : (_worldSim.IsInCutscene ? "INTRO - PRESS SPACE TO SKIP" : null)),
+                    inv.ForceMana,
+                    inv.MaxForceMana,
+                    inv.Battery,
+                    _worldSim.IsFieldLightActive(renderPlayerId));
             }
         }
 
