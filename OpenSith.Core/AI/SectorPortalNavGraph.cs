@@ -37,6 +37,7 @@ public sealed class SectorPortalNavGraph
 
     private readonly SectorNode[] _nodes;
     private readonly JklLevel _level;
+    private readonly Dictionary<int, HashSet<int>> _reachableFromCache = new();
 
     public int SectorCount => _nodes.Length;
 
@@ -69,6 +70,37 @@ public sealed class SectorPortalNavGraph
 
     public IReadOnlyList<PortalEdge> GetEdges(int sectorIndex) =>
         sectorIndex >= 0 && sectorIndex < _nodes.Length ? _nodes[sectorIndex].Edges : [];
+
+    /// <summary>
+    /// Returns true if <paramref name="goalSector"/> is reachable from <paramref name="startSector"/>
+    /// via traversable portal edges (cached per source sector via BFS).
+    /// </summary>
+    public bool CanReach(int startSector, int goalSector)
+    {
+        if ((uint)startSector >= (uint)_nodes.Length || (uint)goalSector >= (uint)_nodes.Length)
+            return false;
+        if (startSector == goalSector)
+            return true;
+
+        if (!_reachableFromCache.TryGetValue(startSector, out var reachable))
+        {
+            reachable = [startSector];
+            var queue = new Queue<int>();
+            queue.Enqueue(startSector);
+            while (queue.Count > 0)
+            {
+                int cur = queue.Dequeue();
+                foreach (var edge in _nodes[cur].Edges)
+                {
+                    if (reachable.Add(edge.ToSector))
+                        queue.Enqueue(edge.ToSector);
+                }
+            }
+            _reachableFromCache[startSector] = reachable;
+        }
+
+        return reachable.Contains(goalSector);
+    }
 
     /// <summary>
     /// Computes an A* path of sector portal crossing points from <paramref name="startSector"/>

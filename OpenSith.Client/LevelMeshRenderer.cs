@@ -28,6 +28,16 @@ public sealed class LevelMeshRenderer : IDisposable
     /// </summary>
     public const int SurfaceFlagSkyMask = SurfaceFlagHorizonSky | SurfaceFlagCeilingSky;
 
+    /// <summary>
+    /// Default cel animation rate (Hz) applied to translucent multi-cel water/liquid MATs (e.g. 8-cel <c>00Twater2.mat</c>).
+    /// </summary>
+    public const float DefaultTranslucentWaterAnimFps = 6.0f;
+
+    /// <summary>
+    /// Alpha multiplier used for translucent surfaces (authentic Sith 50% translucency).
+    /// </summary>
+    public const float TranslucentPassAlpha = 0.50f;
+
     private readonly GL _gl;
     private readonly JklLevel _level;
     private readonly TextureManager _textureManager;
@@ -37,7 +47,9 @@ public sealed class LevelMeshRenderer : IDisposable
     private readonly List<SurfaceMeshSlice> _skySlices = [];
     private readonly List<SurfaceMeshSlice> _scrollingSlices = [];
     private readonly Dictionary<int, Vector2> _scrollVelocities = new();
+    private readonly Dictionary<string, float> _materialAnimFps = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<int, float> _sectorExtraLights = new();
+    private float _animTime;
     private Vertex[] _vertices = [];
     private uint _vao;
     private uint _vbo;
@@ -66,10 +78,50 @@ public sealed class LevelMeshRenderer : IDisposable
         ((surface.FaceFlags & 0x2) != 0 || (surface.IsPortal && surface.GeometryMode == 4));
 
     /// <summary>
+    /// Returns true when a portal has a valid drawn mirror surface on the opposite sector side.
+    /// When both paired faces exist, each renders single-sided from its own sector with authentic sector lighting and UVs.
+    /// </summary>
+    public static bool HasDrawnMirror(JklSurface surface) =>
+        surface is not null &&
+        surface.IsPortal &&
+        surface.MirrorSurface != null &&
+        surface.MirrorSurface.GeometryMode != 0 &&
+        surface.MirrorSurface.MaterialIndex >= 0 &&
+        surface.MirrorSurface.VertexIndices.Length >= 3;
+
+    /// <summary>
     /// Determines whether a surface renders double-sided (cull face disabled).
+    /// One-sided portals (no drawn mirror) and surfaces with <c>FaceFlags &amp; 0x1</c> render double-sided;
+    /// paired back-to-back portals render single-sided per face to avoid Z-fighting while preserving per-side lighting.
     /// </summary>
     public static bool IsDoubleSidedSurface(JklSurface surface) =>
-        surface is not null && (surface.IsPortal || (surface.FaceFlags & 0x1) != 0);
+        surface is not null &&
+        ((surface.FaceFlags & 0x1) != 0 || (surface.IsPortal && !HasDrawnMirror(surface)));
+
+    /// <summary>
+    /// Resolves the active animation cel index for a multi-cel material at <paramref name="elapsedSeconds"/> and <paramref name="fps"/>.
+    /// </summary>
+    public static int ComputeAnimatedCelIndex(int celCount, float elapsedSeconds, float fps)
+    {
+        if (celCount <= 1 || fps <= 0.0f)
+            return 0;
+
+        int frame = (int)MathF.Floor(MathF.Max(0.0f, elapsedSeconds) * fps);
+        return ((frame % celCount) + celCount) % celCount;
+    }
+
+    /// <summary>
+    /// Returns true when a translucent multi-cel world material (such as 8-cel <c>00Twater2.mat</c>)
+    /// should animate automatically without requiring an explicit COG <c>MaterialAnim</c> call.
+    /// </summary>
+    public static bool ShouldAutoAnimateTranslucentMaterial(string materialName, bool isTranslucent, int celCount) =>
+        isTranslucent && celCount >= 4 && !string.IsNullOrWhiteSpace(materialName);
+
+    /// <summary>
+    /// Converts a Sith COG <c>SlideWall</c>/<c>SlideSurface</c> velocity vector into normalized UV scroll units per second.
+    /// </summary>
+    public static Vector2 ComputeSlideWallUvVelocity(Vector2 dir, float speed) =>
+        dir * (speed * 0.25f);
 
     /// <summary>
     /// Computes the effective vertex light intensity for a surface vertex slot, clamped to <c>[0.0f, 1.0f]</c>
@@ -124,15 +176,17 @@ public sealed class LevelMeshRenderer : IDisposable
         public bool DoubleSided { get; }
         public bool IsTranslucent { get; }
         public bool IsSky { get; }
+        public bool AllowAlphaTest { get; }
         public int ElementStart { get; }
         public int ElementCount { get; }
 
-        public MaterialBatch(string materialName, bool doubleSided, bool isTranslucent, bool isSky, int start, int count)
+        public MaterialBatch(string materialName, bool doubleSided, bool isTranslucent, bool isSky, bool allowAlphaTest, int start, int count)
         {
             MaterialName = materialName;
             DoubleSided = doubleSided;
             IsTranslucent = isTranslucent;
             IsSky = isSky;
+            AllowAlphaTest = allowAlphaTest;
             ElementStart = start;
             ElementCount = count;
         }
@@ -198,7 +252,7 @@ public sealed class LevelMeshRenderer : IDisposable
         }
     }
 
-    private readonly record struct BatchKey(string MaterialName, bool DoubleSided, bool IsTranslucent, bool IsSky);
+    private readonly record struct BatchKey(string MaterialName, bool DoubleSided, bool IsTranslucent, bool IsSky, bool AllowAlphaTest);
 
     private sealed class BatchKeyComparer : IEqualityComparer<BatchKey>
     {
@@ -208,6 +262,7 @@ public sealed class LevelMeshRenderer : IDisposable
             x.DoubleSided == y.DoubleSided &&
             x.IsTranslucent == y.IsTranslucent &&
             x.IsSky == y.IsSky &&
+            x.AllowAlphaTest == y.AllowAlphaTest &&
             string.Equals(x.MaterialName, y.MaterialName, StringComparison.OrdinalIgnoreCase);
 
         public int GetHashCode(BatchKey obj) =>
@@ -215,7 +270,8 @@ public sealed class LevelMeshRenderer : IDisposable
                 StringComparer.OrdinalIgnoreCase.GetHashCode(obj.MaterialName),
                 obj.DoubleSided,
                 obj.IsTranslucent,
-                obj.IsSky);
+                obj.IsSky,
+                obj.AllowAlphaTest);
     }
 
     public int BatchCount => _batches.Count;
@@ -252,17 +308,6 @@ public sealed class LevelMeshRenderer : IDisposable
             if (surface.GeometryMode == 0 || surface.MaterialIndex < 0 || surface.VertexIndices.Length < 3)
                 continue;
 
-            // Deduplicate coplanar back-to-back portal surfaces when both sides are drawn
-            if (surface.IsPortal && surface.MirrorSurface != null)
-            {
-                var mirror = surface.MirrorSurface;
-                bool mirrorIsDrawn = mirror.GeometryMode != 0 &&
-                                     mirror.MaterialIndex >= 0 &&
-                                     mirror.VertexIndices.Length >= 3;
-                if (mirrorIsDrawn && surface.SurfaceIndex > mirror.SurfaceIndex)
-                    continue;
-            }
-
             string matName = (surface.MaterialIndex < level.Materials.Count)
                 ? level.Materials[surface.MaterialIndex]
                 : string.Empty;
@@ -274,7 +319,8 @@ public sealed class LevelMeshRenderer : IDisposable
             bool isSky = IsSkySurface(surface);
             bool doubleSided = IsDoubleSidedSurface(surface);
             bool isTranslucent = IsTranslucentSurface(surface);
-            var batchKey = new BatchKey(matName, doubleSided, isTranslucent, isSky);
+            bool allowAlphaTest = surface.IsPortal || (surface.FaceFlags & 0x1) != 0;
+            var batchKey = new BatchKey(matName, doubleSided, isTranslucent, isSky, allowAlphaTest);
             if (!indicesByBatch.TryGetValue(batchKey, out var indexList))
             {
                 indexList = new List<uint>();
@@ -353,12 +399,20 @@ public sealed class LevelMeshRenderer : IDisposable
 
             int localIndexOffset = indexList.Count;
             var triIndices = new List<uint>((nverts - 2) * 3);
-            // Fan triangulation: (0, i, i+1) for i = 1 .. nverts - 2
+            // Fan triangulation: (0, i, i+1) for i = 1 .. nverts - 2, enforcing CCW winding along surface.Normal on single-sided surfaces
             for (int i = 1; i < nverts - 1; i++)
             {
                 uint a = baseVertexIndex + 0;
                 uint b = baseVertexIndex + (uint)i;
                 uint c = baseVertexIndex + (uint)(i + 1);
+                if (!doubleSided)
+                {
+                    Vector3 posA = vertices[(int)a].Position;
+                    Vector3 posB = vertices[(int)b].Position;
+                    Vector3 posC = vertices[(int)c].Position;
+                    if (Vector3.Dot(Vector3.Cross(posB - posA, posC - posA), surface.Normal) < 0f)
+                        (b, c) = (c, b);
+                }
                 triIndices.Add(a);
                 triIndices.Add(b);
                 triIndices.Add(c);
@@ -413,18 +467,26 @@ public sealed class LevelMeshRenderer : IDisposable
             {
                 foreach (bool doubleSided in new[] { false, true })
                 {
-                    foreach (var (key, indexList) in indicesByBatch)
+                    foreach (bool allowAlphaTest in new[] { false, true })
                     {
-                        if (key.IsTranslucent != translucent || key.IsSky != isSky || key.DoubleSided != doubleSided)
-                            continue;
-
-                        int start = allIndices.Count;
-                        allIndices.AddRange(indexList);
-                        foreach (var (slice, localOffset) in slicesByBatch[key])
+                        foreach (var (key, indexList) in indicesByBatch)
                         {
-                            slice.IndexStart = start + localOffset;
+                            if (key.IsTranslucent != translucent ||
+                                key.IsSky != isSky ||
+                                key.DoubleSided != doubleSided ||
+                                key.AllowAlphaTest != allowAlphaTest)
+                            {
+                                continue;
+                            }
+
+                            int start = allIndices.Count;
+                            allIndices.AddRange(indexList);
+                            foreach (var (slice, localOffset) in slicesByBatch[key])
+                            {
+                                slice.IndexStart = start + localOffset;
+                            }
+                            _batches.Add(new MaterialBatch(key.MaterialName, key.DoubleSided, key.IsTranslucent, key.IsSky, key.AllowAlphaTest, start, indexList.Count));
                         }
-                        _batches.Add(new MaterialBatch(key.MaterialName, key.DoubleSided, key.IsTranslucent, key.IsSky, start, indexList.Count));
                     }
                 }
             }
@@ -682,12 +744,29 @@ public sealed class LevelMeshRenderer : IDisposable
     }
 
     /// <summary>
-    /// Advances active UV scrolling animations and uploads updated vertex slices to the GPU.
+    /// Sets or clears the cel animation rate (Hz) for all world surfaces referencing <paramref name="materialName"/>.
+    /// </summary>
+    public void SetMaterialAnim(string materialName, float fps)
+    {
+        if (string.IsNullOrWhiteSpace(materialName))
+            return;
+
+        if (fps > 0.0f)
+            _materialAnimFps[materialName] = fps;
+        else
+            _materialAnimFps.Remove(materialName);
+    }
+
+    /// <summary>
+    /// Advances animated world material timers and active UV scrolling animations, uploading updated vertex slices to the GPU.
     /// </summary>
     public void Update(float dt)
     {
         if (_geometryDirty)
             RebuildGeometry();
+
+        if (dt > 0.0f)
+            _animTime += dt;
 
         if (dt <= 0.0f || _scrollingSlices.Count == 0)
             return;
@@ -770,7 +849,10 @@ public sealed class LevelMeshRenderer : IDisposable
         }
     }
 
-    public void Render(ShaderProgram shader)
+    /// <summary>
+    /// Renders Pass 1 (opaque sky and world geometry) before 3D entities and sprites.
+    /// </summary>
+    public void RenderOpaque(ShaderProgram shader)
     {
         if (_geometryDirty)
             RebuildGeometry();
@@ -784,7 +866,7 @@ public sealed class LevelMeshRenderer : IDisposable
         _gl.FrontFace(FrontFaceDirection.Ccw);
         bool cullingEnabled = true;
 
-        // Pass 1: Opaque sky & world surfaces (rendered before translucent windows)
+        // Pass 1: Opaque sky & world surfaces (rendered before entities and translucent portals)
         // Disable colorkey discard on solid (non-portal) world surfaces so grates like 00fgrte2.mat / 10cgrid1.mat
         // on Adjoin=-1 walls/vents render dark gaps instead of punching holes into the void.
         _gl.DepthMask(true);
@@ -795,15 +877,36 @@ public sealed class LevelMeshRenderer : IDisposable
         foreach (var batch in _batches)
         {
             if (batch.IsTranslucent) continue;
-            shader.SetUniform("uAlphaTest", batch.DoubleSided ? 1.0f : 0.0f);
+            shader.SetUniform("uAlphaTest", batch.AllowAlphaTest ? 1.0f : 0.0f);
             DrawBatch(batch, shader, ref cullingEnabled);
         }
 
-        // Pass 2: Translucent window/portal surfaces (alpha-blended without depth write)
+        // Restore default double-sided state for downstream 3DO entity rendering
+        shader.SetUniform("uAlpha", 1.0f);
+        shader.SetUniform("uAlphaTest", 1.0f);
+        _gl.Disable(EnableCap.CullFace);
+        _gl.BindVertexArray(0);
+    }
+
+    /// <summary>
+    /// Renders Pass 2 (translucent water and glass portal surfaces) after opaque world and 3DO entities
+    /// so submerged geometry depth-tests cleanly behind the translucent surface.
+    /// </summary>
+    public void RenderTranslucent(ShaderProgram shader)
+    {
+        if (_geometryDirty)
+            RebuildGeometry();
+
+        _gl.BindVertexArray(_vao);
+        _gl.Enable(EnableCap.CullFace);
+        _gl.CullFace(TriangleFace.Back);
+        _gl.FrontFace(FrontFaceDirection.Ccw);
+        bool cullingEnabled = true;
+
         _gl.Enable(EnableCap.Blend);
         _gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
         _gl.DepthMask(false);
-        shader.SetUniform("uAlpha", 0.35f);
+        shader.SetUniform("uAlpha", TranslucentPassAlpha);
         shader.SetUniform("uAlphaTest", 1.0f);
 
         foreach (var batch in _batches)
@@ -812,13 +915,19 @@ public sealed class LevelMeshRenderer : IDisposable
             DrawBatch(batch, shader, ref cullingEnabled);
         }
 
-        // Restore render state and double-sided culling for downstream 3DO rendering
+        // Restore render state and double-sided culling for downstream rendering
         _gl.DepthMask(true);
         _gl.Disable(EnableCap.Blend);
         shader.SetUniform("uAlpha", 1.0f);
         shader.SetUniform("uAlphaTest", 1.0f);
         _gl.Disable(EnableCap.CullFace);
         _gl.BindVertexArray(0);
+    }
+
+    public void Render(ShaderProgram shader)
+    {
+        RenderOpaque(shader);
+        RenderTranslucent(shader);
     }
 
     private unsafe void DrawBatch(MaterialBatch batch, ShaderProgram shader, ref bool cullingEnabled)
@@ -834,7 +943,14 @@ public sealed class LevelMeshRenderer : IDisposable
             cullingEnabled = true;
         }
 
-        var texInfo = _textureManager.GetOrCreateTexture(batch.MaterialName);
+        var cels = _textureManager.GetOrCreateTextureCels(batch.MaterialName);
+        float animFps = _materialAnimFps.TryGetValue(batch.MaterialName, out float explicitFps)
+            ? explicitFps
+            : (ShouldAutoAnimateTranslucentMaterial(batch.MaterialName, batch.IsTranslucent, cels.Length)
+                ? DefaultTranslucentWaterAnimFps
+                : 0.0f);
+        int celIdx = ComputeAnimatedCelIndex(cels.Length, _animTime, animFps);
+        var texInfo = cels[celIdx];
         _gl.ActiveTexture(TextureUnit.Texture0);
         _gl.BindTexture(TextureTarget.Texture2D, texInfo.Handle);
         shader.SetUniform("uTexture", 0);

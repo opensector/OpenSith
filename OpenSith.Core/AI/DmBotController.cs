@@ -102,6 +102,7 @@ public sealed class DmBotController
     private Vector3 _lastPlantedTrapPos;
     private float _trapAvoidUntil;
     private float _forceCooldown;
+    private float _jumpCooldown;
 
     public BotArchetype Archetype { get; }
     public BotSkill Skill { get; }
@@ -135,6 +136,7 @@ public sealed class DmBotController
         _seqDropCooldown = 0f;
         _trapAvoidUntil = 0f;
         _forceCooldown = 0f;
+        _jumpCooldown = 0f;
     }
 
     /// <summary>
@@ -268,7 +270,7 @@ public sealed class DmBotController
                             chosenWeapon == PlayerInventory.BinFists;
 
         WorldSimulation.PickupInfo? desiredPickup = SelectDesiredPickup(
-            selfPlayer.Inventory, selfPos, urgentPickup || bestEnemy == null || !hasLos, activePickups);
+            selfPlayer.Inventory, selfSector, selfPos, urgentPickup || bestEnemy == null || !hasLos, navGraph, activePickups);
 
         // 4. Movement & Navigation
         bool wantJump = false;
@@ -282,17 +284,17 @@ public sealed class DmBotController
         }
         else if (bestEnemy != null && hasLos && (!urgentPickup || enemyDist < 2.2f))
         {
-            wishMove = ComputeCombatMovement(chosenWeapon, selfPos, enemyPos, enemyDist, ref wantJump);
+            wishMove = ComputeCombatMovement(chosenWeapon, selfPos, enemyPos, enemyDist);
         }
         else if (desiredPickup is { } pickup)
         {
-            wishMove = FollowNavPath(selfSector, selfPos, pickup.SectorIndex, pickup.Position, navGraph, ref wantJump);
+            wishMove = FollowNavPath(selfSector, selfPos, pickup.SectorIndex, pickup.Position, selfPlayer.IsGrounded, selfPlayer.IsUnderwater, navGraph, ref wantJump);
         }
         else if (bestEnemy != null)
         {
             int enemySector = bestEnemy.ThingIndex >= 0 ? sim.GetThingSector(bestEnemy.ThingIndex) : selfSector;
             if (enemySector < 0) enemySector = selfSector;
-            wishMove = FollowNavPath(selfSector, selfPos, enemySector, enemyPos, navGraph, ref wantJump);
+            wishMove = FollowNavPath(selfSector, selfPos, enemySector, enemyPos, selfPlayer.IsGrounded, selfPlayer.IsUnderwater, navGraph, ref wantJump);
         }
         else
         {
@@ -300,10 +302,10 @@ public sealed class DmBotController
                 _roamGoalSector = navGraph.PickRoamSector(selfSector, _rng);
 
             if (navGraph.TryGetSectorCenter(_roamGoalSector, out Vector3 roamCenter))
-                wishMove = FollowNavPath(selfSector, selfPos, _roamGoalSector, roamCenter, navGraph, ref wantJump);
+                wishMove = FollowNavPath(selfSector, selfPos, _roamGoalSector, roamCenter, selfPlayer.IsGrounded, selfPlayer.IsUnderwater, navGraph, ref wantJump);
         }
 
-        // Stuck recovery: jump, use nearest door, sidestep, and force repath (only when attempting to move)
+        // Stuck recovery: sidestep horizontally and pulse jump/use only on fresh stuck transitions
         float movedHoriz = Vector2.Distance(new Vector2(selfPos.X, selfPos.Y), new Vector2(_lastProgressPos.X, _lastProgressPos.Y));
         if (movedHoriz > 0.08f || wishMove.LengthSquared() <= 0.01f)
         {
@@ -319,17 +321,18 @@ public sealed class DmBotController
         {
             Vector3 side = Vector3.Normalize(Vector3.Cross(wishMove, Vector3.UnitZ)) * _stuckSidestepSign;
             wishMove = Vector3.Normalize(wishMove * 0.45f + side * 0.85f);
-            wantJump = true;
         }
 
-        if (_stuckTimer >= 0.60f)
+        if (_stuckTimer >= 0.75f)
         {
             _stuckTimer = 0f;
             _stuckSidestepTimer = 0.45f;
             _stuckSidestepSign = -_stuckSidestepSign;
             _repathTimer = 0f;
+            _roamGoalSector = -1;
             _waypoints.Clear();
-            wantJump = true;
+            if (selfPlayer.IsGrounded && _jumpCooldown <= 0f)
+                wantJump = true;
             decision.UsePressed = true;
         }
 
@@ -363,6 +366,14 @@ public sealed class DmBotController
 
         // 7. Opportunistic Force Powers
         decision.DesiredForceBin = SelectForcePower(selfPlayer.Inventory, bestEnemy != null, hasLos, enemyDist, wishMove.LengthSquared() > 0.1f);
+
+        if (wantJump)
+        {
+            if (_jumpCooldown > 0f || (!selfPlayer.IsGrounded && !selfPlayer.IsUnderwater))
+                wantJump = false;
+            else
+                _jumpCooldown = 1.15f;
+        }
 
         decision.WishMoveDir = wishMove;
         decision.WishJump = wantJump;
@@ -671,8 +682,7 @@ public sealed class DmBotController
         int weaponBin,
         Vector3 selfPos,
         Vector3 enemyPos,
-        float dist,
-        ref bool wantJump)
+        float dist)
     {
         Vector3 toEnemy = enemyPos - selfPos;
         toEnemy.Z = 0f;
@@ -715,11 +725,7 @@ public sealed class DmBotController
             return Vector3.Normalize(-fwd * 0.85f + tangent * 0.55f);
 
         if (dist > maxDesiredDist)
-        {
-            if (Skill >= BotSkill.Medium && _strafeTimer > 1.4f && _rng.NextDouble() < 0.03)
-                wantJump = true;
             return Vector3.Normalize(fwd * 0.85f + tangent * 0.45f);
-        }
 
         return tangent;
     }
@@ -729,6 +735,8 @@ public sealed class DmBotController
         Vector3 selfPos,
         int goalSector,
         Vector3 goalPos,
+        bool isGrounded,
+        bool isUnderwater,
         SectorPortalNavGraph navGraph,
         ref bool wantJump)
     {
@@ -739,9 +747,16 @@ public sealed class DmBotController
             _waypointIndex = 0;
             if (!navGraph.FindPath(startSector, selfPos, goalSector, goalPos, _waypoints, _waypointJumps))
             {
-                Vector3 direct = goalPos - selfPos;
-                direct.Z = 0f;
-                return direct.LengthSquared() > 1e-6f ? Vector3.Normalize(direct) : Vector3.Zero;
+                if (startSector != goalSector)
+                {
+                    _roamGoalSector = -1;
+                    var fallbackEdges = navGraph.GetEdges(startSector);
+                    if (fallbackEdges.Count > 0)
+                        return NormalizeSwimOrFlatDirection(fallbackEdges[0].PortalCentroid - selfPos, isUnderwater);
+                    return Vector3.Zero;
+                }
+
+                return NormalizeSwimOrFlatDirection(goalPos - selfPos, isUnderwater);
             }
         }
 
@@ -756,18 +771,49 @@ public sealed class DmBotController
         }
 
         Vector3 activeTarget = _waypoints[Math.Clamp(_waypointIndex, 0, _waypoints.Count - 1)];
-        if (_waypointIndex < _waypointJumps.Count && _waypointJumps[_waypointIndex])
+        float horizDistToTarget = Vector2.Distance(
+            new Vector2(selfPos.X, selfPos.Y),
+            new Vector2(activeTarget.X, activeTarget.Y));
+        if (isUnderwater)
+        {
+            if (activeTarget.Z > selfPos.Z + 0.18f && _jumpCooldown <= 0f && horizDistToTarget <= 0.45f)
+                wantJump = true;
+        }
+        else if (_waypointIndex < _waypointJumps.Count &&
+                 _waypointJumps[_waypointIndex] &&
+                 isGrounded &&
+                 _jumpCooldown <= 0f &&
+                 horizDistToTarget <= 0.38f &&
+                 activeTarget.Z > selfPos.Z + 0.05f)
+        {
             wantJump = true;
+        }
 
-        Vector3 dir = activeTarget - selfPos;
+        return NormalizeSwimOrFlatDirection(activeTarget - selfPos, isUnderwater);
+    }
+
+    private static Vector3 NormalizeSwimOrFlatDirection(Vector3 dir, bool isUnderwater)
+    {
+        if (isUnderwater)
+        {
+            float dZ = dir.Z;
+            dir.Z = 0f;
+            if (dir.LengthSquared() > 1e-6f)
+                dir = Vector3.Normalize(dir);
+            dir.Z = Math.Clamp(dZ * 2.0f, -1f, 1f);
+            return dir.LengthSquared() > 1e-6f ? Vector3.Normalize(dir) : Vector3.Zero;
+        }
+
         dir.Z = 0f;
         return dir.LengthSquared() > 1e-6f ? Vector3.Normalize(dir) : Vector3.Zero;
     }
 
     private WorldSimulation.PickupInfo? SelectDesiredPickup(
         PlayerInventory inv,
+        int selfSector,
         Vector3 selfPos,
         bool includeGeneralUpgrades,
+        SectorPortalNavGraph navGraph,
         IReadOnlyList<WorldSimulation.PickupInfo> pickups)
     {
         WorldSimulation.PickupInfo? best = null;
@@ -775,6 +821,9 @@ public sealed class DmBotController
 
         foreach (var p in pickups)
         {
+            if (p.SectorIndex >= 0 && !navGraph.CanReach(selfSector, p.SectorIndex))
+                continue;
+
             float baseValue = 0f;
             if (p.IsHealth && inv.Health < 90f)
                 baseValue = inv.Health < 55f ? 320f : 120f;
@@ -795,8 +844,9 @@ public sealed class DmBotController
             if (!includeGeneralUpgrades && baseValue < 200f)
                 continue;
 
-            float dist = Vector3.Distance(selfPos, p.Position);
-            float score = baseValue / (1.0f + dist * 0.45f);
+            float horiz = Vector2.Distance(new Vector2(selfPos.X, selfPos.Y), new Vector2(p.Position.X, p.Position.Y));
+            float effDist = horiz + MathF.Abs(p.Position.Z - selfPos.Z) * 3.5f;
+            float score = baseValue / (1.0f + effDist * 0.45f);
             if (score > bestScore)
             {
                 bestScore = score;
@@ -917,9 +967,9 @@ public sealed class DmBotController
             }
         }
 
-        if (isMoving && hasEnemy && enemyDist > 1.8f && inv.GetInv(PlayerInventory.BinForceSpeed) > 0f && inv.ForceMana >= 30f)
+        if (isMoving && hasEnemy && enemyDist > 3.0f && inv.GetInv(PlayerInventory.BinForceSpeed) > 0f && inv.ForceMana >= 30f)
         {
-            _forceCooldown = 5.0f;
+            _forceCooldown = 8.0f;
             return PlayerInventory.BinForceSpeed;
         }
 
@@ -932,6 +982,7 @@ public sealed class DmBotController
         _seqDropCooldown = MathF.Max(0f, _seqDropCooldown - dt);
         _forceCooldown = MathF.Max(0f, _forceCooldown - dt);
         _stuckSidestepTimer = MathF.Max(0f, _stuckSidestepTimer - dt);
+        _jumpCooldown = MathF.Max(0f, _jumpCooldown - dt);
 
         _strafeTimer += dt;
         if (_strafeTimer >= 1.8f)

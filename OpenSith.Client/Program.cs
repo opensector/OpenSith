@@ -710,7 +710,9 @@ public static partial class Program
         _worldSim.OnSectorLightChanged += (sectorId, light) =>
             _meshRenderer?.SetSectorExtraLight(sectorId, light);
         _worldSim.OnSurfaceScroll += (surfaceId, dir, speed) =>
-            _meshRenderer?.SetSurfaceScroll(surfaceId, dir * speed);
+            _meshRenderer?.SetSurfaceScroll(surfaceId, LevelMeshRenderer.ComputeSlideWallUvVelocity(dir, speed));
+        _worldSim.OnMaterialAnimChanged += (matName, fps) =>
+            _meshRenderer?.SetMaterialAnim(matName, fps);
         _worldSim.OnSurfaceGeoModeChanged += (surfaceId, geoMode) =>
             _meshRenderer?.SetSurfaceGeoMode(surfaceId, geoMode);
         _worldSim.OnSurfaceMaterialChanged += (surfaceId, matName) =>
@@ -1275,13 +1277,14 @@ public static partial class Program
             }
             else
             {
+                Vector3 spTint = _worldSim?.CurrentScreenTint ?? Vector3.Zero;
                 _shader.SetUniform("uModel", model);
                 _shader.SetUniform("uView", view);
                 _shader.SetUniform("uProjection", projection);
-                _shader.SetUniform("uTint", _worldSim?.CurrentScreenTint ?? Vector3.Zero);
+                _shader.SetUniform("uTint", spTint);
                 _shader.SetUniform("uAlpha", 1.0f);
 
-                _meshRenderer!.Render(_shader);
+                _meshRenderer!.RenderOpaque(_shader);
 
                 int localPlayerId = _worldSim!.GetLocalPlayerThing();
                 int renderPlayerId = localPlayerId >= 0 ? localPlayerId : 0;
@@ -1385,8 +1388,16 @@ public static partial class Program
                     }
                 }
 
-                // Render active 3D projectiles, wall impact sparks, and sprite/explosion VFX
+                // Render active 3D projectiles, translucent water/glass portals, wall impact sparks, and sprite/explosion VFX
                 _thingRenderer?.RenderProjectiles(_shader, _worldSim!.Projectiles);
+
+                _shader.Use();
+                _shader.SetUniform("uModel", model);
+                _shader.SetUniform("uView", view);
+                _shader.SetUniform("uProjection", projection);
+                _shader.SetUniform("uTint", spTint);
+                _meshRenderer.RenderTranslucent(_shader);
+
                 _thingRenderer?.RenderSparks(_shader, _worldSim!.Sparks);
                 _thingRenderer?.RenderVisualEffects(_shader, _camera, _worldSim!.VisualEffects);
 

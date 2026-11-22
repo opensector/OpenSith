@@ -67,6 +67,11 @@ public sealed partial class WorldSimulation
     public event Action<int, float>? OnSurfaceLightChanged;
 
     /// <summary>
+    /// Invoked when <c>MaterialAnim</c> or <c>StopAnim</c> changes a world material's cel animation rate (<c>fps &lt;= 0</c> stops it).
+    /// </summary>
+    public event Action<string, float>? OnMaterialAnimChanged;
+
+    /// <summary>
     /// Effective RGB additive tint applied to the 3D scene from active sector tint,
     /// dynamic COG tint/add flashes, color effects, and IR mode.
     /// </summary>
@@ -174,6 +179,39 @@ public sealed partial class WorldSimulation
         return start + (end - start) * Math.Clamp(t, 0f, 1f);
     }
 
+    /// <summary>
+    /// Computes the effective RGB additive screen tint for <paramref name="playerThingId"/>
+    /// from its current sector tint, plus local dynamic tint/add flashes, color effects, and IR mode.
+    /// </summary>
+    public Vector3 ComputeScreenTintForPlayer(int playerThingId)
+    {
+        if (!TryResolvePlayer(playerThingId, out var player))
+            return CurrentScreenTint;
+
+        bool isLocal = player.ThingIndex == _localPlayerThingIndex;
+        Vector3 tint = isLocal ? (_dynamicTint + _dynamicAdd) : Vector3.Zero;
+
+        int curSector = (player.ThingIndex >= 0 && player.ThingIndex < _level.Things.Count)
+            ? _level.Things[player.ThingIndex].SectorIndex
+            : player.PrevSectorIndex;
+        if (curSector >= 0 && curSector < _level.Sectors.Count)
+        {
+            Vector3 secTint = _level.Sectors[curSector].Tint;
+            tint += new Vector3(
+                Math.Clamp(secTint.X, 0f, 1f),
+                Math.Clamp(secTint.Y, 0f, 1f),
+                Math.Clamp(secTint.Z, 0f, 1f)) * 0.35f;
+        }
+
+        foreach (var effect in _colorEffects.Values)
+            tint += effect.Tint + effect.Add;
+
+        if (isLocal && _irModeEnabled)
+            tint += new Vector3(0.0f, Math.Clamp(_irModeIntensity * 0.25f, 0.08f, 0.35f), 0.02f);
+
+        return Vector3.Clamp(tint, Vector3.Zero, new Vector3(0.75f, 0.75f, 0.75f));
+    }
+
     private void UpdateScreenColorEffects(float dt)
     {
         if (dt > 0f)
@@ -185,27 +223,18 @@ public sealed partial class WorldSimulation
             if (_dynamicAdd.LengthSquared() < 1e-5f) _dynamicAdd = Vector3.Zero;
         }
 
+        if (LocalPlayer is { } localPlayer)
+        {
+            CurrentScreenTint = ComputeScreenTintForPlayer(localPlayer.ThingIndex);
+            return;
+        }
+
         Vector3 tint = _dynamicTint + _dynamicAdd;
-
-        int curSector = LocalPlayer?.PrevSectorIndex ?? -1;
-        if (curSector >= 0 && curSector < _level.Sectors.Count)
-        {
-            Vector3 secTint = _level.Sectors[curSector].Tint;
-            tint += new Vector3(
-                Math.Clamp(secTint.X, 0f, 1f),
-                Math.Clamp(secTint.Y, 0f, 1f),
-                Math.Clamp(secTint.Z, 0f, 1f)) * 0.35f;
-        }
-
         foreach (var effect in _colorEffects.Values)
-        {
             tint += effect.Tint + effect.Add;
-        }
 
         if (_irModeEnabled)
-        {
             tint += new Vector3(0.0f, Math.Clamp(_irModeIntensity * 0.25f, 0.08f, 0.35f), 0.02f);
-        }
 
         CurrentScreenTint = Vector3.Clamp(tint, Vector3.Zero, new Vector3(0.75f, 0.75f, 0.75f));
     }
@@ -393,16 +422,19 @@ public sealed partial class WorldSimulation
 
     public int MaterialAnim(string material, float fps, int flags)
     {
+        string safeMaterial = material ?? string.Empty;
         int animId = _nextAnimId++;
         _activeAnims[animId] = new ActiveLightAnim
         {
             AnimId = animId,
             Kind = LightAnimKind.MaterialCel,
             TargetId = -1,
-            MaterialName = material ?? string.Empty,
+            MaterialName = safeMaterial,
             Period = fps,
             Flags = flags
         };
+        if (!string.IsNullOrWhiteSpace(safeMaterial))
+            OnMaterialAnimChanged?.Invoke(safeMaterial, MathF.Max(0f, fps));
         return animId;
     }
 
@@ -448,10 +480,31 @@ public sealed partial class WorldSimulation
 
     public void StopAnim(int animId)
     {
-        if (_activeAnims.Remove(animId, out var anim) && anim.TargetId >= 0)
+        if (_activeAnims.Remove(animId, out var anim))
         {
-            if (_surfaceAnimIds.TryGetValue(anim.TargetId, out int mappedId) && mappedId == animId)
+            if (anim.TargetId >= 0 &&
+                _surfaceAnimIds.TryGetValue(anim.TargetId, out int mappedId) &&
+                mappedId == animId)
+            {
                 _surfaceAnimIds.Remove(anim.TargetId);
+            }
+
+            if (anim.Kind == LightAnimKind.MaterialCel && !string.IsNullOrWhiteSpace(anim.MaterialName))
+            {
+                bool stillActive = false;
+                foreach (var other in _activeAnims.Values)
+                {
+                    if (other.Kind == LightAnimKind.MaterialCel &&
+                        string.Equals(other.MaterialName, anim.MaterialName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        stillActive = true;
+                        break;
+                    }
+                }
+
+                if (!stillActive)
+                    OnMaterialAnimChanged?.Invoke(anim.MaterialName, 0f);
+            }
         }
     }
 

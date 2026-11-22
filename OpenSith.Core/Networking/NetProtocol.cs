@@ -53,7 +53,8 @@ public enum RemotePlayerAnimFlags : byte
     IsFiring = 1 << 2,
     IsUnderwater = 1 << 3,
     SaberActive = 1 << 4,
-    PovKeyLoop = 1 << 5
+    PovKeyLoop = 1 << 5,
+    IsAirborne = 1 << 6
 }
 
 public enum NetEventKind : byte
@@ -65,7 +66,9 @@ public enum NetEventKind : byte
     ParticleRing = 5,
     BeamTrail = 6,
     LoopSoundStart = 7,
-    LoopSoundStop = 8
+    LoopSoundStop = 8,
+    SurfaceScroll = 9,
+    MaterialAnim = 10
 }
 
 [Flags]

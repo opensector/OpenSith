@@ -87,7 +87,9 @@ public sealed class PlayerPhysics
         IReadOnlyList<SolidThingCollider>? solidThings = null,
         Func<string, ThreeDoModel?>? modelResolver = null)
     {
+        bool wasGrounded = IsGrounded;
         IsUnderwater = IsSectorUnderwater(CurrentSectorIndex, level);
+        bool allowStepDown = wasGrounded && !wishJump && !IsUnderwater;
 
         if (IsUnderwater)
         {
@@ -141,7 +143,7 @@ public sealed class PlayerPhysics
         }
 
         // 4. Sector-constrained collision, solid thing collision, and portal traversal
-        newPos = ResolveCollisionsAndSector(newPos, level, solidThings, modelResolver ?? ModelResolver);
+        newPos = ResolveCollisionsAndSector(newPos, level, solidThings, modelResolver ?? ModelResolver, allowStepDown);
 
         Position = newPos;
     }
@@ -220,7 +222,8 @@ public sealed class PlayerPhysics
         Vector3 proposedPos,
         JklLevel level,
         IReadOnlyList<SolidThingCollider>? solidThings,
-        Func<string, ThreeDoModel?>? modelResolver)
+        Func<string, ThreeDoModel?>? modelResolver,
+        bool allowStepDown = false)
     {
         if (CurrentSectorIndex < 0 || CurrentSectorIndex >= level.Sectors.Count)
             return proposedPos;
@@ -403,15 +406,19 @@ public sealed class PlayerPhysics
             }
             IsGrounded = false;
         }
-        else if (foundFloor && proposedPos.Z <= floorZ + 0.03f && Velocity.Z <= 0.0f)
-        {
-            proposedPos = new Vector3(proposedPos.X, proposedPos.Y, floorZ);
-            Velocity = new Vector3(Velocity.X, Velocity.Y, 0.0f);
-            IsGrounded = true;
-        }
         else
         {
-            IsGrounded = false;
+            float groundSnapTolerance = allowStepDown ? MathF.Max(0.03f, MaxStepHeight) : 0.03f;
+            if (foundFloor && proposedPos.Z <= floorZ + groundSnapTolerance && Velocity.Z <= 0.0f)
+            {
+                proposedPos = new Vector3(proposedPos.X, proposedPos.Y, floorZ);
+                Velocity = new Vector3(Velocity.X, Velocity.Y, 0.0f);
+                IsGrounded = true;
+            }
+            else
+            {
+                IsGrounded = false;
+            }
         }
 
         // 4. Dynamic Sector Determination (after floor step-up clamping so sector tracks stepped-onto ledges)

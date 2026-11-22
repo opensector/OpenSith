@@ -79,7 +79,7 @@ public sealed class DedicatedGameServer : IDisposable
     }
 
     private const float MaxClientStepJumpDistance = 3.5f;
-    private const int MaxBufferedEvents = 64;
+    private const int MaxBufferedEvents = 128;
 
     private readonly UdpClient _udp;
     private readonly JklLevel _level;
@@ -101,6 +101,9 @@ public sealed class DedicatedGameServer : IDisposable
     private readonly Dictionary<int, BotSession> _botsByThing = new();
     private readonly SectorPortalNavGraph _navGraph;
     private readonly List<WorldSimulation.PickupInfo> _pickupScratch = [];
+    private readonly List<SolidThingCollider> _botColliderScratch = [];
+    private readonly Dictionary<int, (Vector2 Dir, float Speed)> _activeSurfaceScrolls = new();
+    private readonly Dictionary<string, float> _activeMaterialAnims = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<NetWorldEvent> _recentEvents = [];
     private readonly HashSet<int> _activeLoopChannels = [];
     private readonly List<WorldSimulation.DynamicThingState> _dynamicScratch = [];
@@ -162,7 +165,7 @@ public sealed class DedicatedGameServer : IDisposable
             vfs,
             _audioSink,
             difficulty: 1,
-            runStartupCogs: true,
+            runStartupCogs: false,
             isMultiplayer: true,
             isDedicatedServer: true);
 
@@ -172,6 +175,9 @@ public sealed class DedicatedGameServer : IDisposable
         _sim.OnVisualEffectSpawned += HandleVisualEffectSpawned;
         _sim.OnLoopingSoundStarted += HandleLoopingSoundStarted;
         _sim.OnLoopingSoundStopped += HandleLoopingSoundStopped;
+        _sim.OnSurfaceScroll += HandleSurfaceScroll;
+        _sim.OnMaterialAnimChanged += HandleMaterialAnimChanged;
+        _sim.StartLevel();
     }
 
     public IReadOnlyList<ConnectedClientInfo> GetConnectedClientsSnapshot()
@@ -226,7 +232,8 @@ public sealed class DedicatedGameServer : IDisposable
         bool grantAllWeapons = false,
         int team = 0,
         int? favoriteWeaponBin = null,
-        PlayerLoadoutConfig? customLoadout = null)
+        PlayerLoadoutConfig? customLoadout = null,
+        Random? rng = null)
     {
         lock (_sync)
         {
@@ -301,7 +308,7 @@ public sealed class DedicatedGameServer : IDisposable
                 PlayerThingId = player.ThingIndex,
                 PlayerSlot = freeSlot,
                 Physics = physics,
-                Controller = new DmBotController(archetype, skill),
+                Controller = new DmBotController(archetype, skill, rng),
                 PrevSnapshotPos = spawnPos
             };
 
@@ -567,6 +574,7 @@ public sealed class DedicatedGameServer : IDisposable
         _clientsByThing[player.ThingIndex] = session;
 
         EnqueueEvent(NetEventKind.StatusMessage, Vector3.Zero, 0f, 0f, 0, $"{player.Name} joined the game", string.Empty);
+        ReplaySurfaceAndMaterialAnimsToEvents();
         SendWelcome(senderEp, session, spawnPos, spawnYaw, spawnSector);
     }
 
@@ -744,6 +752,26 @@ public sealed class DedicatedGameServer : IDisposable
         }
     }
 
+    /// <summary>
+    /// Computes the horizontal movement speed for a Deathmatch AI bot according to skill tier,
+    /// directional thrust, and Force Speed extra speed, avoiding runaway speed stacking.
+    /// </summary>
+    public static float ComputeBotMoveSpeed(BotSkill skill, Vector3 localThrust, float extraSpeed)
+    {
+        bool isForward = localThrust.Y >= 0.1f;
+        float baseSpeed = (skill, isForward) switch
+        {
+            (BotSkill.Easy, true) => 1.25f,
+            (BotSkill.Easy, false) => 1.00f,
+            (BotSkill.Medium, true) => 1.50f,
+            (BotSkill.Medium, false) => 1.25f,
+            (_, true) => 1.75f,
+            (_, false) => 1.45f
+        };
+        float boostMul = 1.0f + Math.Clamp(extraSpeed, -0.5f, 1.5f) * 0.35f;
+        return baseSpeed * boostMul;
+    }
+
     private void StepBotsPreSim(float dt)
     {
         if (_bots.Count == 0)
@@ -777,13 +805,24 @@ public sealed class DedicatedGameServer : IDisposable
             bot.DeadRespawnTimer = 0f;
             BotTickDecision decision = bot.Controller.Decide(dt, _sim, player, thing, _navGraph, _pickupScratch);
 
-            float speedMul = decision.LocalThrust.Y < 0.1f ? 1.0f : 1.35f;
-            bot.Physics.MoveSpeed = 2.0f * speedMul * MathF.Max(0.25f, 1.0f + _sim.GetActorExtraSpeed(bot.PlayerThingId));
+            _botColliderScratch.Clear();
+            foreach (var other in _sim.Players)
+            {
+                if (other.ThingIndex == bot.PlayerThingId || other.Inventory.IsDead)
+                    continue;
+                _botColliderScratch.Add(new SolidThingCollider(GetPlayerPosition(other), 0.065f, 0.18f));
+            }
+
+            bot.Physics.MoveSpeed = ComputeBotMoveSpeed(
+                bot.Controller.Skill,
+                decision.LocalThrust,
+                _sim.GetActorExtraSpeed(bot.PlayerThingId));
             bot.Physics.Update(
                 dt,
                 decision.WishMoveDir,
                 decision.WishJump,
                 _level,
+                solidThings: _botColliderScratch,
                 modelResolver: _sim.ResolveThreeDoModel);
 
             thing.PitchYawRoll = new Vector3(decision.Pitch, decision.Yaw, thing.PitchYawRoll.Z);
@@ -941,7 +980,7 @@ public sealed class DedicatedGameServer : IDisposable
             if (platDelta.LengthSquared() > 1e-8f)
                 lpFlags |= LocalPlayerSnapFlags.HasPlatformDelta;
 
-            Vector3 tint = _sim.CurrentScreenTint;
+            Vector3 tint = _sim.ComputeScreenTintForPlayer(lp.ThingIndex);
             if (tint.LengthSquared() > 1e-6f)
                 lpFlags |= LocalPlayerSnapFlags.HasScreenTint;
 
@@ -1044,6 +1083,7 @@ public sealed class DedicatedGameServer : IDisposable
         if (distMoved > 0.002f) animFlags |= RemotePlayerAnimFlags.IsMoving;
         if (p.ActiveFireMode >= 0 || p.FireWait > 0f) animFlags |= RemotePlayerAnimFlags.IsFiring;
         if (p.IsUnderwater) animFlags |= RemotePlayerAnimFlags.IsUnderwater;
+        if (!p.IsGrounded && !p.IsUnderwater) animFlags |= RemotePlayerAnimFlags.IsAirborne;
         bool isSaber = p.CurWeaponBin == PlayerInventory.BinLightsaber;
         if (isSaber && ((_sim.JkGetFlags(p.ThingIndex) & 0x85) != 0 || p.SaberDamageActive))
             animFlags |= RemotePlayerAnimFlags.SaberActive;
@@ -1126,6 +1166,36 @@ public sealed class DedicatedGameServer : IDisposable
             return;
 
         EnqueueEvent(NetEventKind.LoopSoundStop, Vector3.Zero, fadeOut, 0f, channelId, string.Empty, string.Empty);
+    }
+
+    private void HandleSurfaceScroll(int surfaceId, Vector2 dir, float speed)
+    {
+        _activeSurfaceScrolls[surfaceId] = (dir, speed);
+        if (_clients.Count > 0)
+            EnqueueEvent(NetEventKind.SurfaceScroll, new Vector3(dir.X, dir.Y, speed), 0f, 0f, surfaceId, string.Empty, string.Empty);
+    }
+
+    private void HandleMaterialAnimChanged(string materialName, float fps)
+    {
+        if (string.IsNullOrWhiteSpace(materialName))
+            return;
+
+        if (fps > 0f)
+            _activeMaterialAnims[materialName] = fps;
+        else
+            _activeMaterialAnims.Remove(materialName);
+
+        if (_clients.Count > 0)
+            EnqueueEvent(NetEventKind.MaterialAnim, Vector3.Zero, fps, 0f, 0, materialName, string.Empty);
+    }
+
+    private void ReplaySurfaceAndMaterialAnimsToEvents()
+    {
+        foreach (var (surfaceId, scroll) in _activeSurfaceScrolls)
+            EnqueueEvent(NetEventKind.SurfaceScroll, new Vector3(scroll.Dir.X, scroll.Dir.Y, scroll.Speed), 0f, 0f, surfaceId, string.Empty, string.Empty);
+
+        foreach (var (matName, fps) in _activeMaterialAnims)
+            EnqueueEvent(NetEventKind.MaterialAnim, Vector3.Zero, fps, 0f, 0, matName, string.Empty);
     }
 
     private void HandleVisualEffectSpawned(WorldSimulation.VisualEffect vfx)
@@ -1259,6 +1329,8 @@ public sealed class DedicatedGameServer : IDisposable
             _sim.OnVisualEffectSpawned -= HandleVisualEffectSpawned;
             _sim.OnLoopingSoundStarted -= HandleLoopingSoundStarted;
             _sim.OnLoopingSoundStopped -= HandleLoopingSoundStopped;
+            _sim.OnSurfaceScroll -= HandleSurfaceScroll;
+            _sim.OnMaterialAnimChanged -= HandleMaterialAnimChanged;
             _udp.Dispose();
         }
     }

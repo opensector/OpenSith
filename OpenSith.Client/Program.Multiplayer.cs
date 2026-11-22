@@ -276,7 +276,11 @@ public static partial class Program
             if (thingId >= 0 && thingId < _level.Things.Count)
             {
                 var thing = _level.Things[thingId];
-                thing.Position = rp.Position + new Vector3(0f, 0f, _player.PelvisOffset);
+                float rpPelvis = !string.IsNullOrEmpty(thing.Model3D) &&
+                    GetOrLoadModel(thing.Model3D) is { InsertOffset.Z: > 0f } rpModel
+                    ? rpModel.InsertOffset.Z
+                    : _player.PelvisOffset;
+                thing.Position = rp.Position + new Vector3(0f, 0f, rpPelvis);
                 thing.PitchYawRoll = new Vector3(0f, rp.Yaw, 0f);
                 if (!rp.IsDead)
                 {
@@ -542,6 +546,18 @@ public static partial class Program
                         Console.WriteLine($"[MP] {_netBannerMessage}");
                     }
                     break;
+
+                case NetEventKind.SurfaceScroll:
+                    _meshRenderer?.SetSurfaceScroll(
+                        evt.IntParam0,
+                        LevelMeshRenderer.ComputeSlideWallUvVelocity(
+                            new Vector2(evt.Position.X, evt.Position.Y),
+                            evt.Position.Z));
+                    break;
+
+                case NetEventKind.MaterialAnim:
+                    _meshRenderer?.SetMaterialAnim(evt.Text0, evt.FloatParam0);
+                    break;
             }
         }
 
@@ -634,12 +650,15 @@ public static partial class Program
 
             bool isSaber = ps.WeaponBin == PlayerInventory.BinLightsaber;
             bool isUnder = (ps.AnimFlags & RemotePlayerAnimFlags.IsUnderwater) != 0;
+            bool isAirborne = (ps.AnimFlags & RemotePlayerAnimFlags.IsAirborne) != 0;
             int mode = isUnder ? (isSaber ? 5 : 4) : (isSaber ? 2 : 1);
             string action = rp.IsDead
                 ? "death"
                 : ((ps.AnimFlags & RemotePlayerAnimFlags.IsFiring) != 0
                     ? "fire"
-                    : ((ps.AnimFlags & RemotePlayerAnimFlags.IsMoving) != 0 ? "run" : "stand"));
+                    : (!isUnder && isAirborne
+                        ? "fall"
+                        : ((ps.AnimFlags & RemotePlayerAnimFlags.IsMoving) != 0 ? "run" : "stand")));
             _thingRenderer?.SetThingAnimation(ps.ThingIndex, action, mode, loop: !rp.IsDead);
         }
 
@@ -695,9 +714,22 @@ public static partial class Program
             return;
 
         var lpSnap = _latestSnapshot?.Local;
-        Vector3 tint = lpSnap != null && (lpSnap.Flags & LocalPlayerSnapFlags.HasScreenTint) != 0
+        Vector3 serverTint = lpSnap != null && (lpSnap.Flags & LocalPlayerSnapFlags.HasScreenTint) != 0
             ? lpSnap.ScreenTint
             : Vector3.Zero;
+        Vector3 localSectorTint = Vector3.Zero;
+        if (_player != null && _player.CurrentSectorIndex >= 0 && _player.CurrentSectorIndex < _level.Sectors.Count)
+        {
+            Vector3 rawSecTint = _level.Sectors[_player.CurrentSectorIndex].Tint;
+            localSectorTint = new Vector3(
+                Math.Clamp(rawSecTint.X, 0f, 1f),
+                Math.Clamp(rawSecTint.Y, 0f, 1f),
+                Math.Clamp(rawSecTint.Z, 0f, 1f)) * 0.35f;
+        }
+        Vector3 tint = Vector3.Clamp(
+            Vector3.Max(serverTint, localSectorTint),
+            Vector3.Zero,
+            new Vector3(0.75f, 0.75f, 0.75f));
 
         _shader.SetUniform("uModel", Matrix4x4.Identity);
         _shader.SetUniform("uView", view);
@@ -705,7 +737,7 @@ public static partial class Program
         _shader.SetUniform("uTint", tint);
         _shader.SetUniform("uAlpha", 1.0f);
 
-        _meshRenderer.Render(_shader);
+        _meshRenderer.RenderOpaque(_shader);
         _thingRenderer?.RenderThings(_shader, _level, playerThingIndex: _thirdPerson ? -1 : _netLocalThingId);
 
         int activeWeaponBin = lpSnap?.CurWeaponBin ?? PlayerInventory.BinBryar;
@@ -774,6 +806,14 @@ public static partial class Program
         }
 
         _thingRenderer?.RenderProjectiles(_shader, _netProjectiles);
+
+        _shader.Use();
+        _shader.SetUniform("uModel", Matrix4x4.Identity);
+        _shader.SetUniform("uView", view);
+        _shader.SetUniform("uProjection", projection);
+        _shader.SetUniform("uTint", tint);
+        _meshRenderer.RenderTranslucent(_shader);
+
         _thingRenderer?.RenderVisualEffects(_shader, _camera, _netVisualEffects);
 
         // First-person POV viewmodel & saber blade
