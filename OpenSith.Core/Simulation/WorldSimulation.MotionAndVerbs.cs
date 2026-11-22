@@ -595,4 +595,40 @@ public sealed partial class WorldSimulation
     public void ClearMapModeFlags(int flags) => _mapModeFlags &= ~flags;
 
     public int GetMapModeFlags() => _mapModeFlags;
+
+    public void SetWeaponFlags(int flags) { }
+
+    public void SetWeaponFlags(int thingId, int flags)
+    {
+        if (thingId >= 0 && thingId < _level.Things.Count && (flags & 0x1000) != 0)
+        {
+            // Support dynamic sequencer proximity arming (class_sequencer.cog SetWeaponFlags(id, 0x1000))
+            // when a projectile is matched near that spawned weapon thing.
+            Vector3 refPos = _level.Things[thingId].Position;
+            foreach (var proj in _projectiles)
+            {
+                if (Vector3.DistanceSquared(proj.Position, refPos) <= 0.04f)
+                    proj.ProximityDetonate = true;
+            }
+        }
+    }
+
+    public void JkSetInvulnerable(int thingId, int invulnerable)
+    {
+        if (invulnerable != 0)
+            SetActorFlags(thingId, 0x8);
+        else
+            ClearActorFlags(thingId, 0x8);
+    }
+
+    public void SyncSurface(int surfaceId)
+    {
+        // Surface sync triggers immediate replication of surface cel changes if needed.
+    }
+
+    public void SyncThingPos(int thingId)
+    {
+        if (thingId >= 0 && thingId < _level.Things.Count)
+            _replicatedDynamicThings.Add(thingId);
+    }
 }

@@ -135,6 +135,7 @@ public interface ICogWorldContext
     int GetCurWeaponMode() => 0;
     float GetWeaponPriority(int playerThing, int binIdx, int mode) => 0f;
     void SetWeaponFlags(int flags) { }
+    void SetWeaponFlags(int thingId, int flags) => SetWeaponFlags(flags);
     void ChangeFireRate(int weaponThing, float fireRate) { }
     int CreateBackpack(int playerThingId) => -1;
     void PickupBackpack(int playerThingId, int backpackThingId) { }
@@ -245,6 +246,9 @@ public interface ICogWorldContext
     void JkClearSuperFlags(int flags) { }
     int JkGetSuperFlags() => 0;
     int JkGetChoice() => 1;
+    void JkSetInvulnerable(int thingId, int invulnerable) { }
+    void SyncSurface(int surfaceId) { }
+    void SyncThingPos(int thingId) { }
     void AssignWeapon(int playerThing, int binIdx) { }
     string LoadSound(string soundName) => soundName ?? string.Empty;
     string LoadTemplate(string templateName) => templateName ?? string.Empty;

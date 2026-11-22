@@ -204,6 +204,11 @@ public sealed partial class WorldSimulation
         var instance = new CogInstance(script, _nextDynamicCogId++);
         if (instance.SymbolSlots.ContainsKey("player"))
             instance.SetSymbolValue("player", new CogValue(player.ThingIndex));
+        if (instance.SymbolSlots.ContainsKey("powerboost") &&
+            MathF.Abs(instance.GetSymbolValue("powerboost").AsFloat) < 1e-6f)
+        {
+            instance.SetSymbolValue("powerboost", new CogValue(1.0f));
+        }
         _cogVm.AddInstance(instance);
         player.ClassCog = instance;
         _playerCogOwners[instance] = player.ThingIndex;
@@ -233,6 +238,11 @@ public sealed partial class WorldSimulation
         var instance = new CogInstance(script, _nextDynamicCogId++);
         if (instance.SymbolSlots.ContainsKey("player"))
             instance.SetSymbolValue("player", new CogValue(player.ThingIndex));
+        if (instance.SymbolSlots.ContainsKey("powerboost") &&
+            MathF.Abs(instance.GetSymbolValue("powerboost").AsFloat) < 1e-6f)
+        {
+            instance.SetSymbolValue("powerboost", new CogValue(1.0f));
+        }
         _cogVm.AddInstance(instance);
         player.BinCogs[binIdx] = instance;
         _playerCogOwners[instance] = player.ThingIndex;
@@ -872,7 +882,7 @@ public sealed partial class WorldSimulation
             if (targetPlayer.ThingIndex < 0 || targetPlayer.ThingIndex >= _level.Things.Count)
                 continue;
 
-            Vector3 targetCenter = _level.Things[targetPlayer.ThingIndex].Position + new Vector3(0f, 0f, 0.10f);
+            Vector3 targetCenter = GetPlayerWorldPos(targetPlayer) + new Vector3(0f, 0f, 0.10f);
             Vector3 toTarget = targetCenter - rayOrigin;
             float proj = Vector3.Dot(toTarget, dir);
             if (proj <= 0f || proj > closestDist)
@@ -1005,8 +1015,9 @@ public sealed partial class WorldSimulation
             _audio?.PlaySoundPos(fireSound, spawnPos, 0.85f, 0.5f, 7.0f);
         }
 
-        // Hitscan instant-impact weapons (SITH_WF_INSTANT_IMPACT 0x8000): +concblast2, +force_lightning
-        if ((typeFlags & 0x8000) != 0)
+        // Hitscan instant-impact weapons: SITH_WF_INSTANT_IMPACT (0x2000) / beam-trail variants (0x8000)
+        // (+punch 0x200d, +concblast2 0xa00d, +force_lightning 0x1840d)
+        if ((typeFlags & 0xA000) != 0)
         {
             FireInstantBeamWeapon(
                 shooterThing,
@@ -1017,11 +1028,92 @@ public sealed partial class WorldSimulation
                 aimDir,
                 baseDamage,
                 damageClass,
+                typeFlags,
                 explodeTpl,
                 fleshHitTpl);
             return -1;
         }
 
+        AddTemplateProjectile(
+            tmpl,
+            spawnPos,
+            worldVel,
+            shooterThing,
+            !shooterIsPlayer,
+            baseDamage,
+            minDamage,
+            damageDecayRate,
+            lifetime,
+            physFlags,
+            typeFlags,
+            damageClass,
+            radius,
+            explodeTpl,
+            fleshHitTpl);
+
+        return -1;
+    }
+
+    internal void AddTemplateProjectileFromCreateThing(int spawnedThingId, string tmpl, Vector3 spawnPos)
+    {
+        var (right, forward, up) = GetThingBasis(spawnedThingId);
+        Vector3 localVel = ParseTemplateVector3(tmpl, "vel", Vector3.Zero);
+        Vector3 worldVel = right * localVel.X + forward * localVel.Y + up * localVel.Z;
+        if (worldVel.LengthSquared() < 1e-6f)
+            worldVel = forward * 0.5f;
+
+        float baseDamage = ParseTemplateFloat(tmpl, "damage", 0f);
+        float minDamage = MathF.Max(0f, ParseTemplateFloat(tmpl, "mindamage", 0f));
+        float damageDecayRate = MathF.Max(0f, ParseTemplateFloat(tmpl, "rate", 0f));
+        if (baseDamage <= 0f || minDamage >= baseDamage)
+            damageDecayRate = 0f;
+
+        float lifetime = ParseTemplateFloat(tmpl, "timer", 3.0f);
+        if (lifetime <= 0f)
+            lifetime = 3.0f;
+
+        uint physFlags = ParseTemplateHexOrInt(tmpl, "physflags", 0x225);
+        uint typeFlags = ParseTemplateHexOrInt(tmpl, "typeflags", 0x40309);
+        int damageClass = (int)ParseTemplateHexOrInt(tmpl, "damageclass", 4);
+        float radius = MathF.Max(ParseTemplateFloat(tmpl, "size", 0.015f), 0.01f);
+        string? explodeTpl = ResolveTemplateParam(tmpl, "explode");
+        string? fleshHitTpl = ResolveTemplateParam(tmpl, "fleshhit");
+
+        AddTemplateProjectile(
+            tmpl,
+            spawnPos,
+            worldVel,
+            ownerThingIndex: -1,
+            isEnemy: false,
+            baseDamage,
+            minDamage,
+            damageDecayRate,
+            lifetime,
+            physFlags,
+            typeFlags,
+            damageClass,
+            radius,
+            explodeTpl,
+            fleshHitTpl);
+    }
+
+    private void AddTemplateProjectile(
+        string tmpl,
+        Vector3 spawnPos,
+        Vector3 worldVel,
+        int ownerThingIndex,
+        bool isEnemy,
+        float baseDamage,
+        float minDamage,
+        float damageDecayRate,
+        float lifetime,
+        uint physFlags,
+        uint typeFlags,
+        int damageClass,
+        float radius,
+        string? explodeTpl,
+        string? fleshHitTpl)
+    {
         string modelName = !string.IsNullOrWhiteSpace(tmpl) ? _level.ResolveModel3D(tmpl) : string.Empty;
         if (string.IsNullOrWhiteSpace(modelName))
         {
@@ -1029,30 +1121,35 @@ public sealed partial class WorldSimulation
             modelName = string.IsNullOrWhiteSpace(spriteRef) ? "str0.3do" : string.Empty;
         }
 
+        // Authentic SITH_WEAPON_FLAGS (JK.EXE sithWeapon_SurfaceCollisionHandler 0x004D4BC0 / sithWeapon.h):
+        // 0x4 = FACEHITEXPLODE, 0x80 = ATTACHFACE, 0x100 = EXPLODE (on timeout),
+        // 0x1000 = PROXIMITY, 0x80000 = SURFACERICOCHET
         bool useGravity = (physFlags & 0x1) != 0;
         bool hasSurfaceBounceFlag = (physFlags & 0x20) != 0;
-        bool bounce = hasSurfaceBounceFlag && (typeFlags & 0x4) != 0;
+        bool faceHitExplode = (typeFlags & 0x4) != 0;
+        bool attachFace = (typeFlags & 0x80) != 0;
+        bool explodeOnTimeout = (typeFlags & 0x100) != 0;
         bool laserBounce = (typeFlags & 0x80000) != 0;
-        bool sticky = (typeFlags & 0x200000) != 0 && (typeFlags & 0x4) == 0 &&
-            (tmpl.StartsWith("+raildet2", StringComparison.OrdinalIgnoreCase) || (physFlags & 0x88) != 0);
-        if (!sticky && tmpl.StartsWith("+seqchrg", StringComparison.OrdinalIgnoreCase))
-            sticky = true;
+        bool sticky = attachFace && !faceHitExplode;
+        bool bounce = hasSurfaceBounceFlag && !faceHitExplode && !attachFace;
+        bool proximityDetonate = (typeFlags & 0x1000) != 0 || tmpl.Equals("+seqchrg2", StringComparison.OrdinalIgnoreCase);
+        bool explodeOnImpact = faceHitExplode && !sticky && !laserBounce;
+        if (!explodeOnTimeout && (bounce || sticky))
+            explodeOnTimeout = true;
 
-        bool proximityDetonate = tmpl.Equals("+seqchrg", StringComparison.OrdinalIgnoreCase);
-        bool explodeOnTimeout = bounce || sticky;
-        bool explodeOnImpact = !bounce && !sticky && !laserBounce;
+        Vector3 dir = worldVel.LengthSquared() > 1e-6f ? Vector3.Normalize(worldVel) : Vector3.UnitY;
 
         _projectiles.Add(new Projectile
         {
             Position = spawnPos,
-            Direction = Vector3.Normalize(worldVel),
+            Direction = dir,
             Velocity = worldVel,
             Damage = baseDamage,
             MinDamage = minDamage,
             DamageDecayRate = damageDecayRate,
             Lifetime = lifetime,
-            OwnerThingIndex = shooterThing,
-            IsEnemy = !shooterIsPlayer,
+            OwnerThingIndex = ownerThingIndex,
+            IsEnemy = isEnemy,
             ModelName = modelName,
             BoltColor = ResolveBoltColorForModel(modelName, tmpl),
             UseGravity = useGravity,
@@ -1060,6 +1157,7 @@ public sealed partial class WorldSimulation
             LaserBounce = laserBounce,
             BouncesRemaining = laserBounce ? 3 : 0,
             Sticky = sticky,
+            ArmDelay = tmpl.Equals("+seqchrg2", StringComparison.OrdinalIgnoreCase) ? 2.0f : 0.8f,
             ProximityDetonate = proximityDetonate,
             ProximityRange = 0.45f,
             ExplodeOnImpact = explodeOnImpact,
@@ -1069,8 +1167,6 @@ public sealed partial class WorldSimulation
             DamageClass = damageClass,
             Radius = radius
         });
-
-        return -1;
     }
 
     private void FireInstantBeamWeapon(
@@ -1082,15 +1178,19 @@ public sealed partial class WorldSimulation
         Vector3 aimDir,
         float baseDamage,
         int damageClass,
+        uint typeFlags,
         string? explodeTpl,
         string? fleshHitTpl)
     {
-        float range = MathF.Max(0.25f, ParseTemplateFloat(tmpl, "range", 5.0f));
+        float rawRange = MathF.Max(0.10f, ParseTemplateFloat(tmpl, "range", 5.0f));
         float minDamage = ParseTemplateFloat(tmpl, "mindamage", 0f);
         float damageRate = ParseTemplateFloat(tmpl, "rate", 0f);
         float impactForce = ParseTemplateFloat(tmpl, "force", 0f);
         float elementSize = MathF.Max(0.04f, ParseTemplateFloat(tmpl, "elementsize", 0.25f));
         float trailCylRadius = ParseTemplateFloat(tmpl, "trailcylradius", 0f);
+        bool hasTrail = (typeFlags & 0x8000) != 0 || !string.IsNullOrWhiteSpace(ResolveTemplateParam(tmpl, "trailthing"));
+        bool isMelee = !hasTrail && rawRange < 0.5f;
+        float range = isMelee ? MathF.Max(rawRange, 0.26f) : rawRange;
         bool isLightning = tmpl.Contains("lightning", StringComparison.OrdinalIgnoreCase) || trailCylRadius > 0.001f;
 
         Vector3 rayEnd = rayOrigin + aimDir * range;
@@ -1138,7 +1238,7 @@ public sealed partial class WorldSimulation
                 targetPlayer.ThingIndex < 0 || targetPlayer.ThingIndex >= _level.Things.Count)
                 continue;
 
-            Vector3 targetTorso = _level.Things[targetPlayer.ThingIndex].Position + new Vector3(0f, 0f, 0.13f);
+            Vector3 targetTorso = GetPlayerWorldPos(targetPlayer) + new Vector3(0f, 0f, 0.13f);
             float hitRadius = 0.08f + beamEntityRadius;
             float distSq = DistanceSqPointToSegment(targetTorso, rayOrigin, hitPos, out float segT);
             float distAlongRay = segT * closestDist;
@@ -1180,7 +1280,7 @@ public sealed partial class WorldSimulation
         {
             if (finalDamage > 0f)
                 DispatchThingCogMessageFromSource(hitPropId, shooterThing, "damaged", new CogValue(finalDamage), new CogValue(damageClass));
-            TriggerExplosion(hitPos, fleshHitTpl ?? explodeTpl, shooterThing, directHitThingId: hitPropId, fallbackSound: isLightning ? "ForceLitning02.wav" : "concuss2.wav");
+            TriggerExplosion(hitPos, fleshHitTpl ?? explodeTpl, shooterThing, directHitThingId: hitPropId, fallbackSound: isLightning ? "ForceLitning02.wav" : (isMelee ? "HitFist01.wav" : "concuss2.wav"));
         }
         else if (hitNpcId >= 0)
         {
@@ -1188,12 +1288,12 @@ public sealed partial class WorldSimulation
                 ApplyNpcDamage(hitNpcId, finalDamage, rayOrigin, damageClass, shooterThing);
             if (impactForce > 0f && _npcs.TryGetValue(hitNpcId, out var npc))
                 npc.Velocity += aimDir * (impactForce * 0.015f);
-            TriggerExplosion(hitPos, fleshHitTpl ?? explodeTpl, shooterThing, directHitThingId: hitNpcId, fallbackSound: isLightning ? "ForceLitning02.wav" : "kbodyhit01.wav");
+            TriggerExplosion(hitPos, fleshHitTpl ?? explodeTpl, shooterThing, directHitThingId: hitNpcId, fallbackSound: isLightning ? "ForceLitning02.wav" : (isMelee ? "HitFist01.wav" : "kbodyhit01.wav"));
         }
         else if (hitPlayer != null)
         {
             if (finalDamage > 0f)
-                ApplyDamageToPlayer(hitPlayer, shooterThing, finalDamage, isLightning ? "ForceLitning02.wav" : "kbodyhit01.wav");
+                ApplyDamageToPlayer(hitPlayer, shooterThing, finalDamage, isLightning ? "ForceLitning02.wav" : (isMelee ? "HitFist01.wav" : "kbodyhit01.wav"));
             if (impactForce > 0f)
             {
                 float hitMass = hitPlayer.ThingIndex >= 0 && hitPlayer.ThingIndex < _level.Things.Count
@@ -1201,14 +1301,17 @@ public sealed partial class WorldSimulation
                     : 150f;
                 AddThingVel(hitPlayer.ThingIndex, aimDir * (impactForce / hitMass));
             }
-            TriggerExplosion(hitPos, fleshHitTpl ?? explodeTpl, shooterThing, directHitThingId: hitPlayer.ThingIndex, fallbackSound: isLightning ? "ForceLitning02.wav" : "kbodyhit01.wav");
+            TriggerExplosion(hitPos, fleshHitTpl ?? explodeTpl, shooterThing, directHitThingId: hitPlayer.ThingIndex, fallbackSound: isLightning ? "ForceLitning02.wav" : (isMelee ? "HitFist01.wav" : "kbodyhit01.wav"));
         }
         else if (hitAny)
         {
             if (hitSurfaceId >= 0 && finalDamage > 0f)
                 DispatchSurfaceDamaged(hitSurfaceId, finalDamage, damageClass, shooterThing);
-            TriggerExplosion(hitPos, explodeTpl, shooterThing, fallbackSound: isLightning ? "ForceLitning02.wav" : "concuss2.wav");
+            TriggerExplosion(hitPos, explodeTpl, shooterThing, fallbackSound: isLightning ? "ForceLitning02.wav" : (isMelee ? "HitFist01.wav" : "concuss2.wav"));
         }
+
+        if (isMelee)
+            return;
 
         string? trailThing = ResolveTemplateParam(tmpl, "trailthing");
         string? trailMat = !string.IsNullOrWhiteSpace(trailThing)

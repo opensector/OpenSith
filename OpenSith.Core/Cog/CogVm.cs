@@ -1565,7 +1565,10 @@ public sealed class CogVm
                 return true;
 
             case "setweaponflags":
-                _context.SetWeaponFlags(Arg(0).AsInt);
+                if (args.Count >= 2)
+                    _context.SetWeaponFlags(Arg(0).AsInt, Arg(1).AsInt);
+                else
+                    _context.SetWeaponFlags(Arg(0).AsInt);
                 result = CogValue.Null;
                 return true;
 
@@ -2059,6 +2062,21 @@ public sealed class CogVm
                 result = new CogValue(_context.JkGetChoice());
                 return true;
 
+            case "jksetinvulnerable":
+                _context.JkSetInvulnerable(Arg(0).AsInt, Arg(1).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "syncsurface":
+                _context.SyncSurface(Arg(0).AsInt);
+                result = CogValue.Null;
+                return true;
+
+            case "syncthingpos":
+                _context.SyncThingPos(Arg(0).AsInt);
+                result = CogValue.Null;
+                return true;
+
             case "getmajormode":
                 result = args.Count > 0
                     ? new CogValue(_context.GetMajorMode(Arg(0).AsInt))
@@ -2338,6 +2356,7 @@ public sealed class CogVm
         "jksetpersuasioninfo", "jksetpovmodel", "jkplaypovkey", "jkstoppovkey", "jksetwaggle",
         "jkgetsabercam", "jksettarget", "jkendtarget", "jksettargetcolors", "jkbegincutscene",
         "jkendcutscene", "jksetsuperflags", "jkclearsuperflags", "jkgetsuperflags", "jkgetchoice",
+        "jksetinvulnerable", "syncsurface", "syncthingpos",
         "getmajormode", "getdifficulty", "ismulti", "isserver",
         "getnumplayers", "getplayerthing", "getplayerteam", "setplayerteam",
         "getplayerscore", "setplayerscore", "getplayerkills", "getplayerkilled", "getplayersuicides",

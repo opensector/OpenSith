@@ -6,8 +6,10 @@ using System.Net.Sockets;
 using System.Numerics;
 using System.Threading;
 using System.Threading.Tasks;
+using OpenSith.Core.AI;
 using OpenSith.Core.Cog;
 using OpenSith.Core.Data;
+using OpenSith.Core.Physics;
 using OpenSith.Core.Simulation;
 using OpenSith.Core.Vfs;
 using OpenSith.Core.World;
@@ -29,7 +31,22 @@ public sealed class DedicatedGameServer : IDisposable
         int Kills,
         int Deaths,
         int Score,
-        Vector3 Position);
+        Vector3 Position,
+        bool IsBot = false);
+
+    private sealed class BotSession
+    {
+        public int PlayerThingId;
+        public byte PlayerSlot;
+        public required PlayerPhysics Physics;
+        public required DmBotController Controller;
+        public bool PrevPrimaryHeld;
+        public bool PrevSecondaryHeld;
+        public int PrevForceBin;
+        public float DeadRespawnTimer;
+        public Vector3 PrevSnapshotPos;
+        public float LastDistanceMoved;
+    }
 
     private sealed class ClientSession
     {
@@ -80,6 +97,10 @@ public sealed class DedicatedGameServer : IDisposable
     private readonly List<ClientSession> _clients = [];
     private readonly Dictionary<ushort, ClientSession> _clientsById = new();
     private readonly Dictionary<int, ClientSession> _clientsByThing = new();
+    private readonly List<BotSession> _bots = [];
+    private readonly Dictionary<int, BotSession> _botsByThing = new();
+    private readonly SectorPortalNavGraph _navGraph;
+    private readonly List<WorldSimulation.PickupInfo> _pickupScratch = [];
     private readonly List<NetWorldEvent> _recentEvents = [];
     private readonly HashSet<int> _activeLoopChannels = [];
     private readonly List<WorldSimulation.DynamicThingState> _dynamicScratch = [];
@@ -87,6 +108,7 @@ public sealed class DedicatedGameServer : IDisposable
     private readonly object _sync = new();
 
     private ushort _nextClientId = 1;
+    private int _botSequence;
     private uint _nextEventSeq = 1;
     private bool _disposed;
 
@@ -98,6 +120,7 @@ public sealed class DedicatedGameServer : IDisposable
     public bool DefaultAllWeapons => _defaultAllWeapons;
     public bool AllowClientAllWeapons => _allowClientAllWeapons;
     public int ConnectedClientCount { get { lock (_sync) return _clients.Count; } }
+    public int BotCount { get { lock (_sync) return _bots.Count; } }
     public string EpisodeGob => _episodeGob;
     public string LevelFile => _levelFile;
     public WorldSimulation Simulation => _sim;
@@ -133,6 +156,7 @@ public sealed class DedicatedGameServer : IDisposable
         BoundPort = ((IPEndPoint)_udp.Client.LocalEndPoint!).Port;
 
         _audioSink = new ServerAudioSink(HandleSimulationSound);
+        _navGraph = new SectorPortalNavGraph(level);
         _sim = new WorldSimulation(
             level,
             vfs,
@@ -154,7 +178,7 @@ public sealed class DedicatedGameServer : IDisposable
     {
         lock (_sync)
         {
-            var result = new List<ConnectedClientInfo>(_clients.Count);
+            var result = new List<ConnectedClientInfo>(_clients.Count + _bots.Count);
             foreach (var c in _clients)
             {
                 var p = _sim.GetPlayerByThing(c.PlayerThingId);
@@ -168,10 +192,176 @@ public sealed class DedicatedGameServer : IDisposable
                     p.Kills,
                     p.Killed,
                     p.Score,
-                    GetPlayerPosition(p)));
+                    GetPlayerPosition(p),
+                    IsBot: false));
+            }
+            foreach (var b in _bots)
+            {
+                var p = _sim.GetPlayerByThing(b.PlayerThingId);
+                if (p == null) continue;
+                result.Add(new ConnectedClientInfo(
+                    0,
+                    b.PlayerThingId,
+                    b.PlayerSlot,
+                    p.Name,
+                    p.Team,
+                    p.Kills,
+                    p.Killed,
+                    p.Score,
+                    GetPlayerPosition(p),
+                    IsBot: true));
             }
             return result;
         }
+    }
+
+    /// <summary>
+    /// Spawns a server-authoritative Deathmatch AI bot that participates as a native
+    /// <see cref="PlayerState"/> + <see cref="PlayerPhysics"/> player across all weapons and UDP snapshots.
+    /// Returns the bot's player Thing index, or <c>-1</c> if the server is at capacity.
+    /// </summary>
+    public int AddBot(
+        string? name = null,
+        BotSkill skill = BotSkill.Medium,
+        bool grantAllWeapons = false,
+        int team = 0,
+        int? favoriteWeaponBin = null,
+        PlayerLoadoutConfig? customLoadout = null)
+    {
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_clients.Count + _bots.Count >= _maxPlayers)
+                return -1;
+
+            int archIdx = _botSequence++;
+            BotArchetype archetype = DmBotController.DefaultArchetypes[archIdx % DmBotController.DefaultArchetypes.Count];
+            if (!string.IsNullOrWhiteSpace(name))
+                archetype = archetype with { Name = name.Trim() };
+            else if (archIdx >= DmBotController.DefaultArchetypes.Count)
+                archetype = archetype with { Name = $"{archetype.Name}_{(archIdx / DmBotController.DefaultArchetypes.Count) + 1}" };
+
+            if (favoriteWeaponBin.HasValue && WorldSimulation.IsValidWeaponBin(favoriteWeaponBin.Value))
+                archetype = archetype with { FavoriteWeaponBin = favoriteWeaponBin.Value };
+
+            byte freeSlot = AllocateFreeSlot();
+            PlayerState player = _sim.AddPlayer(freeSlot, archetype.Name, team);
+
+            PlayerLoadoutConfig loadout;
+            if (customLoadout != null)
+            {
+                loadout = customLoadout.Clone();
+            }
+            else
+            {
+                loadout = new PlayerLoadoutConfig
+                {
+                    ModelIndex = ResolveModelIndexHint(archetype.PreferredModelHint, archIdx),
+                    SaberColorIndex = _sim.SaberCatalog.Count > 0 ? archetype.SaberColorIndex % _sim.SaberCatalog.Count : 0,
+                    JediRank = skill switch
+                    {
+                        BotSkill.Easy => 0,
+                        BotSkill.Medium => 3,
+                        _ => 6
+                    },
+                    GrantAllWeapons = grantAllWeapons || _defaultAllWeapons
+                };
+                if (loadout.JediRank > 0)
+                {
+                    for (int i = 0; i < PlayerCustomizationCatalog.ForcePowers.Count; i++)
+                    {
+                        int bin = PlayerCustomizationCatalog.ForcePowers[i].Bin;
+                        if (bin is PlayerInventory.BinForceJump or PlayerInventory.BinForceSpeed or PlayerInventory.BinForceHeal or PlayerInventory.BinForceLightning)
+                            loadout.ForceRanks[i] = (byte)(skill == BotSkill.Hard ? 3 : 2);
+                    }
+                }
+            }
+
+            if (_defaultAllWeapons)
+                loadout.GrantAllWeapons = true;
+            loadout.ClampToPolicy(
+                _maxJediRank,
+                grantAllWeapons || _allowClientAllWeapons || _defaultAllWeapons,
+                _sim.ModelCatalog.Count,
+                _sim.SaberCatalog.Count);
+
+            _sim.ApplyPlayerCustomization(player.ThingIndex, loadout);
+
+            JklThing? spawnThing = player.ThingIndex >= 0 && player.ThingIndex < _level.Things.Count
+                ? _level.Things[player.ThingIndex]
+                : null;
+            Vector3 spawnPos = spawnThing?.Position ?? player.WorldPosition;
+            int spawnSector = spawnThing?.SectorIndex ?? 0;
+
+            var physics = new PlayerPhysics(spawnPos, spawnSector);
+            physics.ConfigureFromModel(_sim.ResolveThreeDoModel(spawnThing?.Model3D));
+
+            var bot = new BotSession
+            {
+                PlayerThingId = player.ThingIndex,
+                PlayerSlot = freeSlot,
+                Physics = physics,
+                Controller = new DmBotController(archetype, skill),
+                PrevSnapshotPos = spawnPos
+            };
+
+            _bots.Add(bot);
+            _botsByThing[player.ThingIndex] = bot;
+            EnqueueEvent(NetEventKind.StatusMessage, Vector3.Zero, 0f, 0f, 0, $"{player.Name} [BOT] joined the game", string.Empty);
+            return player.ThingIndex;
+        }
+    }
+
+    public bool RemoveBot(int thingId)
+    {
+        lock (_sync)
+        {
+            if (!_botsByThing.Remove(thingId, out var bot))
+                return false;
+
+            string name = _sim.GetPlayerByThing(thingId)?.Name ?? $"Bot {bot.PlayerSlot + 1}";
+            _bots.Remove(bot);
+            _sim.RemovePlayer(thingId);
+            EnqueueEvent(NetEventKind.StatusMessage, Vector3.Zero, 0f, 0f, 0, $"{name} left the game", string.Empty);
+            return true;
+        }
+    }
+
+    public int RemoveAllBots()
+    {
+        lock (_sync)
+        {
+            int count = _bots.Count;
+            if (count == 0)
+                return 0;
+
+            foreach (var bot in _bots)
+            {
+                _botsByThing.Remove(bot.PlayerThingId);
+                _sim.RemovePlayer(bot.PlayerThingId);
+            }
+            _bots.Clear();
+            EnqueueEvent(NetEventKind.StatusMessage, Vector3.Zero, 0f, 0f, 0, $"Removed {count} bot(s)", string.Empty);
+            return count;
+        }
+    }
+
+    private int ResolveModelIndexHint(string preferredHint, int fallbackSeed)
+    {
+        if (_sim.ModelCatalog.Count == 0)
+            return 0;
+
+        if (!string.IsNullOrWhiteSpace(preferredHint))
+        {
+            for (int i = 0; i < _sim.ModelCatalog.Count; i++)
+            {
+                if (_sim.ModelCatalog[i].DisplayName.Contains(preferredHint, StringComparison.OrdinalIgnoreCase) ||
+                    _sim.ModelCatalog[i].Model3D.Contains(preferredHint, StringComparison.OrdinalIgnoreCase))
+                    return i;
+            }
+        }
+
+        return Math.Abs(fallbackSeed) % _sim.ModelCatalog.Count;
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -227,8 +417,12 @@ public sealed class DedicatedGameServer : IDisposable
                 }
             }
 
+            StepBotsPreSim(dt);
+
             _sim.StepWorld(dt);
             ServerTick++;
+
+            StepBotsPostSim();
 
             foreach (var client in _clients)
             {
@@ -317,7 +511,7 @@ public sealed class DedicatedGameServer : IDisposable
             }
         }
 
-        if (_clients.Count >= _maxPlayers)
+        if (_clients.Count + _bots.Count >= _maxPlayers)
         {
             if (NetCodec.TryWriteServerReject(_sendBuffer, new ServerRejectPacket("Server is full."), out int rejLen))
                 SafeSendTo(_sendBuffer.AsSpan(0, rejLen), senderEp);
@@ -467,54 +661,182 @@ public sealed class DedicatedGameServer : IDisposable
         }
 
         bool primaryHeld = (pkt.Flags & ClientInputFlags.PrimaryFireHeld) != 0;
-        if (primaryHeld != client.PrevPrimaryHeld)
-        {
-            client.PrevPrimaryHeld = primaryHeld;
-            if (primaryHeld)
-                _sim.BeginWeaponFire(client.PlayerThingId, 0);
-            else
-                _sim.EndWeaponFire(client.PlayerThingId, 0);
-        }
-
         bool secondaryHeld = (pkt.Flags & ClientInputFlags.SecondaryFireHeld) != 0;
-        if (secondaryHeld != client.PrevSecondaryHeld)
-        {
-            client.PrevSecondaryHeld = secondaryHeld;
-            if (secondaryHeld)
-                _sim.BeginWeaponFire(client.PlayerThingId, 1);
-            else
-                _sim.EndWeaponFire(client.PlayerThingId, 1);
-        }
-
         int desiredForceBin = WorldSimulation.IsValidForceBin(pkt.ActiveForceBin)
             ? pkt.ActiveForceBin
             : 0;
-        if (desiredForceBin != client.PrevForceBin)
+        SyncWeaponAndForceHolds(
+            client.PlayerThingId,
+            ref client.PrevPrimaryHeld,
+            ref client.PrevSecondaryHeld,
+            ref client.PrevForceBin,
+            primaryHeld,
+            secondaryHeld,
+            desiredForceBin,
+            aimDir);
+    }
+
+    private void ReleaseActivePlayerHolds(ClientSession client, PlayerState player) =>
+        ReleaseWeaponAndForceHolds(
+            player.ThingIndex,
+            ref client.PrevPrimaryHeld,
+            ref client.PrevSecondaryHeld,
+            ref client.PrevForceBin);
+
+    private void SyncWeaponAndForceHolds(
+        int playerThingId,
+        ref bool prevPrimaryHeld,
+        ref bool prevSecondaryHeld,
+        ref int prevForceBin,
+        bool primaryHeld,
+        bool secondaryHeld,
+        int desiredForceBin,
+        Vector3 aimDir)
+    {
+        if (primaryHeld != prevPrimaryHeld)
         {
-            if (client.PrevForceBin > 0)
-                _sim.EndForcePower(client.PlayerThingId, client.PrevForceBin);
-            client.PrevForceBin = desiredForceBin;
+            prevPrimaryHeld = primaryHeld;
+            if (primaryHeld)
+                _sim.BeginWeaponFire(playerThingId, 0);
+            else
+                _sim.EndWeaponFire(playerThingId, 0);
+        }
+
+        if (secondaryHeld != prevSecondaryHeld)
+        {
+            prevSecondaryHeld = secondaryHeld;
+            if (secondaryHeld)
+                _sim.BeginWeaponFire(playerThingId, 1);
+            else
+                _sim.EndWeaponFire(playerThingId, 1);
+        }
+
+        if (desiredForceBin != prevForceBin)
+        {
+            if (prevForceBin > 0)
+                _sim.EndForcePower(playerThingId, prevForceBin);
+            prevForceBin = desiredForceBin;
             if (desiredForceBin > 0)
-                _sim.BeginForcePower(client.PlayerThingId, desiredForceBin, aimDir);
+                _sim.BeginForcePower(playerThingId, desiredForceBin, aimDir);
         }
     }
 
-    private void ReleaseActivePlayerHolds(ClientSession client, PlayerState player)
+    private void ReleaseWeaponAndForceHolds(
+        int playerThingId,
+        ref bool prevPrimaryHeld,
+        ref bool prevSecondaryHeld,
+        ref int prevForceBin)
     {
-        if (client.PrevPrimaryHeld)
+        if (prevPrimaryHeld)
         {
-            client.PrevPrimaryHeld = false;
-            _sim.EndWeaponFire(player.ThingIndex, 0);
+            prevPrimaryHeld = false;
+            _sim.EndWeaponFire(playerThingId, 0);
         }
-        if (client.PrevSecondaryHeld)
+        if (prevSecondaryHeld)
         {
-            client.PrevSecondaryHeld = false;
-            _sim.EndWeaponFire(player.ThingIndex, 1);
+            prevSecondaryHeld = false;
+            _sim.EndWeaponFire(playerThingId, 1);
         }
-        if (client.PrevForceBin > 0)
+        if (prevForceBin > 0)
         {
-            _sim.EndForcePower(player.ThingIndex, client.PrevForceBin);
-            client.PrevForceBin = 0;
+            _sim.EndForcePower(playerThingId, prevForceBin);
+            prevForceBin = 0;
+        }
+    }
+
+    private void StepBotsPreSim(float dt)
+    {
+        if (_bots.Count == 0)
+            return;
+
+        _sim.CollectActivePickups(_pickupScratch);
+
+        foreach (var bot in _bots)
+        {
+            var player = _sim.GetPlayerByThing(bot.PlayerThingId);
+            if (player == null || bot.PlayerThingId < 0 || bot.PlayerThingId >= _level.Things.Count)
+                continue;
+
+            var thing = _level.Things[bot.PlayerThingId];
+            if (player.Inventory.IsDead)
+            {
+                ReleaseWeaponAndForceHolds(
+                    bot.PlayerThingId,
+                    ref bot.PrevPrimaryHeld,
+                    ref bot.PrevSecondaryHeld,
+                    ref bot.PrevForceBin);
+                bot.DeadRespawnTimer += dt;
+                if (bot.DeadRespawnTimer >= 1.5f)
+                {
+                    bot.DeadRespawnTimer = 0f;
+                    _sim.RespawnPlayer(bot.PlayerThingId);
+                }
+                continue;
+            }
+
+            bot.DeadRespawnTimer = 0f;
+            BotTickDecision decision = bot.Controller.Decide(dt, _sim, player, thing, _navGraph, _pickupScratch);
+
+            float speedMul = decision.LocalThrust.Y < 0.1f ? 1.0f : 1.35f;
+            bot.Physics.MoveSpeed = 2.0f * speedMul * MathF.Max(0.25f, 1.0f + _sim.GetActorExtraSpeed(bot.PlayerThingId));
+            bot.Physics.Update(
+                dt,
+                decision.WishMoveDir,
+                decision.WishJump,
+                _level,
+                modelResolver: _sim.ResolveThreeDoModel);
+
+            thing.PitchYawRoll = new Vector3(decision.Pitch, decision.Yaw, thing.PitchYawRoll.Z);
+            _sim.UpdatePlayerInput(
+                bot.PlayerThingId,
+                bot.Physics.Position,
+                bot.Physics.CurrentSectorIndex,
+                decision.AimDirection,
+                decision.LocalThrust,
+                bot.Physics.IsGrounded,
+                bot.Physics.IsUnderwater);
+
+            if (decision.DesiredWeaponBin != player.CurWeaponBin &&
+                WorldSimulation.IsValidWeaponBin(decision.DesiredWeaponBin))
+            {
+                _sim.SelectWeapon(bot.PlayerThingId, decision.DesiredWeaponBin);
+            }
+
+            if (decision.UsePressed)
+                _sim.ActivateNearestDoor(bot.PlayerThingId, bot.Physics.Position, decision.AimDirection);
+
+            int desiredForceBin = WorldSimulation.IsValidForceBin(decision.DesiredForceBin)
+                ? decision.DesiredForceBin
+                : 0;
+            SyncWeaponAndForceHolds(
+                bot.PlayerThingId,
+                ref bot.PrevPrimaryHeld,
+                ref bot.PrevSecondaryHeld,
+                ref bot.PrevForceBin,
+                decision.PrimaryFireHeld,
+                decision.SecondaryFireHeld,
+                desiredForceBin,
+                decision.AimDirection);
+        }
+    }
+
+    private void StepBotsPostSim()
+    {
+        if (_bots.Count == 0)
+            return;
+
+        foreach (var bot in _bots)
+        {
+            var player = _sim.GetPlayerByThing(bot.PlayerThingId);
+            if (player == null || player.Inventory.IsDead)
+                continue;
+
+            Vector3 platDelta = _sim.ConsumePlayerPlatformDelta(bot.PlayerThingId);
+            if (platDelta.LengthSquared() > 1e-8f)
+                bot.Physics.Position += platDelta;
+
+            if (_sim.TryConsumePlayerVelocityOverride(bot.PlayerThingId, out Vector3 velOverride))
+                bot.Physics.ApplyExternalVelocity(velOverride);
         }
     }
 
@@ -564,50 +886,18 @@ public sealed class DedicatedGameServer : IDisposable
         _sim.CollectDynamicThingStates(_dynamicScratch);
 
         // Compute per-player distance delta cleanly once per tick before building client packets
-        var playerSnaps = new List<NetPlayerSnapshot>(_clients.Count);
+        var playerSnaps = new List<NetPlayerSnapshot>(_clients.Count + _bots.Count);
         foreach (var c in _clients)
         {
             var p = _sim.GetPlayerByThing(c.PlayerThingId);
             if (p == null) continue;
-
-            Vector3 pos = GetPlayerPosition(p);
-            float distMoved = p.Inventory.IsDead
-                ? 0f
-                : Vector2.Distance(new Vector2(c.PrevSnapshotPos.X, c.PrevSnapshotPos.Y), new Vector2(pos.X, pos.Y));
-            c.PrevSnapshotPos = pos;
-            c.LastDistanceMoved = distMoved;
-
-            Vector3 pyr = p.ThingIndex >= 0 && p.ThingIndex < _level.Things.Count
-                ? _level.Things[p.ThingIndex].PitchYawRoll
-                : Vector3.Zero;
-
-            RemotePlayerAnimFlags animFlags = RemotePlayerAnimFlags.None;
-            if (p.Inventory.IsDead) animFlags |= RemotePlayerAnimFlags.IsDead;
-            if (distMoved > 0.002f) animFlags |= RemotePlayerAnimFlags.IsMoving;
-            if (p.ActiveFireMode >= 0 || p.FireWait > 0f) animFlags |= RemotePlayerAnimFlags.IsFiring;
-            if (p.IsUnderwater) animFlags |= RemotePlayerAnimFlags.IsUnderwater;
-            bool isSaber = p.CurWeaponBin == PlayerInventory.BinLightsaber;
-            if (isSaber && ((_sim.JkGetFlags(p.ThingIndex) & 0x85) != 0 || p.SaberDamageActive))
-                animFlags |= RemotePlayerAnimFlags.SaberActive;
-            if (p.PovKeyLoop) animFlags |= RemotePlayerAnimFlags.PovKeyLoop;
-
-            playerSnaps.Add(new NetPlayerSnapshot(
-                p.ThingIndex,
-                (byte)p.PlayerSlot,
-                (byte)p.Team,
-                p.Name,
-                pos,
-                pyr.X,
-                pyr.Y,
-                (byte)Math.Clamp((int)MathF.Ceiling(p.Inventory.Health), 0, 255),
-                (byte)Math.Clamp(p.CurWeaponBin, 0, 255),
-                animFlags,
-                distMoved,
-                (short)Math.Clamp(p.Kills, short.MinValue, short.MaxValue),
-                (short)Math.Clamp(p.Killed, short.MinValue, short.MaxValue),
-                (short)Math.Clamp(p.Score, short.MinValue, short.MaxValue),
-                (byte)Math.Clamp(p.ModelIndex, 0, 255),
-                (byte)Math.Clamp(p.SaberColorIndex, 0, 255)));
+            playerSnaps.Add(BuildPlayerSnapshot(p, ref c.PrevSnapshotPos, out c.LastDistanceMoved));
+        }
+        foreach (var b in _bots)
+        {
+            var p = _sim.GetPlayerByThing(b.PlayerThingId);
+            if (p == null) continue;
+            playerSnaps.Add(BuildPlayerSnapshot(p, ref b.PrevSnapshotPos, out b.LastDistanceMoved));
         }
 
         var projectiles = new List<NetProjectileSnapshot>(_sim.Projectiles.Count);
@@ -737,6 +1027,47 @@ public sealed class DedicatedGameServer : IDisposable
         }
     }
 
+    private NetPlayerSnapshot BuildPlayerSnapshot(PlayerState p, ref Vector3 prevSnapshotPos, out float distMoved)
+    {
+        Vector3 pos = GetPlayerPosition(p);
+        distMoved = p.Inventory.IsDead
+            ? 0f
+            : Vector2.Distance(new Vector2(prevSnapshotPos.X, prevSnapshotPos.Y), new Vector2(pos.X, pos.Y));
+        prevSnapshotPos = pos;
+
+        Vector3 pyr = p.ThingIndex >= 0 && p.ThingIndex < _level.Things.Count
+            ? _level.Things[p.ThingIndex].PitchYawRoll
+            : Vector3.Zero;
+
+        RemotePlayerAnimFlags animFlags = RemotePlayerAnimFlags.None;
+        if (p.Inventory.IsDead) animFlags |= RemotePlayerAnimFlags.IsDead;
+        if (distMoved > 0.002f) animFlags |= RemotePlayerAnimFlags.IsMoving;
+        if (p.ActiveFireMode >= 0 || p.FireWait > 0f) animFlags |= RemotePlayerAnimFlags.IsFiring;
+        if (p.IsUnderwater) animFlags |= RemotePlayerAnimFlags.IsUnderwater;
+        bool isSaber = p.CurWeaponBin == PlayerInventory.BinLightsaber;
+        if (isSaber && ((_sim.JkGetFlags(p.ThingIndex) & 0x85) != 0 || p.SaberDamageActive))
+            animFlags |= RemotePlayerAnimFlags.SaberActive;
+        if (p.PovKeyLoop) animFlags |= RemotePlayerAnimFlags.PovKeyLoop;
+
+        return new NetPlayerSnapshot(
+            p.ThingIndex,
+            (byte)p.PlayerSlot,
+            (byte)p.Team,
+            p.Name,
+            pos,
+            pyr.X,
+            pyr.Y,
+            (byte)Math.Clamp((int)MathF.Ceiling(p.Inventory.Health), 0, 255),
+            (byte)Math.Clamp(p.CurWeaponBin, 0, 255),
+            animFlags,
+            distMoved,
+            (short)Math.Clamp(p.Kills, short.MinValue, short.MaxValue),
+            (short)Math.Clamp(p.Killed, short.MinValue, short.MaxValue),
+            (short)Math.Clamp(p.Score, short.MinValue, short.MaxValue),
+            (byte)Math.Clamp(p.ModelIndex, 0, 255),
+            (byte)Math.Clamp(p.SaberColorIndex, 0, 255));
+    }
+
     private byte AllocateFreeSlot()
     {
         for (byte slot = 0; slot < _maxPlayers; slot++)
@@ -751,9 +1082,20 @@ public sealed class DedicatedGameServer : IDisposable
                 }
             }
             if (!used)
+            {
+                foreach (var b in _bots)
+                {
+                    if (b.PlayerSlot == slot)
+                    {
+                        used = true;
+                        break;
+                    }
+                }
+            }
+            if (!used)
                 return slot;
         }
-        return (byte)_clients.Count;
+        return (byte)(_clients.Count + _bots.Count);
     }
 
     private Vector3 GetPlayerPosition(PlayerState player) =>
@@ -834,6 +1176,20 @@ public sealed class DedicatedGameServer : IDisposable
 
     private void HandlePlayerTeleportOrRespawn(int thingId, Vector3 pos, Vector3 pyr, int sector)
     {
+        if (_botsByThing.TryGetValue(thingId, out var bot))
+        {
+            bot.Physics.Position = pos;
+            bot.Physics.CurrentSectorIndex = sector;
+            bot.Physics.Velocity = Vector3.Zero;
+            bot.PrevSnapshotPos = pos;
+            bot.PrevPrimaryHeld = false;
+            bot.PrevSecondaryHeld = false;
+            bot.PrevForceBin = 0;
+            bot.DeadRespawnTimer = 0f;
+            bot.Controller.ResetForRespawn(pos);
+            return;
+        }
+
         if (!_clientsByThing.TryGetValue(thingId, out var client))
             return;
 
@@ -901,6 +1257,8 @@ public sealed class DedicatedGameServer : IDisposable
             _sim.OnPlayerRespawned -= HandlePlayerTeleportOrRespawn;
             _sim.OnAnyPlayerTeleported -= HandlePlayerTeleportOrRespawn;
             _sim.OnVisualEffectSpawned -= HandleVisualEffectSpawned;
+            _sim.OnLoopingSoundStarted -= HandleLoopingSoundStarted;
+            _sim.OnLoopingSoundStopped -= HandleLoopingSoundStopped;
             _udp.Dispose();
         }
     }

@@ -273,28 +273,28 @@ public sealed class Phase5SimulationAndWeaponsTests
 
         sim.UpdatePlayerInput(playerId, new Vector3(0f, -1f, 0f), 0, Vector3.UnitY);
 
-        // Mode 0: hold & release throws bouncing +grenade1
-        Assert.True(sim.BeginWeaponFire(playerId, mode: 0));
+        // Mode 1: hold & release throws bouncing +grenade2 (SITH_WF_FACEHITEXPLODE=0, SITH_PF_SURFACEBOUNCE=1)
+        Assert.True(sim.BeginWeaponFire(playerId, mode: 1));
         for (int i = 0; i < 8; i++)
             sim.StepWorld(0.05f);
-        Assert.True(sim.EndWeaponFire(playerId, mode: 0));
+        Assert.True(sim.EndWeaponFire(playerId, mode: 1));
         Assert.Equal(3f, sim.GetInv(playerId, PlayerInventory.BinThermDet));
         Assert.Contains(sim.Projectiles, p => p.Bounce && p.UseGravity);
 
-        // Wait past Mode 0 throwWait (0.8s) before throwing Mode 1 impact grenade
+        // Wait past Mode 1 throwWait (0.8s) before throwing Mode 0 impact grenade (+grenade1)
         for (int i = 0; i < 18; i++)
             sim.StepWorld(0.05f);
 
-        // Mode 1: spawn a fresh Ree-Yees ahead and detonate an impact grenade beside it
+        // Mode 0: spawn a fresh Ree-Yees ahead and detonate an impact grenade (+grenade1) beside it
         Vector3 npc2Pos = new(2.5f, 3.0f, 0.13f);
         int targetNpcId = sim.CreateThingAtPos("reeyeesgun", 0, npc2Pos, new Vector3(0f, 180f, 0f));
-        sim.UpdatePlayerInput(playerId, new Vector3(npc2Pos.X, npc2Pos.Y - 0.35f, 0.2f), 0, Vector3.UnitY);
+        sim.UpdatePlayerInput(playerId, new Vector3(npc2Pos.X, npc2Pos.Y - 1.15f, 0.2f), 0, Vector3.UnitY);
         float npc2HpBefore = sim.GetThingHealth(targetNpcId);
         Assert.Equal(50f, npc2HpBefore);
-        Assert.True(sim.BeginWeaponFire(playerId, mode: 1));
+        Assert.True(sim.BeginWeaponFire(playerId, mode: 0));
         for (int i = 0; i < 6; i++)
             sim.StepWorld(0.05f);
-        Assert.True(sim.EndWeaponFire(playerId, mode: 1));
+        Assert.True(sim.EndWeaponFire(playerId, mode: 0));
 
         bool sawGrenadeVfx = false;
         for (int i = 0; i < 25; i++)

@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
+using OpenSith.Core.AI;
 using OpenSith.Core.Networking;
 using OpenSith.Core.Vfs;
 using OpenSith.Core.World;
@@ -25,6 +26,9 @@ public static class Program
         int maxJediRank = 8;
         bool defaultAllWeapons = false;
         bool allowClientAllWeapons = true;
+        int botCount = 0;
+        BotSkill botSkill = BotSkill.Medium;
+        bool botAllWeapons = false;
         var extraGobs = new List<string>();
 
         for (int i = 0; i < args.Length; i++)
@@ -50,6 +54,12 @@ public static class Program
                 defaultAllWeapons = true;
             else if (string.Equals(arg, "--no-client-all-weapons", StringComparison.OrdinalIgnoreCase))
                 allowClientAllWeapons = false;
+            else if (string.Equals(arg, "--bots", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length && int.TryParse(args[++i], out int parsedBots))
+                botCount = Math.Max(0, parsedBots);
+            else if (string.Equals(arg, "--bot-skill", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                botSkill = ParseBotSkill(args[++i]);
+            else if (string.Equals(arg, "--bot-all-weapons", StringComparison.OrdinalIgnoreCase))
+                botAllWeapons = true;
         }
 
         string res1Path = Path.Combine(assetsDir, "Resource", "Res1hi.gob");
@@ -115,6 +125,14 @@ public static class Program
             defaultAllWeapons: defaultAllWeapons,
             allowClientAllWeapons: allowClientAllWeapons);
 
+        int botsSpawned = 0;
+        int clampedBots = Math.Clamp(botCount, 0, maxPlayers);
+        for (int b = 0; b < clampedBots; b++)
+        {
+            if (server.AddBot(skill: botSkill, grantAllWeapons: botAllWeapons || defaultAllWeapons) >= 0)
+                botsSpawned++;
+        }
+
         Console.WriteLine("==================================================");
         Console.WriteLine("         OPENSITH - DEDICATED SERVER              ");
         Console.WriteLine("==================================================");
@@ -123,13 +141,14 @@ public static class Program
         Console.WriteLine($"UDP Port  : {server.BoundPort}");
         Console.WriteLine($"Tick Rate : {server.TickRateHz} Hz | Max Players: {server.MaxPlayers}");
         Console.WriteLine($"Policy    : MaxJediRank={server.MaxJediRank} | DefaultAllWeapons={server.DefaultAllWeapons} | ClientAllWeapons={server.AllowClientAllWeapons}");
+        Console.WriteLine($"Bots      : {botsSpawned} (Skill={botSkill}, AllWeapons={botAllWeapons || defaultAllWeapons})");
         Console.WriteLine($"COGs      : {server.Simulation.ActiveCogCount} | Dynamic Framed Things: {server.Simulation.FramedThingCount}");
         Console.WriteLine();
         Console.WriteLine("Connect clients with:");
         Console.WriteLine($"  dotnet run --project OpenSith.Client -- --connect 127.0.0.1:{server.BoundPort} --name Kyle");
         Console.WriteLine($"  dotnet run --project OpenSith.Client -- --connect 127.0.0.1:{server.BoundPort} --name Jan");
         Console.WriteLine();
-        Console.WriteLine("Console commands: status | players | quit (or Ctrl+C)");
+        Console.WriteLine("Console commands: status | players | addbot [name] | kickbots | quit (or Ctrl+C)");
 
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) =>
@@ -174,9 +193,23 @@ public static class Program
                     if (cmd.Equals("status", StringComparison.OrdinalIgnoreCase) || cmd.Equals("players", StringComparison.OrdinalIgnoreCase))
                     {
                         var clients = server.GetConnectedClientsSnapshot();
-                        Console.WriteLine($"[STATUS] Tick={server.ServerTick} Players={clients.Count}/{server.MaxPlayers}");
+                        Console.WriteLine($"[STATUS] Tick={server.ServerTick} Players={clients.Count}/{server.MaxPlayers} (Humans={server.ConnectedClientCount}, Bots={server.BotCount})");
                         foreach (var c in clients)
-                            Console.WriteLine($"  #{c.PlayerSlot} {c.Name} (Thing {c.PlayerThingId}) Team={c.Team} K={c.Kills} D={c.Deaths} S={c.Score} Pos={c.Position}");
+                            Console.WriteLine($"  #{c.PlayerSlot} {(c.IsBot ? "[BOT] " : "[UDP] ")}{c.Name} (Thing {c.PlayerThingId}) Team={c.Team} K={c.Kills} D={c.Deaths} S={c.Score} Pos={c.Position}");
+                    }
+                    else if (cmd.StartsWith("addbot", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string customName = cmd.Length > 6 ? cmd[6..].Trim() : string.Empty;
+                        int addedId = server.AddBot(
+                            name: string.IsNullOrWhiteSpace(customName) ? null : customName,
+                            skill: botSkill,
+                            grantAllWeapons: botAllWeapons || defaultAllWeapons);
+                        Console.WriteLine(addedId >= 0 ? $"Spawned bot as Thing {addedId}." : "Server is full; cannot add bot.");
+                    }
+                    else if (cmd.Equals("kickbots", StringComparison.OrdinalIgnoreCase))
+                    {
+                        int removed = server.RemoveAllBots();
+                        Console.WriteLine($"Removed {removed} bot(s).");
                     }
                 }
 
@@ -198,6 +231,13 @@ public static class Program
         Console.WriteLine("OpenSith Dedicated Server stopped.");
         return 0;
     }
+
+    private static BotSkill ParseBotSkill(string value) => value.Trim().ToLowerInvariant() switch
+    {
+        "easy" or "0" => BotSkill.Easy,
+        "hard" or "2" => BotSkill.Hard,
+        _ => BotSkill.Medium
+    };
 
     private static string InferEpisodeGob(string assetsDir, string levelFile)
     {

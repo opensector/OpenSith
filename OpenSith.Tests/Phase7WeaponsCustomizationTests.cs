@@ -428,16 +428,16 @@ public sealed class Phase7WeaponsCustomizationTests
         Assert.DoesNotContain(sim.Projectiles, p => p.Sticky);
         Assert.Contains(spawnedVfx, v => v.Kind == WorldSimulation.VisualEffectKind.Billboard && v.MaterialName == "conx.mat");
 
-        // 6. Sequencer Charge (+seqchrg) drops to floor, arms after 0.8s, and proximity-detonates when enemy approaches
-        level.Templates["+seqchrg"] = new JklTemplate
+        // 6. Sequencer Charge Mode 1 (+seqchrg2) drops to floor, arms after 2.0s, and proximity-detonates when enemy approaches
+        level.Templates["+seqchrg2"] = new JklTemplate
         {
-            Name = "+seqchrg",
+            Name = "+seqchrg2",
             BasedOn = "none",
             Model3D = "seq0.3do",
             Parameters = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
             {
                 ["vel"] = "(0/0.1/0)",
-                ["timer"] = "10.0",
+                ["timer"] = "60.0",
                 ["explode"] = "+conc_exp",
                 ["typeflags"] = "0x40380",
                 ["physflags"] = "0x29d"
@@ -447,8 +447,8 @@ public sealed class Phase7WeaponsCustomizationTests
         sim.RespawnPlayer(p2.ThingIndex);
         sim.UpdatePlayerInput(p2.ThingIndex, new Vector3(-4f, -4f, 0f), 0, Vector3.UnitY);
         sim.UpdatePlayerInput(p1.ThingIndex, new Vector3(0f, 0f, 0.05f), 0, Vector3.UnitY);
-        sim.FireProjectile(p1.ThingIndex, "+seqchrg", "-1", 0, Vector3.Zero, Vector3.Zero, 1f, 0, 0f, 0f);
-        for (int i = 0; i < 25; i++)
+        sim.FireProjectile(p1.ThingIndex, "+seqchrg2", "-1", 1, Vector3.Zero, Vector3.Zero, 1f, 0, 0f, 0f);
+        for (int i = 0; i < 50; i++)
             sim.StepWorld(0.05f);
         var planted = Assert.Single(sim.Projectiles, p => p.ProximityDetonate);
         Assert.True(planted.IsStuck);

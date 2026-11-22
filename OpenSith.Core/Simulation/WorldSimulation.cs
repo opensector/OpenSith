@@ -66,6 +66,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
     private readonly Dictionary<string, CogInstance?> _templateCogInstances = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, ThreeDoModel?> _threeDoCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<int, CogInstance> _pickupCogs = new();
+    private readonly Dictionary<int, (float RemainingSec, Vector3 OriginPos, int OriginSector)> _respawningPickups = new();
     private readonly HashSet<int> _destroyedThings = [];
     private readonly Dictionary<int, float> _thingLifeleft = new();
     private readonly Dictionary<int, Vector3> _thingVelocities = new();
@@ -175,6 +176,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
         public bool Sticky;
         public bool IsStuck;
         public float ArmedElapsed;
+        public float ArmDelay = 0.8f;
         public bool ProximityDetonate;
         public float ProximityRange = 0.45f;
         public bool ExplodeOnImpact = true;
@@ -1224,6 +1226,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
         }
 
         UpdateLifeleftTimers(dt);
+        UpdateRespawningPickups(dt);
         UpdateThingTimersAndPulses(dt);
         UpdateThingRotVels(dt);
         UpdateThingVelocities(dt);
@@ -1397,7 +1400,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
 
         if (IsMultiplayer)
         {
-            ClearActorFlags(player.ThingIndex, 0x4 | 0x80 | 0x800 | 0x40000);
+            ClearActorFlags(player.ThingIndex, 0x4 | 0x8 | 0x80 | 0x800 | 0x40000);
             _actorExtraSpeeds.Remove(player.ThingIndex);
             _jkFlags[player.ThingIndex] = 0;
             player.InvActivated.Clear();
@@ -1440,6 +1443,16 @@ public sealed partial class WorldSimulation : ICogWorldContext
             player.AimDirection = Vector3.Normalize(new Vector3(-MathF.Sin(yawRad), MathF.Cos(yawRad), 0f));
             player.HasAimDirection = true;
 
+            WithPlayerCogContext(player.ThingIndex, () =>
+            {
+                foreach (var binCog in new List<CogInstance>(player.BinCogs.Values))
+                {
+                    if (binCog.Program.Labels.ContainsKey("newplayer"))
+                        SafeSendMessage(binCog, "newplayer", senderRef: player.ThingIndex, senderId: 0, sourceRef: player.ThingIndex, senderType: 3);
+                }
+            });
+
+            int preNewPlayerWeapon = player.CurWeaponBin;
             bool hadNewPlayerCog = false;
             var classCog = GetOrCreatePlayerClassCog(player);
             if (classCog != null && classCog.Program.Labels.ContainsKey("newplayer"))
@@ -1453,6 +1466,10 @@ public sealed partial class WorldSimulation : ICogWorldContext
             {
                 int fallbackWeapon = AutoSelectWeapon(player.ThingIndex, 0);
                 SelectWeapon(player.ThingIndex, fallbackWeapon > 0 ? fallbackWeapon : PlayerInventory.BinBryar);
+            }
+            else if (player.CurWeaponBin == preNewPlayerWeapon)
+            {
+                SelectWeaponInternal(player, player.CurWeaponBin, assignMode: false);
             }
 
             if (player.Loadout != null)
@@ -3444,6 +3461,12 @@ public sealed partial class WorldSimulation : ICogWorldContext
 
     private void ApplyDamageToPlayer(PlayerState victim, int attackerThingId, float damage, string hitSound)
     {
+        if (victim.Inventory.IsDead)
+            return;
+
+        if ((GetActorFlags(victim.ThingIndex) & 0x8) != 0 || (GetThingFlags(victim.ThingIndex) & 0x4) != 0)
+            return;
+
         if (victim.ThingIndex == _localPlayerThingIndex)
             _audio?.PlaySoundLocal(hitSound, 0.85f);
         else if (victim.ThingIndex >= 0 && victim.ThingIndex < _level.Things.Count)
@@ -3615,7 +3638,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
             if (proj.IsStuck)
             {
                 proj.ArmedElapsed += dt;
-                if (proj.ProximityDetonate && proj.ArmedElapsed >= 0.8f)
+                if (proj.ProximityDetonate && proj.ArmedElapsed >= proj.ArmDelay)
                 {
                     bool triggered = false;
                     float rangeSq = proj.ProximityRange * proj.ProximityRange;
@@ -4520,6 +4543,14 @@ public sealed partial class WorldSimulation : ICogWorldContext
             {
                 SpawnParticleCloudFromTemplate(template, pos);
             }
+            else if (string.Equals(type, "weapon", StringComparison.OrdinalIgnoreCase) &&
+                     !string.IsNullOrWhiteSpace(ResolveTemplateParam(template, "explode")))
+            {
+                thing.ThingFlags |= (uint)SithThingFlags.Disabled;
+                thing.IsNonSolid = true;
+                _thingFlags[newId] = (int)thing.ThingFlags;
+                AddTemplateProjectileFromCreateThing(newId, template, pos);
+            }
             else if (!string.IsNullOrWhiteSpace(sprite))
             {
                 SpawnVisualEffectFromTemplate(template, pos);
@@ -4855,12 +4886,77 @@ public sealed partial class WorldSimulation : ICogWorldContext
                 cog = GetOrCreateTemplateCog(cogName);
         }
 
-        DestroyThing(itemThingId);
+        bool scheduledRespawn = false;
+        if (itemThingId >= 0 && itemThingId < _level.Things.Count)
+        {
+            var itemThing = _level.Things[itemThingId];
+            uint itemTypeFlags = ParseTemplateHexOrInt(itemThing.TemplateName, "typeflags", 0);
+            bool shouldRespawn = (IsMultiplayer && (itemTypeFlags & 0x1) != 0) ||
+                                 (!IsMultiplayer && (itemTypeFlags & 0x2) != 0);
+
+            if (shouldRespawn)
+            {
+                float respawnSec = MathF.Max(1.0f, ParseTemplateFloat(itemThing.TemplateName, "respawn", 30.0f));
+                Vector3 originPos = itemThingId < _initialThingPositions.Length ? _initialThingPositions[itemThingId] : itemThing.Position;
+                int originSector = itemThingId < _initialThingSectors.Length ? _initialThingSectors[itemThingId] : itemThing.SectorIndex;
+
+                itemThing.IsNonSolid = true;
+                SetThingFlags(itemThingId, (int)SithThingFlags.Disabled);
+                _respawningPickups[itemThingId] = (respawnSec, originPos, originSector);
+                scheduledRespawn = true;
+            }
+        }
+
+        if (!scheduledRespawn)
+            DestroyThing(itemThingId);
 
         if (cog != null && cog.Program.Labels.ContainsKey("taken"))
         {
             WithPlayerCogContext(playerThingId >= 0 ? playerThingId : _localPlayerThingIndex, () =>
                 SafeSendMessage(cog, "taken", senderRef: itemThingId, senderId: 0, sourceRef: playerThingId, senderType: 3));
+        }
+    }
+
+    private void UpdateRespawningPickups(float dt)
+    {
+        if (_respawningPickups.Count == 0)
+            return;
+
+        List<int>? ready = null;
+        foreach (var (thingId, state) in _respawningPickups)
+        {
+            float next = state.RemainingSec - dt;
+            if (next <= 0f)
+            {
+                ready ??= [];
+                ready.Add(thingId);
+            }
+            else
+            {
+                _respawningPickups[thingId] = (next, state.OriginPos, state.OriginSector);
+            }
+        }
+
+        if (ready == null)
+            return;
+
+        foreach (int thingId in ready)
+        {
+            if (!_respawningPickups.Remove(thingId, out var state))
+                continue;
+            if (thingId < 0 || thingId >= _level.Things.Count)
+                continue;
+
+            var thing = _level.Things[thingId];
+            thing.Position = state.OriginPos;
+            thing.SectorIndex = state.OriginSector;
+            thing.IsNonSolid = false;
+            ClearThingFlags(thingId, (int)SithThingFlags.Disabled);
+
+            if (_pickupCogs.TryGetValue(thingId, out var cog) && cog.Program.Labels.ContainsKey("respawn"))
+            {
+                SafeSendMessage(cog, "respawn", senderRef: thingId, senderId: 0, sourceRef: thingId, senderType: 3);
+            }
         }
     }
 
@@ -5368,6 +5464,90 @@ public sealed partial class WorldSimulation : ICogWorldContext
                     t.ThingFlags,
                     t.SectorIndex));
             }
+        }
+    }
+
+    /// <summary>
+    /// Resolves and caches a 3DO model by filename for headless server physics/collider checks.
+    /// </summary>
+    public ThreeDoModel? ResolveThreeDoModel(string? modelName) =>
+        string.IsNullOrWhiteSpace(modelName) ? null : TryLoadThreeDo(modelName);
+
+    /// <summary>
+    /// Returns true if an unobstructed line of sight exists between two world positions.
+    /// </summary>
+    public bool CheckLineOfSight(Vector3 from, Vector3 to) => HasLineOfSight(from, to);
+
+    /// <summary>
+    /// Metadata for an active, currently collectable item/weapon pickup in the level.
+    /// </summary>
+    public readonly record struct PickupInfo(
+        int ThingIndex,
+        Vector3 Position,
+        int SectorIndex,
+        string TemplateName,
+        int WeaponBin,
+        bool IsHealth,
+        bool IsShield,
+        bool IsAmmo,
+        bool IsPowerup);
+
+    /// <summary>
+    /// Populates <paramref name="output"/> with all currently active, non-disabled pickups in the level.
+    /// </summary>
+    public void CollectActivePickups(List<PickupInfo> output)
+    {
+        output.Clear();
+        for (int i = 0; i < _level.Things.Count; i++)
+        {
+            var thing = _level.Things[i];
+            if (thing.IsPlayerSpawn ||
+                _playersByThing.ContainsKey(thing.ThingIndex) ||
+                _destroyedThings.Contains(thing.ThingIndex) ||
+                (thing.ThingFlags & (uint)(SithThingFlags.Disabled | SithThingFlags.Destroyed)) != 0 ||
+                !JklThing.ShouldSpawnForDifficulty(thing.ThingFlags, Difficulty) ||
+                string.IsNullOrWhiteSpace(thing.TemplateName))
+            {
+                continue;
+            }
+
+            string? type = ResolveTemplateParam(thing.TemplateName, "type");
+            string? cogName = ResolveTemplateParam(thing.TemplateName, "cog");
+            bool isItem = string.Equals(type, "item", StringComparison.OrdinalIgnoreCase) ||
+                (!string.IsNullOrEmpty(cogName) && cogName.StartsWith("pow_", StringComparison.OrdinalIgnoreCase));
+            if (!isItem || string.IsNullOrWhiteSpace(cogName))
+                continue;
+
+            int weaponBin = cogName.ToLowerInvariant() switch
+            {
+                "pow_bryar.cog" => PlayerInventory.BinBryar,
+                "pow_strifle.cog" => PlayerInventory.BinStRifle,
+                "pow_thermal.cog" or "pow_single_thermal.cog" => PlayerInventory.BinThermDet,
+                "pow_crossbow.cog" => PlayerInventory.BinBowcaster,
+                "pow_repeater.cog" => PlayerInventory.BinRepeater,
+                "pow_railgun.cog" => PlayerInventory.BinRailDet,
+                "pow_sequencer.cog" or "pow_single_sequencer.cog" => PlayerInventory.BinSeqCharge,
+                "pow_concrifle.cog" => PlayerInventory.BinConcRifle,
+                "pow_saber.cog" => PlayerInventory.BinLightsaber,
+                _ => -1
+            };
+
+            string lowCog = cogName.ToLowerInvariant();
+            bool isHealth = lowCog is "pow_health.cog" or "pow_bacta.cog";
+            bool isShield = lowCog is "pow_shields.cog" or "pow_supershield.cog" or "pow_vest.cog";
+            bool isAmmo = lowCog is "pow_energy.cog" or "pow_power.cog" or "pow_railcharges.cog" or "pow_backpack.cog";
+            bool isPowerup = !isHealth && !isShield && !isAmmo && weaponBin < 0;
+
+            output.Add(new PickupInfo(
+                thing.ThingIndex,
+                thing.Position,
+                thing.SectorIndex,
+                thing.TemplateName,
+                weaponBin,
+                isHealth,
+                isShield,
+                isAmmo,
+                isPowerup));
         }
     }
 }
