@@ -456,23 +456,17 @@ public sealed partial class WorldSimulation
         return elapsed;
     }
 
-    public void ChangeFireRate(int weaponThing, float fireRate)
-    {
-        if (!TryResolvePlayer(weaponThing, out var player))
-            return;
-
-        float safeWait = float.IsFinite(fireRate) && fireRate > 0f ? fireRate : 0f;
-        player.FireRate = safeWait;
-        player.FireWait = safeWait;
-        _fireWaitExplicitlySet = true;
-    }
+    public void ChangeFireRate(int weaponThing, float fireRate) =>
+        SetFireWait(weaponThing, fireRate);
 
     public void SetFireWait(int thingId, float wait)
     {
         if (!TryResolvePlayer(thingId, out var player))
             return;
 
-        player.FireWait = float.IsFinite(wait) && wait > 0f ? wait : 0f;
+        float safeWait = float.IsFinite(wait) && wait > 0f ? wait : 0f;
+        player.FireRate = safeWait;
+        player.FireWait = safeWait;
         _fireWaitExplicitlySet = true;
     }
 
@@ -594,10 +588,11 @@ public sealed partial class WorldSimulation
             return -1;
 
         string trimmedKey = keyframe.Trim();
-        bool isEndPause = (flags & 0x04) != 0 || flags == 0x12 || flags == 0x18;
-        bool returnToIdle = !isEndPause && ((flags & 0x20) != 0 || flags == 0x0a || (priority > 0 && flags != 0));
-        bool loop = !isEndPause && !returnToIdle;
-        bool updatesIdle = priority == 0 && (flags == 0 || flags == 0x14);
+        bool isDismountHold = priority == 0 && (flags == 0x12 || flags == 0x18);
+        bool returnToIdle = !isDismountHold && ((flags & 0x02) != 0 || (flags & 0x20) != 0);
+        bool isEndPause = isDismountHold || (!returnToIdle && (flags & 0x04) != 0);
+        bool loop = !returnToIdle && !isEndPause;
+        bool updatesIdle = !isDismountHold && priority == 0 && !returnToIdle;
 
         player.PovKey = trimmedKey;
         player.PovKeyTime = 0f;

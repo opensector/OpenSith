@@ -5388,7 +5388,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
 
         if (!string.IsNullOrWhiteSpace(keyName))
         {
-            bool loop = (flags & 0x14) == 0;
+            bool loop = (flags & 0x26) == 0;
             OnPlayThingKeyframe?.Invoke(thingId, keyName, loop);
         }
 

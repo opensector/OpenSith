@@ -235,7 +235,7 @@ public sealed class BotAnimationAndWeaponBalanceTests
         Assert.Equal("strafeleft", strafeLeft.BaseAction);
         Assert.Equal("walkback", walkBack.BaseAction);
 
-        // Jump upward moving -> non-looping "leap"; stationary rising -> non-looping "rising"
+        // Jump upward forward -> non-looping "leap"; stationary/backward/strafe rising -> non-looping "rising"
         var leap = ThingMeshRenderer.ResolvePlayerAnimationState(false, false, true, true, false, PlayerInventory.BinBryar, new Vector2(0f, 1.4f), 0f, verticalVelocity: 1.4f, descendingSeconds: 0f);
         Assert.Equal("leap", leap.BaseAction);
         Assert.False(leap.BaseLoop);
@@ -244,13 +244,21 @@ public sealed class BotAnimationAndWeaponBalanceTests
         Assert.Equal("rising", rising.BaseAction);
         Assert.False(rising.BaseLoop);
 
-        // Normal jump descent -> non-looping "drop"; deep sustained fall -> looping "fall"
-        var drop = ThingMeshRenderer.ResolvePlayerAnimationState(false, false, true, true, false, PlayerInventory.BinBryar, new Vector2(0f, 1.4f), 0f, verticalVelocity: -0.9f, descendingSeconds: 0.30f);
+        var backJump = ThingMeshRenderer.ResolvePlayerAnimationState(false, false, true, true, false, PlayerInventory.BinBryar, new Vector2(0f, -1.4f), 0f, verticalVelocity: 1.4f, descendingSeconds: 0f);
+        Assert.Equal("rising", backJump.BaseAction);
+        Assert.False(backJump.BaseLoop);
+
+        var strafeJump = ThingMeshRenderer.ResolvePlayerAnimationState(false, false, true, true, false, PlayerInventory.BinBryar, new Vector2(1.4f, 0f), 0f, verticalVelocity: 1.4f, descendingSeconds: 0f);
+        Assert.Equal("rising", strafeJump.BaseAction);
+        Assert.False(strafeJump.BaseLoop);
+
+        // Descent above -3.0 JKU/s (<0.86s) stays non-looping "drop"; <= -3.0 JKU/s or >= 0.86s transitions to looping "fall"
+        var drop = ThingMeshRenderer.ResolvePlayerAnimationState(false, false, true, true, false, PlayerInventory.BinBryar, new Vector2(0f, 1.4f), 0f, verticalVelocity: -2.6f, descendingSeconds: 0.50f);
         Assert.Equal("drop", drop.BaseAction);
         Assert.False(drop.BaseLoop);
         Assert.Null(drop.OverlayActionOrKey);
 
-        var fall = ThingMeshRenderer.ResolvePlayerAnimationState(false, false, true, true, false, PlayerInventory.BinBryar, new Vector2(0f, 1.4f), 0f, verticalVelocity: -3.0f, descendingSeconds: 0.85f);
+        var fall = ThingMeshRenderer.ResolvePlayerAnimationState(false, false, true, true, false, PlayerInventory.BinBryar, new Vector2(0f, 1.4f), 0f, verticalVelocity: -3.0f, descendingSeconds: 0.86f);
         Assert.Equal("fall", fall.BaseAction);
         Assert.True(fall.BaseLoop);
         Assert.Null(fall.OverlayActionOrKey);
@@ -568,6 +576,27 @@ public sealed class BotAnimationAndWeaponBalanceTests
             sim.StepWorld(dt);
         Assert.Equal("DetVpre.key", p.PovKey);
         Assert.InRange(p.PovKeyTime, 0.28f, 0.30f);
+
+        // 4. JK.EXE sithPuppet_PlayKey bit precedence (0x02/0x20 override 0x04), PlayKey 0x26 non-loop mask (0x10 loops), and SetFireWait(-1) clears FireRate
+        sim.JkPlayPovKey(p.ThingIndex, "SabVsnp1.key", priority: 1, flags: 0x24);
+        Assert.True(p.PovKeyReturnToIdle);
+        Assert.False(p.PovKeyEndPause);
+        Assert.False(p.PovKeyLoop);
+
+        playKeyEvents.Clear();
+        sim.PlayKey(p.ThingIndex, "KYsnap1.key", 1, 0x02);
+        sim.PlayKey(p.ThingIndex, "KYsnap2.key", 1, 0x20);
+        sim.PlayKey(p.ThingIndex, "SabVmnt.key", 0, 0x10);
+        Assert.Equal(3, playKeyEvents.Count);
+        Assert.False(playKeyEvents[0].Loop);
+        Assert.False(playKeyEvents[1].Loop);
+        Assert.True(playKeyEvents[2].Loop);
+
+        p.FireRate = 0.5f;
+        p.FireWait = 0.5f;
+        sim.SetFireWait(p.ThingIndex, -1f);
+        Assert.Equal(0f, p.FireRate);
+        Assert.Equal(0f, p.FireWait);
     }
 
     [Fact]

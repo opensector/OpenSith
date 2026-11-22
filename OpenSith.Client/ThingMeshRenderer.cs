@@ -191,16 +191,20 @@ public sealed class ThingMeshRenderer : IDisposable
         if (isDead)
             return new(mode, "death", false, null, false);
 
+        float yawRad = yawDeg * (MathF.PI / 180f);
+        Vector2 fwd = new(-MathF.Sin(yawRad), MathF.Cos(yawRad));
+
         string baseAction;
         bool baseLoop = true;
         if (!isUnderwater && isAirborneSustained)
         {
             if (verticalVelocity > 0.05f)
             {
-                baseAction = isMoving ? "leap" : "rising";
+                float fwdSpeed = Vector2.Dot(horizVelocity, fwd);
+                baseAction = (isMoving && fwdSpeed > 0.02f) ? "leap" : "rising";
                 baseLoop = false;
             }
-            else if (descendingSeconds >= 0.70f || verticalVelocity <= -2.5f)
+            else if (verticalVelocity <= -3.0f || descendingSeconds >= 0.86f)
             {
                 baseAction = "fall";
                 baseLoop = true;
@@ -219,8 +223,6 @@ public sealed class ThingMeshRenderer : IDisposable
             }
             else if (horizVelocity.LengthSquared() > 1e-4f)
             {
-                float yawRad = yawDeg * (MathF.PI / 180f);
-                Vector2 fwd = new(-MathF.Sin(yawRad), MathF.Cos(yawRad));
                 Vector2 right = new(MathF.Cos(yawRad), MathF.Sin(yawRad));
                 Vector2 moveDir = Vector2.Normalize(horizVelocity);
                 float fwdDot = Vector2.Dot(moveDir, fwd);
