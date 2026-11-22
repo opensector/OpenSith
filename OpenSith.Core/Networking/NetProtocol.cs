@@ -68,7 +68,8 @@ public enum NetEventKind : byte
     LoopSoundStart = 7,
     LoopSoundStop = 8,
     SurfaceScroll = 9,
-    MaterialAnim = 10
+    MaterialAnim = 10,
+    ThingPlayKey = 11
 }
 
 [Flags]

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Numerics;
+using System.Threading.Tasks;
 using OpenSith.Client;
 using OpenSith.Core.AI;
 using OpenSith.Core.Animation;
@@ -184,7 +185,7 @@ public sealed class BotAnimationAndWeaponBalanceTests
         Assert.True(runGunFire.BaseLoop);
         Assert.Equal("fire", runGunFire.OverlayActionOrKey);
 
-        // Saber + moving + firing -> mode 2, run base + kysabrf1.key overlay
+        // Saber + above water + moving + firing -> mode 2, run base, no continuous overlay (swings come from one-shot PlayKey/ThingPlayKey)
         var runSaberFire = ThingMeshRenderer.ResolvePlayerAnimationState(
             isDead: false,
             isUnderwater: false,
@@ -196,7 +197,21 @@ public sealed class BotAnimationAndWeaponBalanceTests
             yawDeg: 0f);
         Assert.Equal(2, runSaberFire.Mode);
         Assert.Equal("run", runSaberFire.BaseAction);
-        Assert.Equal("kysabrf1.key", runSaberFire.OverlayActionOrKey);
+        Assert.Null(runSaberFire.OverlayActionOrKey);
+
+        // Saber + underwater + moving + firing -> mode 5, run base + fire overlay
+        var underwaterSaberFire = ThingMeshRenderer.ResolvePlayerAnimationState(
+            isDead: false,
+            isUnderwater: true,
+            isAirborneSustained: false,
+            isMoving: true,
+            isFiring: true,
+            weaponBin: PlayerInventory.BinLightsaber,
+            horizVelocity: new Vector2(0f, 1.2f),
+            yawDeg: 0f);
+        Assert.Equal(5, underwaterSaberFire.Mode);
+        Assert.Equal("run", underwaterSaberFire.BaseAction);
+        Assert.Equal("fire", underwaterSaberFire.OverlayActionOrKey);
 
         // Fists + moving + firing -> mode 0, run base + fire overlay
         var runFistsFire = ThingMeshRenderer.ResolvePlayerAnimationState(
@@ -220,9 +235,24 @@ public sealed class BotAnimationAndWeaponBalanceTests
         Assert.Equal("strafeleft", strafeLeft.BaseAction);
         Assert.Equal("walkback", walkBack.BaseAction);
 
-        // Sustained airborne -> fall + optional overlay if firing
-        var fall = ThingMeshRenderer.ResolvePlayerAnimationState(false, false, true, true, false, PlayerInventory.BinBryar, new Vector2(0f, 1.4f), 0f);
+        // Jump upward moving -> non-looping "leap"; stationary rising -> non-looping "rising"
+        var leap = ThingMeshRenderer.ResolvePlayerAnimationState(false, false, true, true, false, PlayerInventory.BinBryar, new Vector2(0f, 1.4f), 0f, verticalVelocity: 1.4f, descendingSeconds: 0f);
+        Assert.Equal("leap", leap.BaseAction);
+        Assert.False(leap.BaseLoop);
+
+        var rising = ThingMeshRenderer.ResolvePlayerAnimationState(false, false, true, false, false, PlayerInventory.BinBryar, Vector2.Zero, 0f, verticalVelocity: 1.4f, descendingSeconds: 0f);
+        Assert.Equal("rising", rising.BaseAction);
+        Assert.False(rising.BaseLoop);
+
+        // Normal jump descent -> non-looping "drop"; deep sustained fall -> looping "fall"
+        var drop = ThingMeshRenderer.ResolvePlayerAnimationState(false, false, true, true, false, PlayerInventory.BinBryar, new Vector2(0f, 1.4f), 0f, verticalVelocity: -0.9f, descendingSeconds: 0.30f);
+        Assert.Equal("drop", drop.BaseAction);
+        Assert.False(drop.BaseLoop);
+        Assert.Null(drop.OverlayActionOrKey);
+
+        var fall = ThingMeshRenderer.ResolvePlayerAnimationState(false, false, true, true, false, PlayerInventory.BinBryar, new Vector2(0f, 1.4f), 0f, verticalVelocity: -3.0f, descendingSeconds: 0.85f);
         Assert.Equal("fall", fall.BaseAction);
+        Assert.True(fall.BaseLoop);
         Assert.Null(fall.OverlayActionOrKey);
 
         // Dead -> death non-looping, no overlay
@@ -383,5 +413,235 @@ public sealed class BotAnimationAndWeaponBalanceTests
                 inRangeCasts++;
         }
         Assert.InRange(inRangeCasts, 1, 2);
+    }
+
+    private static string BuildSyntheticKeyText(int frames, float fps) =>
+        $"""
+        SECTION: HEADER
+        FRAMES {frames}
+        FPS {fps:0.0}
+        JOINTS 1
+
+        SECTION: KEYFRAME NODES
+        NODES 1
+        NODE 0
+        ENTRIES 1
+        0: 0 0x0000 0.0 0.0 0.0 0.0 0.0 0.0
+        0.0 0.0 0.0 0.0 0.0 0.0
+        """;
+
+    [Fact]
+    public void Lightsaber_TapAndHold_PlaysFullSwingReturnsToIdle_AndChainsNextSwingOnHold()
+    {
+        var vfs = new InMemoryVfs();
+        vfs.AddText("3do/key/SabVmnt.key", BuildSyntheticKeyText(frames: 8, fps: 10f));  // 0.80s
+        vfs.AddText("3do/key/SabVsnp1.key", BuildSyntheticKeyText(frames: 4, fps: 10f)); // 0.40s
+        vfs.AddText("3do/key/SabVsnp2.key", BuildSyntheticKeyText(frames: 5, fps: 10f)); // 0.50s
+        vfs.AddText("3do/key/KYsnap1.key", BuildSyntheticKeyText(frames: 5, fps: 10f));  // 0.50s
+        vfs.AddText("3do/key/KYsnap2.key", BuildSyntheticKeyText(frames: 5, fps: 10f));  // 0.50s
+        vfs.AddText("3do/key/DetVpre.key", BuildSyntheticKeyText(frames: 3, fps: 10f));  // 0.30s
+        vfs.AddText("cog/weap_saber.cog", """
+            symbols
+            keyframe mountAnim=SabVmnt.key local
+            keyframe povFire1=SabVsnp1.key local
+            keyframe povFire2=SabVsnp2.key local
+            keyframe extFire1=KYsnap1.key local
+            keyframe extFire2=KYsnap2.key local
+            thing player local
+            int mode local
+            int nextAttack local
+            message selected
+            message activated
+            message deactivated
+            message fire
+            end
+            code
+            selected:
+                player = GetLocalPlayerThing();
+                jkSetPOVModel(player, "sabv.3do");
+                jkPlayPOVKey(player, mountAnim, 0, 0x14);
+                SetMountWait(player, 0.2);
+                SetCurWeapon(player, 10);
+                Return;
+            activated:
+                mode = GetSenderRef();
+                ActivateWeapon(player, 0.5, mode);
+                Return;
+            deactivated:
+                mode = GetSenderRef();
+                DeactivateWeapon(player, mode);
+                Return;
+            fire:
+                jkEnableSaber(player, 50.0, 0.25, 0.4);
+                if (nextAttack == 0)
+                {
+                    jkPlayPOVKey(player, povFire1, 2, 0x38);
+                    PlayKey(player, extFire1, 2, 0x38);
+                    nextAttack = 1;
+                }
+                else
+                {
+                    jkPlayPOVKey(player, povFire2, 2, 0x38);
+                    PlayKey(player, extFire2, 2, 0x38);
+                    nextAttack = 0;
+                }
+                SetFireWait(player, 0.8);
+                Return;
+            end
+            """);
+
+        var level = CreateBoxArena();
+        var sim = new WorldSimulation(level, vfs, isMultiplayer: true, isDedicatedServer: true);
+        PlayerState p = CreateLoadedPlayer(sim, 0, "SaberTester");
+
+        var playKeyEvents = new List<(int ThingId, string Key, bool Loop)>();
+        sim.OnPlayThingKeyframe += (id, key, loop) => playKeyEvents.Add((id, key, loop));
+
+        sim.SelectWeapon(p.ThingIndex, PlayerInventory.BinLightsaber);
+        Assert.Equal("SabVmnt.key", p.PovKey);
+        Assert.Equal("SabVmnt.key", p.PovIdleKey);
+        Assert.False(p.PovIdleKeyLoop);
+
+        // Advance past mount (0.80s) -> mount pauses at ready end frame
+        const float dt = 1.0f / 60.0f;
+        for (int i = 0; i < 52; i++)
+            sim.StepWorld(dt);
+        Assert.Equal("SabVmnt.key", p.PovKey);
+        Assert.False(p.PovKeyLoop);
+        Assert.InRange(p.PovKeyTime, 0.78f, 0.80f);
+
+        // 1. Single tap (Begin on tick 0, End on tick 1) must still play full SabVsnp1.key (~0.40s) and then return to ready SabVmnt.key
+        Assert.True(sim.BeginWeaponFire(p.ThingIndex, 0));
+        Assert.Equal("SabVsnp1.key", p.PovKey);
+        Assert.True(p.PovKeyReturnToIdle);
+        Assert.False(p.PovKeyLoop);
+        Assert.Single(playKeyEvents);
+        Assert.Equal((p.ThingIndex, "KYsnap1.key", false), playKeyEvents[0]);
+
+        sim.StepWorld(dt);
+        Assert.True(sim.EndWeaponFire(p.ThingIndex, 0));
+
+        // Still mid-swing at ~0.25s (not cut off when button released)
+        for (int i = 0; i < 14; i++)
+            sim.StepWorld(dt);
+        Assert.Equal("SabVsnp1.key", p.PovKey);
+        Assert.InRange(p.PovKeyTime, 0.20f, 0.35f);
+
+        // Finish swing (>0.40s total) -> returns to SabVmnt.key at ready end frame
+        for (int i = 0; i < 14; i++)
+            sim.StepWorld(dt);
+        Assert.Equal("SabVmnt.key", p.PovKey);
+        Assert.False(p.PovKeyReturnToIdle);
+        Assert.InRange(p.PovKeyTime, 0.78f, 0.80f);
+
+        // Wait out remaining 0.80s fireWait cooldown
+        for (int i = 0; i < 26; i++)
+            sim.StepWorld(dt);
+
+        // 2. Held attack: plays SabVsnp2.key (0.50s), returns to idle during 0.50..0.80s cooldown, then chains SabVsnp1.key on next hit
+        playKeyEvents.Clear();
+        Assert.True(sim.BeginWeaponFire(p.ThingIndex, 0));
+        Assert.Equal("SabVsnp2.key", p.PovKey);
+        Assert.Single(playKeyEvents);
+        Assert.Equal((p.ThingIndex, "KYsnap2.key", false), playKeyEvents[0]);
+
+        // Advance to ~0.60s (after 0.50s swing ends, before 0.80s next hit) -> cleanly back in ready stance
+        for (int i = 0; i < 36; i++)
+            sim.StepWorld(dt);
+        Assert.Equal("SabVmnt.key", p.PovKey);
+
+        // Advance past 0.80s -> next swing begins when hit fires!
+        for (int i = 0; i < 18; i++)
+            sim.StepWorld(dt);
+        Assert.Equal("SabVsnp1.key", p.PovKey);
+        Assert.True(p.PovKeyTime < 0.20f);
+        Assert.Equal(2, playKeyEvents.Count);
+        Assert.Equal((p.ThingIndex, "KYsnap1.key", false), playKeyEvents[1]);
+
+        Assert.True(sim.EndWeaponFire(p.ThingIndex, 0));
+
+        // 3. Priority-1 ENDPAUSE (e.g. ThermDet windup, flags 0x14) must pause at end frame without returning to idle or overwriting PovIdleKey
+        sim.JkPlayPovKey(p.ThingIndex, "DetVpre.key", priority: 1, flags: 0x14);
+        Assert.Equal("SabVmnt.key", p.PovIdleKey);
+        Assert.False(p.PovKeyReturnToIdle);
+        for (int i = 0; i < 24; i++)
+            sim.StepWorld(dt);
+        Assert.Equal("DetVpre.key", p.PovKey);
+        Assert.InRange(p.PovKeyTime, 0.28f, 0.30f);
+    }
+
+    [Fact]
+    public async Task DedicatedGameServer_ReplicatesLightsaberPlayKeyEvent_AndNetCodecRoundTripsThingPlayKey()
+    {
+        // 1. Direct NetCodec round-trip
+        var packet = new ServerSnapshotPacket
+        {
+            ServerTick = 42,
+            LevelTime = 1.4f,
+            LocalThingIndex = 0
+        };
+        packet.Events.Add(new NetWorldEvent(
+            EventSeq: 7,
+            Kind: NetEventKind.ThingPlayKey,
+            Position: Vector3.Zero,
+            FloatParam0: 0f,
+            FloatParam1: 0f,
+            IntParam0: 3,
+            Text0: "KYsabrf1.key",
+            Text1: string.Empty));
+
+        byte[] buf = new byte[NetCodec.MaxPacketBytes];
+        Assert.True(NetCodec.TryWriteServerSnapshot(buf, packet, out int len));
+        Assert.True(NetCodec.TryReadServerSnapshot(buf.AsSpan(0, len), out var decoded));
+        var roundTripped = Assert.Single(decoded.Events);
+        Assert.Equal(NetEventKind.ThingPlayKey, roundTripped.Kind);
+        Assert.Equal(3, roundTripped.IntParam0);
+        Assert.Equal(0f, roundTripped.FloatParam0);
+        Assert.Equal("KYsabrf1.key", roundTripped.Text0);
+
+        // 2. End-to-end DedicatedGameServer -> MultiplayerClient replication (player/bot replicated, non-player ignored)
+        var level = CreateBoxArena();
+        int nonPlayerThingId = level.Things.Count;
+        level.Things.Add(new JklThing
+        {
+            ThingIndex = nonPlayerThingId,
+            TemplateName = "tie_prop",
+            SectorIndex = 0,
+            Position = new Vector3(1f, 1f, 0.5f)
+        });
+
+        var vfs = new InMemoryVfs();
+        using var server = new DedicatedGameServer(level, vfs, "test.gob", "arena.jkl", port: 0, maxPlayers: 8, tickRateHz: 30);
+        using var client = new MultiplayerClient();
+
+        Task<ServerWelcomePacket> connectTask = client.ConnectAsync("127.0.0.1", server.BoundPort, "Observer");
+        while (!connectTask.IsCompleted)
+        {
+            server.Tick(0.01f);
+            await Task.Delay(5);
+        }
+        ServerWelcomePacket welcome = await connectTask;
+        int botThingId = server.AddBot(skill: BotSkill.Medium, grantAllWeapons: true, rng: new Random(99));
+
+        // Non-player 3DO PlayKey must NOT enqueue ThingPlayKey
+        server.Simulation.PlayKey(nonPlayerThingId, "tiestart.key", 1, 0x14);
+        // Bot player PlayKey MUST enqueue ThingPlayKey with loop == 0
+        server.Simulation.PlayKey(botThingId, "KYsabrf1.key", 2, 0x38);
+
+        var received = new List<NetWorldEvent>();
+        for (int i = 0; i < 10; i++)
+        {
+            server.Tick(1.0f / 30.0f);
+            await Task.Delay(5);
+            client.PollSnapshots(received, 1.0f / 30.0f, out _);
+            if (received.Any(e => e.Kind == NetEventKind.ThingPlayKey))
+                break;
+        }
+
+        NetWorldEvent evt = Assert.Single(received, e => e.Kind == NetEventKind.ThingPlayKey);
+        Assert.Equal(botThingId, evt.IntParam0);
+        Assert.Equal("KYsabrf1.key", evt.Text0);
+        Assert.Equal(0f, evt.FloatParam0);
+        Assert.True(welcome.PlayerThingId >= 0);
     }
 }

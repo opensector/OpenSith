@@ -59,9 +59,12 @@ public sealed class PlayerState
     public HashSet<int> SaberHitThisSwing { get; } = [];
     public string PovModel { get; set; } = "bryv.3do";
     public string PovKey { get; set; } = "bryvpst1.key";
+    public string PovIdleKey { get; set; } = "bryvpst1.key";
+    public bool PovIdleKeyLoop { get; set; } = true;
     public float PovKeyTime { get; set; }
     public bool PovKeyLoop { get; set; } = true;
     public bool PovKeyEndPause { get; set; }
+    public bool PovKeyReturnToIdle { get; set; }
     public int PovTrackId { get; set; }
     public Vector3 PovWaggleMove { get; set; }
     public float PovWaggleSpeed { get; set; }

@@ -56,6 +56,8 @@ public static partial class Program
     private static float _saberIgniteTimer = 0.0f;
     private static float _playerMoveBobTime = 0.0f;
     private static bool _playerMoving = false;
+    private static float _localAirborneSeconds = 0.0f;
+    private static float _localDescendingSeconds = 0.0f;
     private static bool _mouseLeftDown = false;
     private static bool _mouseRightDown = false;
     private static readonly bool[] _keys = new bool[512];
@@ -455,13 +457,17 @@ public static partial class Program
                     if (key == Key.ControlLeft || key == Key.ControlRight || key == Key.Enter)
                     {
                         _fireKeyPrimary = true;
-                        if (!IsMultiplayerClient)
+                        if (IsMultiplayerClient)
+                            _pendingPrimaryFireTap = true;
+                        else
                             _worldSim?.BeginWeaponFire(localPlayerId, 0);
                     }
                     else if (key == Key.Z)
                     {
                         _fireKeySecondary = true;
-                        if (!IsMultiplayerClient)
+                        if (IsMultiplayerClient)
+                            _pendingSecondaryFireTap = true;
+                        else
                             _worldSim?.BeginWeaponFire(localPlayerId, 1);
                     }
                 }
@@ -538,8 +544,16 @@ public static partial class Program
 
                 if (IsMultiplayerClient)
                 {
-                    if (button == MouseButton.Left) _mouseLeftDown = true;
-                    else if (button == MouseButton.Right) _mouseRightDown = true;
+                    if (button == MouseButton.Left)
+                    {
+                        _mouseLeftDown = true;
+                        _pendingPrimaryFireTap = true;
+                    }
+                    else if (button == MouseButton.Right)
+                    {
+                        _mouseRightDown = true;
+                        _pendingSecondaryFireTap = true;
+                    }
                     return;
                 }
 
@@ -670,6 +684,8 @@ public static partial class Program
             _saberIgniteTimer = 0.0f;
             _playerMoveBobTime = 0.0f;
             _playerMoving = false;
+            _localAirborneSeconds = 0.0f;
+            _localDescendingSeconds = 0.0f;
             ReleaseAllHeldInputs(endWorldSimActions: false);
 
             if (_menuRenderer != null)
@@ -720,7 +736,21 @@ public static partial class Program
         _worldSim.OnSurfaceLightChanged += (surfaceId, light) =>
             _meshRenderer?.SetSurfaceExtraLight(surfaceId, light);
         _worldSim.OnPlayThingKeyframe += (thingId, key, loop) =>
-            _thingRenderer?.SetThingKeyframe(thingId, key, mode: 0, loop: loop);
+        {
+            if (_thingRenderer == null)
+                return;
+            if (_worldSim.GetPlayerByThing(thingId) != null)
+            {
+                if (loop)
+                    _thingRenderer.SetThingOverlayAnimation(thingId, key, mode: 0, loop: true);
+                else
+                    _thingRenderer.PlayThingOneShotOverlay(thingId, key, mode: 0, autoClear: true);
+            }
+            else
+            {
+                _thingRenderer.SetThingKeyframe(thingId, key, mode: 0, loop: loop);
+            }
+        };
         _worldSim.OnPlayerTeleported += (pos, pyr, sector) =>
         {
             if (_player != null)
@@ -729,6 +759,10 @@ public static partial class Program
                 _player.Velocity = Vector3.Zero;
                 _player.CurrentSectorIndex = sector;
             }
+            _localAirborneSeconds = 0.0f;
+            _localDescendingSeconds = 0.0f;
+            if (_worldSim.GetLocalPlayerThing() is int lpId && lpId >= 0)
+                _thingRenderer?.ClearThingOverlayAnimation(lpId);
             _camera.Yaw = pyr.Y;
         };
         _worldSim.OnPlayerWeaponAssigned += binIdx =>
@@ -857,6 +891,8 @@ public static partial class Program
         _mouseRightDown = false;
         _fireKeyPrimary = false;
         _fireKeySecondary = false;
+        _pendingPrimaryFireTap = false;
+        _pendingSecondaryFireTap = false;
         _heldForceBin = 0;
         _activeForceKeyBins.Clear();
         Array.Clear(_keys);
@@ -1206,17 +1242,23 @@ public static partial class Program
             Vector2 localDeltaXY = new(_player.Position.X - oldPlayerXY.X, _player.Position.Y - oldPlayerXY.Y);
             float dist = isDead ? 0f : localDeltaXY.Length();
             Vector2 localVelXY = dt > 1e-4f ? localDeltaXY / dt : Vector2.Zero;
+            bool localAirborneAnim = UpdateLocalAirborneTiming(dt, isDead);
             var animSel = ThingMeshRenderer.ResolvePlayerAnimationState(
                 isDead,
                 _player.IsUnderwater,
-                !_player.IsGrounded && !_player.IsUnderwater,
+                localAirborneAnim,
                 _playerMoving,
                 isFiring,
                 spWeaponBin,
                 localVelXY,
-                _camera.Yaw);
+                _camera.Yaw,
+                _player.Velocity.Z,
+                _localDescendingSeconds);
             _thingRenderer?.SetThingAnimation(renderPlayerId, animSel.BaseAction, animSel.Mode, animSel.BaseLoop);
-            _thingRenderer?.SetThingOverlayAnimation(renderPlayerId, animSel.OverlayActionOrKey, animSel.Mode, animSel.OverlayLoop);
+            if (isDead)
+                _thingRenderer?.ClearThingOverlayAnimation(renderPlayerId);
+            else
+                _thingRenderer?.SetThingOverlayAnimation(renderPlayerId, animSel.OverlayActionOrKey, animSel.Mode, animSel.OverlayLoop);
             _thingRenderer?.SetThingDistanceMoved(renderPlayerId, dist);
         }
 
@@ -1492,6 +1534,23 @@ public static partial class Program
         {
             _menuRenderer.Render(_window!.Size.X, _window.Size.Y);
         }
+    }
+
+    private static bool UpdateLocalAirborneTiming(float dt, bool isDead)
+    {
+        bool isAirborne = !isDead && !_flyMode && _player != null && !_player.IsGrounded && !_player.IsUnderwater;
+        if (isAirborne)
+        {
+            _localAirborneSeconds += dt;
+            _localDescendingSeconds = _player!.Velocity.Z < -0.05f
+                ? (_localDescendingSeconds + dt)
+                : 0f;
+            return _player.Velocity.Z > 0.2f || _localAirborneSeconds >= 0.12f;
+        }
+
+        _localAirborneSeconds = 0.0f;
+        _localDescendingSeconds = 0.0f;
+        return false;
     }
 
     /// <summary>

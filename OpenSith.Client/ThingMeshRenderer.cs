@@ -46,6 +46,7 @@ public sealed class ThingMeshRenderer : IDisposable
     private readonly Dictionary<int, AnimatedThingGpu> _animatedInstances = new();
     private readonly Dictionary<int, (string Action, int Mode, bool Loop)> _desiredAnimations = new();
     private readonly Dictionary<int, (string ActionOrKeyframe, int Mode, bool Loop)> _desiredOverlays = new();
+    private readonly Dictionary<int, (string KeyframeName, int Mode)> _pendingOneShotOverlays = new();
     private readonly Dictionary<int, (string KeyframeName, int Mode, bool Loop)> _pendingKeyframes = new();
     private readonly Dictionary<int, float> _pendingDistances = new();
     private readonly Dictionary<string, AnimatedThingGpu> _viewmodelInstances = new(StringComparer.OrdinalIgnoreCase);
@@ -128,6 +129,8 @@ public sealed class ThingMeshRenderer : IDisposable
         public int OverlayMode;
         public bool OverlayLoop = true;
         public float OverlayAnimTime;
+        public bool OverlayIsOneShot;
+        public bool OverlayAutoClear;
     }
 
     public readonly record struct PlayerAnimationSelection(
@@ -178,7 +181,9 @@ public sealed class ThingMeshRenderer : IDisposable
         bool isFiring,
         int weaponBin,
         Vector2 horizVelocity,
-        float yawDeg)
+        float yawDeg,
+        float verticalVelocity = 0f,
+        float descendingSeconds = 0f)
     {
         bool isSaber = weaponBin == PlayerInventory.BinLightsaber;
         bool isFists = weaponBin == PlayerInventory.BinFists;
@@ -187,9 +192,24 @@ public sealed class ThingMeshRenderer : IDisposable
             return new(mode, "death", false, null, false);
 
         string baseAction;
+        bool baseLoop = true;
         if (!isUnderwater && isAirborneSustained)
         {
-            baseAction = "fall";
+            if (verticalVelocity > 0.05f)
+            {
+                baseAction = isMoving ? "leap" : "rising";
+                baseLoop = false;
+            }
+            else if (descendingSeconds >= 0.70f || verticalVelocity <= -2.5f)
+            {
+                baseAction = "fall";
+                baseLoop = true;
+            }
+            else
+            {
+                baseAction = "drop";
+                baseLoop = false;
+            }
         }
         else if (isMoving)
         {
@@ -224,11 +244,14 @@ public sealed class ThingMeshRenderer : IDisposable
         }
 
         string? overlay = null;
-        if (isFiring)
-            overlay = (isSaber && !isUnderwater) ? "kysabrf1.key" : "fire";
+        if (isFiring && (!isSaber || isUnderwater))
+            overlay = "fire";
 
-        return new(mode, baseAction, true, overlay, true);
+        return new(mode, baseAction, baseLoop, overlay, true);
     }
+
+    public float GetKeyframeDuration(string? keyframeName)
+        => string.IsNullOrWhiteSpace(keyframeName) ? 0f : (GetOrCreateKeyframe(keyframeName.Trim())?.Duration ?? 0f);
 
     public void Update(float dt)
     {
@@ -245,7 +268,18 @@ public sealed class ThingMeshRenderer : IDisposable
             }
 
             if (anim.OverlayKeyframe != null)
+            {
                 anim.OverlayAnimTime += dt;
+                if (anim.OverlayIsOneShot &&
+                    anim.OverlayKeyframe.Duration > 0.002f &&
+                    anim.OverlayAnimTime >= anim.OverlayKeyframe.Duration)
+                {
+                    if (anim.OverlayAutoClear)
+                        ClearAnimatedOverlay(anim);
+                    else
+                        anim.OverlayAnimTime = MathF.Max(0f, anim.OverlayKeyframe.Duration - 0.001f);
+                }
+            }
 
             anim.PendingDistanceMoved = 0f;
         }
@@ -296,6 +330,56 @@ public sealed class ThingMeshRenderer : IDisposable
         }
     }
 
+    private static void ClearAnimatedOverlay(AnimatedThingGpu anim)
+    {
+        anim.OverlayKeyframe = null;
+        anim.OverlayAction = string.Empty;
+        anim.OverlayAnimTime = 0f;
+        anim.OverlayIsOneShot = false;
+        anim.OverlayAutoClear = false;
+    }
+
+    /// <summary>
+    /// Clears all active, desired, and pending upper-body overlays (including one-shot swings) for a Thing.
+    /// </summary>
+    public void ClearThingOverlayAnimation(int thingIndex)
+    {
+        _desiredOverlays.Remove(thingIndex);
+        _pendingOneShotOverlays.Remove(thingIndex);
+        if (_animatedInstances.TryGetValue(thingIndex, out var anim))
+            ClearAnimatedOverlay(anim);
+    }
+
+    /// <summary>
+    /// Plays a non-looping one-shot upper-body overlay keyframe (such as a directional lightsaber swing)
+    /// that completes its full animation even if the fire input ends, auto-clearing when finished.
+    /// </summary>
+    public void PlayThingOneShotOverlay(int thingIndex, string keyframeName, int mode = 0, bool autoClear = true)
+    {
+        if (string.IsNullOrWhiteSpace(keyframeName))
+            return;
+
+        string trimmed = keyframeName.Trim();
+        if (!_animatedInstances.TryGetValue(thingIndex, out var anim))
+        {
+            _pendingOneShotOverlays[thingIndex] = (trimmed, mode);
+            return;
+        }
+
+        _pendingOneShotOverlays.Remove(thingIndex);
+        var keyframe = GetOrCreateKeyframe(trimmed);
+        if (keyframe != null)
+        {
+            anim.OverlayKeyframe = keyframe;
+            anim.OverlayAction = trimmed;
+            anim.OverlayMode = mode;
+            anim.OverlayLoop = false;
+            anim.OverlayIsOneShot = true;
+            anim.OverlayAutoClear = autoClear;
+            anim.OverlayAnimTime = 0f;
+        }
+    }
+
     /// <summary>
     /// Sets or clears a joint-masked upper-body overlay animation (by puppet action or explicit <c>.key</c> filename)
     /// blended atop the Thing's full-body locomotion track using the keyframe's <see cref="KeyframeTrack.NodeMask"/>.
@@ -305,18 +389,14 @@ public sealed class ThingMeshRenderer : IDisposable
         if (string.IsNullOrWhiteSpace(actionOrKeyframe))
         {
             _desiredOverlays.Remove(thingIndex);
-            if (_animatedInstances.TryGetValue(thingIndex, out var clearedAnim))
-            {
-                clearedAnim.OverlayKeyframe = null;
-                clearedAnim.OverlayAction = string.Empty;
-                clearedAnim.OverlayAnimTime = 0f;
-            }
+            if (_animatedInstances.TryGetValue(thingIndex, out var clearedAnim) && !clearedAnim.OverlayIsOneShot)
+                ClearAnimatedOverlay(clearedAnim);
             return;
         }
 
         _desiredOverlays[thingIndex] = (actionOrKeyframe, mode, loop);
 
-        if (!_animatedInstances.TryGetValue(thingIndex, out var anim))
+        if (!_animatedInstances.TryGetValue(thingIndex, out var anim) || anim.OverlayIsOneShot)
             return;
 
         if (anim.OverlayAction.Equals(actionOrKeyframe, StringComparison.OrdinalIgnoreCase) &&
@@ -345,6 +425,8 @@ public sealed class ThingMeshRenderer : IDisposable
             anim.OverlayAction = actionOrKeyframe;
             anim.OverlayMode = mode;
             anim.OverlayLoop = loop;
+            anim.OverlayIsOneShot = false;
+            anim.OverlayAutoClear = false;
             anim.OverlayAnimTime = 0f;
         }
     }
@@ -1350,6 +1432,8 @@ public sealed class ThingMeshRenderer : IDisposable
         _animatedInstances[thing.ThingIndex] = animGpu;
         if (_desiredOverlays.TryGetValue(thing.ThingIndex, out var desiredOverlay))
             SetThingOverlayAnimation(thing.ThingIndex, desiredOverlay.ActionOrKeyframe, desiredOverlay.Mode, desiredOverlay.Loop);
+        if (_pendingOneShotOverlays.Remove(thing.ThingIndex, out var pendingOneShot))
+            PlayThingOneShotOverlay(thing.ThingIndex, pendingOneShot.KeyframeName, pendingOneShot.Mode);
         return animGpu;
     }
 
@@ -1810,6 +1894,7 @@ public sealed class ThingMeshRenderer : IDisposable
         }
         _animatedInstances.Clear();
         _desiredOverlays.Clear();
+        _pendingOneShotOverlays.Clear();
         _pendingKeyframes.Clear();
 
         foreach (var vm in _viewmodelInstances.Values)

@@ -177,6 +177,7 @@ public sealed class DedicatedGameServer : IDisposable
         _sim.OnLoopingSoundStopped += HandleLoopingSoundStopped;
         _sim.OnSurfaceScroll += HandleSurfaceScroll;
         _sim.OnMaterialAnimChanged += HandleMaterialAnimChanged;
+        _sim.OnPlayThingKeyframe += HandlePlayThingKeyframe;
         _sim.StartLevel();
     }
 
@@ -1202,6 +1203,17 @@ public sealed class DedicatedGameServer : IDisposable
             EnqueueEvent(NetEventKind.MaterialAnim, Vector3.Zero, fps, 0f, 0, materialName, string.Empty);
     }
 
+    private void HandlePlayThingKeyframe(int thingId, string keyName, bool loop)
+    {
+        if (_clients.Count == 0 || string.IsNullOrWhiteSpace(keyName))
+            return;
+
+        if (!_clientsByThing.ContainsKey(thingId) && !_botsByThing.ContainsKey(thingId))
+            return;
+
+        EnqueueEvent(NetEventKind.ThingPlayKey, Vector3.Zero, loop ? 1f : 0f, 0f, thingId, keyName.Trim(), string.Empty);
+    }
+
     private void ReplaySurfaceAndMaterialAnimsToEvents()
     {
         foreach (var (surfaceId, scroll) in _activeSurfaceScrolls)
@@ -1344,6 +1356,7 @@ public sealed class DedicatedGameServer : IDisposable
             _sim.OnLoopingSoundStopped -= HandleLoopingSoundStopped;
             _sim.OnSurfaceScroll -= HandleSurfaceScroll;
             _sim.OnMaterialAnimChanged -= HandleMaterialAnimChanged;
+            _sim.OnPlayThingKeyframe -= HandlePlayThingKeyframe;
             _udp.Dispose();
         }
     }

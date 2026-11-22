@@ -321,6 +321,7 @@ public sealed partial class WorldSimulation
             player.SaberDamageActive = false;
             player.SaberActiveTimer = 0f;
             player.SaberHitThisSwing.Clear();
+            player.PovKeyReturnToIdle = false;
             _weaponMeshes.Remove(player.ThingIndex);
         }
 
@@ -358,9 +359,12 @@ public sealed partial class WorldSimulation
             PlayerInventory.BinLightsaber => ("sabv.3do", "sabvhold.key"),
             _ => ("bryv.3do", "bryvpst1.key")
         };
+        player.PovIdleKey = player.PovKey;
+        player.PovIdleKeyLoop = true;
         player.PovKeyTime = 0f;
         player.PovKeyLoop = true;
         player.PovKeyEndPause = false;
+        player.PovKeyReturnToIdle = false;
     }
 
     public bool BeginWeaponFire(int playerThing, int mode = 0)
@@ -589,12 +593,51 @@ public sealed partial class WorldSimulation
         if (!TryResolvePlayer(thingId, out var player) || string.IsNullOrWhiteSpace(keyframe))
             return -1;
 
-        player.PovKey = keyframe.Trim();
+        string trimmedKey = keyframe.Trim();
+        bool isEndPause = (flags & 0x04) != 0 || flags == 0x12 || flags == 0x18;
+        bool returnToIdle = !isEndPause && ((flags & 0x20) != 0 || flags == 0x0a || (priority > 0 && flags != 0));
+        bool loop = !isEndPause && !returnToIdle;
+        bool updatesIdle = priority == 0 && (flags == 0 || flags == 0x14);
+
+        player.PovKey = trimmedKey;
         player.PovKeyTime = 0f;
-        player.PovKeyLoop = (flags & 0x14) == 0;
-        player.PovKeyEndPause = (flags & 0x10) != 0;
+        player.PovKeyLoop = loop;
+        player.PovKeyEndPause = isEndPause;
+        player.PovKeyReturnToIdle = returnToIdle;
+        if (updatesIdle)
+        {
+            player.PovIdleKey = trimmedKey;
+            player.PovIdleKeyLoop = loop;
+        }
         player.PovTrackId = _nextKeyTrackId++;
         return player.PovTrackId;
+    }
+
+    private void ResetPovToIdle(PlayerState player)
+    {
+        if (!string.IsNullOrWhiteSpace(player.PovIdleKey))
+        {
+            player.PovKey = player.PovIdleKey;
+            player.PovKeyLoop = player.PovIdleKeyLoop;
+            player.PovKeyEndPause = !player.PovIdleKeyLoop;
+            player.PovKeyReturnToIdle = false;
+            if (player.PovIdleKeyLoop)
+            {
+                player.PovKeyTime = 0f;
+            }
+            else
+            {
+                float idleLen = GetKeyLen(player.PovIdleKey);
+                player.PovKeyTime = idleLen > 0.002f ? MathF.Max(0f, idleLen - 0.001f) : 0f;
+            }
+        }
+        else
+        {
+            player.PovKeyLoop = true;
+            player.PovKeyEndPause = false;
+            player.PovKeyReturnToIdle = false;
+            player.PovKeyTime = 0f;
+        }
     }
 
     public void JkStopPovKey(int thingId, int track, float fadeTime)
@@ -603,11 +646,7 @@ public sealed partial class WorldSimulation
             return;
 
         if (player.PovTrackId == track || track < 0)
-        {
-            player.PovKeyLoop = true;
-            player.PovKeyEndPause = false;
-            player.PovKeyTime = 0f;
-        }
+            ResetPovToIdle(player);
     }
 
     public void JkSetWaggle(int thingId, Vector3 moveVec, float speed)
@@ -748,7 +787,12 @@ public sealed partial class WorldSimulation
             {
                 float keyLen = GetKeyLen(player.PovKey);
                 if (keyLen > 0.002f && player.PovKeyTime >= keyLen)
-                    player.PovKeyTime = MathF.Max(0f, keyLen - 0.001f);
+                {
+                    if (player.PovKeyReturnToIdle && !string.IsNullOrWhiteSpace(player.PovIdleKey))
+                        ResetPovToIdle(player);
+                    else
+                        player.PovKeyTime = MathF.Max(0f, keyLen - 0.001f);
+                }
             }
 
             if (player.PovShakeTimer > 0f)

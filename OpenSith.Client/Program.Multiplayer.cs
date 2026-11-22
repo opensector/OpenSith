@@ -33,7 +33,9 @@ public static partial class Program
         public byte ModelIndex;
         public byte SaberColorIndex = PlayerCustomizationCatalog.DefaultSaberColorIndex;
         public Vector2 SmoothedHorizVel;
+        public float SmoothedVelZ;
         public float AirborneSeconds;
+        public float DescendingSeconds;
         public float MoveGraceSeconds;
         public bool Initialized;
     }
@@ -59,7 +61,13 @@ public static partial class Program
     private static byte _heldForceBin;
     private static bool _fireKeyPrimary;
     private static bool _fireKeySecondary;
+    private static bool _pendingPrimaryFireTap;
+    private static bool _pendingSecondaryFireTap;
     private static int _lastNetWeaponBin = -1;
+    private static string _netPovKey = "bryvpst1.key";
+    private static float _netPovKeyTime;
+    private static float _lastServerPovKeyTime;
+    private static bool _netPovKeyLoop = true;
     private static float _netInputSendAccumulator;
     private static bool _lastSentPrimaryHeld;
     private static bool _lastSentSecondaryHeld;
@@ -197,6 +205,14 @@ public static partial class Program
         _appliedTeleportSeq = 1;
         _appliedVelocitySeq = 0;
         _lastNetWeaponBin = -1;
+        _localAirborneSeconds = 0f;
+        _localDescendingSeconds = 0f;
+        _pendingPrimaryFireTap = false;
+        _pendingSecondaryFireTap = false;
+        _netPovKey = "bryvpst1.key";
+        _netPovKeyTime = 0f;
+        _lastServerPovKeyTime = 0f;
+        _netPovKeyLoop = true;
         _netInputSendAccumulator = 0f;
         _lastSentPrimaryHeld = false;
         _lastSentSecondaryHeld = false;
@@ -249,6 +265,17 @@ public static partial class Program
         bool gotSnapshot = _netClient.PollSnapshots(_pendingNetEvents, dt, out Vector3 accumulatedPlatformDelta);
         _latestSnapshot = _netClient.LatestSnapshot;
 
+        if (_latestSnapshot != null)
+        {
+            _netPovKeyTime += dt;
+            if (!_netPovKeyLoop && _thingRenderer != null)
+            {
+                float povDur = _thingRenderer.GetKeyframeDuration(_netPovKey);
+                if (povDur > 0.002f)
+                    _netPovKeyTime = MathF.Min(_netPovKeyTime, MathF.Max(0f, povDur - 0.001f));
+            }
+        }
+
         for (int i = _netVisualEffects.Count - 1; i >= 0; i--)
         {
             _netVisualEffects[i].Age += dt;
@@ -284,8 +311,19 @@ public static partial class Program
             float dist = deltaXY.Length();
             Vector2 instVel = dt > 1e-4f ? deltaXY / dt : Vector2.Zero;
             rp.SmoothedHorizVel = Vector2.Lerp(rp.SmoothedHorizVel, instVel, Math.Clamp(dt * 12f, 0f, 1f));
+            float instVelZ = dt > 1e-4f ? (rp.Position.Z - oldPos.Z) / dt : 0f;
+            rp.SmoothedVelZ = float.Lerp(rp.SmoothedVelZ, instVelZ, Math.Clamp(dt * 12f, 0f, 1f));
             float smoothedSpeed = rp.SmoothedHorizVel.Length();
-            rp.AirborneSeconds = (!rp.IsDead && rp.IsAirborneFlag && !rp.IsUnderwaterFlag) ? (rp.AirborneSeconds + dt) : 0f;
+            if (!rp.IsDead && rp.IsAirborneFlag && !rp.IsUnderwaterFlag)
+            {
+                rp.AirborneSeconds += dt;
+                rp.DescendingSeconds = rp.SmoothedVelZ < -0.05f ? (rp.DescendingSeconds + dt) : 0f;
+            }
+            else
+            {
+                rp.AirborneSeconds = 0f;
+                rp.DescendingSeconds = 0f;
+            }
             bool movingNow = !rp.IsDead && (rp.IsMovingFlag || smoothedSpeed > 0.12f);
             rp.MoveGraceSeconds = movingNow ? 0.12f : MathF.Max(0f, rp.MoveGraceSeconds - dt);
 
@@ -299,17 +337,23 @@ public static partial class Program
                 thing.Position = rp.Position + new Vector3(0f, 0f, rpPelvis);
                 thing.PitchYawRoll = new Vector3(0f, rp.Yaw, 0f);
 
+                bool remoteAirborne = rp.AirborneSeconds >= 0.14f || (rp.AirborneSeconds > 0f && rp.SmoothedVelZ > 0.25f);
                 var animSel = ThingMeshRenderer.ResolvePlayerAnimationState(
                     rp.IsDead,
                     rp.IsUnderwaterFlag,
-                    rp.AirborneSeconds >= 0.14f,
+                    remoteAirborne,
                     movingNow || rp.MoveGraceSeconds > 0f,
                     rp.IsFiringFlag,
                     rp.WeaponBin,
                     rp.SmoothedHorizVel,
-                    rp.Yaw);
+                    rp.Yaw,
+                    rp.SmoothedVelZ,
+                    rp.DescendingSeconds);
                 _thingRenderer?.SetThingAnimation(thingId, animSel.BaseAction, animSel.Mode, animSel.BaseLoop);
-                _thingRenderer?.SetThingOverlayAnimation(thingId, animSel.OverlayActionOrKey, animSel.Mode, animSel.OverlayLoop);
+                if (rp.IsDead)
+                    _thingRenderer?.ClearThingOverlayAnimation(thingId);
+                else
+                    _thingRenderer?.SetThingOverlayAnimation(thingId, animSel.OverlayActionOrKey, animSel.Mode, animSel.OverlayLoop);
                 if (!rp.IsDead)
                     _thingRenderer?.SetThingDistanceMoved(thingId, dist);
             }
@@ -377,8 +421,14 @@ public static partial class Program
         }
 
         int weaponBin = _latestSnapshot?.Local.CurWeaponBin ?? PlayerInventory.BinBryar;
-        bool primaryHeld = !menuOpen && !isDead && (_mouseLeftDown || _fireKeyPrimary);
-        bool secondaryHeld = !menuOpen && !isDead && (_mouseRightDown || _fireKeySecondary);
+        bool primaryHeld = !menuOpen && !isDead && (_mouseLeftDown || _fireKeyPrimary || _pendingPrimaryFireTap);
+        bool secondaryHeld = !menuOpen && !isDead && (_mouseRightDown || _fireKeySecondary || _pendingSecondaryFireTap);
+        if (menuOpen || isDead)
+        {
+            _pendingPrimaryFireTap = false;
+            _pendingSecondaryFireTap = false;
+        }
+        bool localAirborneAnim = UpdateLocalAirborneTiming(dt, isDead);
 
         // Update local 3rd-person Kyle animation
         if (_netLocalThingId >= 0 && _netLocalThingId < _level.Things.Count)
@@ -394,14 +444,19 @@ public static partial class Program
             var animSel = ThingMeshRenderer.ResolvePlayerAnimationState(
                 isDead,
                 _player.IsUnderwater,
-                !_player.IsGrounded && !_player.IsUnderwater,
+                localAirborneAnim,
                 _playerMoving,
                 primaryHeld || secondaryHeld,
                 weaponBin,
                 localVelXY,
-                _camera.Yaw);
+                _camera.Yaw,
+                _player.Velocity.Z,
+                _localDescendingSeconds);
             _thingRenderer?.SetThingAnimation(_netLocalThingId, animSel.BaseAction, animSel.Mode, animSel.BaseLoop);
-            _thingRenderer?.SetThingOverlayAnimation(_netLocalThingId, animSel.OverlayActionOrKey, animSel.Mode, animSel.OverlayLoop);
+            if (isDead)
+                _thingRenderer?.ClearThingOverlayAnimation(_netLocalThingId);
+            else
+                _thingRenderer?.SetThingOverlayAnimation(_netLocalThingId, animSel.OverlayActionOrKey, animSel.Mode, animSel.OverlayLoop);
             _thingRenderer?.SetThingDistanceMoved(_netLocalThingId, dist);
         }
 
@@ -422,7 +477,9 @@ public static partial class Program
             _pendingUsePressed ||
             _pendingRespawnPressed ||
             _pendingWeaponBin != 0 ||
-            _pendingItemBin != 0;
+            _pendingItemBin != 0 ||
+            _pendingPrimaryFireTap ||
+            _pendingSecondaryFireTap;
         bool stateChanged =
             primaryHeld != _lastSentPrimaryHeld ||
             secondaryHeld != _lastSentSecondaryHeld ||
@@ -456,6 +513,8 @@ public static partial class Program
             _pendingRespawnPressed = false;
             _pendingWeaponBin = 0;
             _pendingItemBin = 0;
+            _pendingPrimaryFireTap = false;
+            _pendingSecondaryFireTap = false;
         }
     }
 
@@ -590,6 +649,16 @@ public static partial class Program
                 case NetEventKind.MaterialAnim:
                     _meshRenderer?.SetMaterialAnim(evt.Text0, evt.FloatParam0);
                     break;
+
+                case NetEventKind.ThingPlayKey:
+                    if (!string.IsNullOrWhiteSpace(evt.Text0) && evt.IntParam0 >= 0)
+                    {
+                        if (evt.FloatParam0 > 0.5f)
+                            _thingRenderer?.SetThingOverlayAnimation(evt.IntParam0, evt.Text0, mode: 0, loop: true);
+                        else
+                            _thingRenderer?.PlayThingOneShotOverlay(evt.IntParam0, evt.Text0, mode: 0, autoClear: true);
+                    }
+                    break;
             }
         }
 
@@ -609,6 +678,10 @@ public static partial class Program
             _player.Velocity = Vector3.Zero;
             _player.CurrentSectorIndex = snap.Local.TeleportSector;
             _camera.Yaw = snap.Local.TeleportYaw;
+            _localAirborneSeconds = 0f;
+            _localDescendingSeconds = 0f;
+            if (_netLocalThingId >= 0)
+                _thingRenderer?.ClearThingOverlayAnimation(_netLocalThingId);
         }
 
         if ((snap.Local.Flags & LocalPlayerSnapFlags.HasVelocityOverride) != 0 &&
@@ -631,6 +704,23 @@ public static partial class Program
                 _saberIgniteTimer = SaberIgniteDuration;
             _lastNetWeaponBin = snap.Local.CurWeaponBin;
         }
+
+        string srvPovKey = string.IsNullOrWhiteSpace(snap.Local.PovKey) ? "bryvpst1.key" : snap.Local.PovKey;
+        if (!srvPovKey.Equals(_netPovKey, StringComparison.OrdinalIgnoreCase) ||
+            snap.Local.PovKeyTime + 0.02f < _lastServerPovKeyTime)
+        {
+            _netPovKey = srvPovKey;
+            _netPovKeyTime = snap.Local.PovKeyTime;
+        }
+        else if (MathF.Abs(snap.Local.PovKeyTime - _netPovKeyTime) > 0.12f)
+        {
+            _netPovKeyTime = snap.Local.PovKeyTime;
+        }
+        else
+        {
+            _netPovKeyTime = float.Lerp(_netPovKeyTime, snap.Local.PovKeyTime, 0.35f);
+        }
+        _lastServerPovKeyTime = snap.Local.PovKeyTime;
 
         // Apply replicated dynamic world objects (doors, elevators, pickups)
         foreach (var dt in snap.DynamicThings)
@@ -660,7 +750,10 @@ public static partial class Program
             }
 
             if (ps.ThingIndex == _netLocalThingId)
+            {
+                _netPovKeyLoop = (ps.AnimFlags & RemotePlayerAnimFlags.PovKeyLoop) != 0;
                 continue;
+            }
 
             if (!_remotePlayers.TryGetValue(ps.ThingIndex, out var rp))
             {
@@ -670,10 +763,15 @@ public static partial class Program
 
             if (!rp.Initialized || Vector3.DistanceSquared(rp.Position, ps.Position) > 4.0f)
             {
+                bool wasInitialized = rp.Initialized;
                 rp.Position = ps.Position;
                 rp.SmoothedHorizVel = Vector2.Zero;
+                rp.SmoothedVelZ = 0f;
                 rp.AirborneSeconds = 0f;
+                rp.DescendingSeconds = 0f;
                 rp.MoveGraceSeconds = 0f;
+                if (wasInitialized)
+                    _thingRenderer?.ClearThingOverlayAnimation(ps.ThingIndex);
             }
             rp.TargetPosition = ps.Position;
             rp.Pitch = ps.Pitch;
@@ -697,6 +795,7 @@ public static partial class Program
             {
                 _remotePlayers.Remove(prevThingId);
                 StopNetLoopSoundsForOwner(prevThingId);
+                _thingRenderer?.ClearThingOverlayAnimation(prevThingId);
                 if (prevThingId >= 0 && prevThingId < _level.Things.Count)
                 {
                     _level.Things[prevThingId].ThingFlags |= (uint)(SithThingFlags.Disabled | SithThingFlags.Invisible);
@@ -848,8 +947,14 @@ public static partial class Program
         if (!_thirdPerson && _thingRenderer != null && lpSnap != null && !isDead)
         {
             string weaponModel = string.IsNullOrWhiteSpace(lpSnap.PovModel) ? "bryv.3do" : lpSnap.PovModel;
-            string weaponKey = string.IsNullOrWhiteSpace(lpSnap.PovKey) ? "bryvpst1.key" : lpSnap.PovKey;
-            float animTime = lpSnap.PovKeyTime;
+            string weaponKey = string.IsNullOrWhiteSpace(_netPovKey) ? "bryvpst1.key" : _netPovKey;
+            float animTime = _netPovKeyTime;
+            if (!_netPovKeyLoop)
+            {
+                float povDur = _thingRenderer.GetKeyframeDuration(weaponKey);
+                if (povDur > 0.002f)
+                    animTime = MathF.Min(animTime, MathF.Max(0f, povDur - 0.001f));
+            }
             float bobX = _playerMoving ? MathF.Cos(_playerMoveBobTime * 8.0f) * 0.0012f : 0f;
             float bobZ = _playerMoving ? MathF.Sin(_playerMoveBobTime * 16.0f) * 0.0012f : 0f;
             Vector3 localOffset = GetViewmodelBaseOffset(isSaber) + new Vector3(bobX, 0f, bobZ) + lpSnap.PovShakePos;
@@ -866,7 +971,7 @@ public static partial class Program
                 Vector3 bladeBaseWorldPos = Vector3.Transform(Vector3.Zero, joint5World);
                 Vector3 bladeForwardDir = Vector3.Normalize(Vector3.TransformNormal(Vector3.UnitY, joint5World));
                 float swingProgress = (lpSnap.Flags & LocalPlayerSnapFlags.SaberDamageActive) != 0
-                    ? Math.Clamp(lpSnap.PovKeyTime / 0.45f, 0.0f, 1.0f)
+                    ? Math.Clamp(animTime / 0.45f, 0.0f, 1.0f)
                     : 0.0f;
                 float bladeLengthScale = _saberIgniteTimer > 0f
                     ? Math.Clamp(1.0f - (_saberIgniteTimer / SaberIgniteDuration), 0.05f, 1.0f)
