@@ -94,7 +94,7 @@ public sealed class DmBotController
     private int _chargeMode;
     private bool _bowUseSecondaryNext;
     private float _burstElapsed;
-    private float _burstTarget = 0.9f;
+    private float _burstTarget;
     private float _burstPauseRemaining;
     private float _saberSwingingTimer;
     private float _saberPauseRemaining;
@@ -103,6 +103,12 @@ public sealed class DmBotController
     private float _trapAvoidUntil;
     private float _forceCooldown;
     private float _jumpCooldown;
+    private float _reactionTimer;
+    private float _losLostTimer = 10f;
+    private int _lockedShotMode;
+    private float _weaponSwitchCooldown;
+    private int _tacticalBiasWeaponBin = -1;
+    private float _tacticalBiasTimer;
 
     public BotArchetype Archetype { get; }
     public BotSkill Skill { get; }
@@ -112,6 +118,8 @@ public sealed class DmBotController
         Archetype = archetype;
         Skill = skill;
         _rng = rng ?? Random.Shared;
+        _forceCooldown = 2.0f;
+        _tacticalBiasTimer = 15f + (float)_rng.NextDouble() * 7f;
     }
 
     public void ResetForRespawn(Vector3 spawnPos)
@@ -130,13 +138,20 @@ public sealed class DmBotController
         _chargeElapsed = 0f;
         _chargeTarget = 0f;
         _burstElapsed = 0f;
+        _burstTarget = 0f;
         _burstPauseRemaining = 0f;
         _saberSwingingTimer = 0f;
         _saberPauseRemaining = 0f;
         _seqDropCooldown = 0f;
         _trapAvoidUntil = 0f;
-        _forceCooldown = 0f;
+        _forceCooldown = 3.0f;
         _jumpCooldown = 0f;
+        _reactionTimer = 0f;
+        _losLostTimer = 10f;
+        _lockedShotMode = 0;
+        _weaponSwitchCooldown = 0f;
+        _tacticalBiasWeaponBin = -1;
+        _tacticalBiasTimer = 15f + (float)_rng.NextDouble() * 7f;
     }
 
     /// <summary>
@@ -200,7 +215,15 @@ public sealed class DmBotController
 
             float score = ScoreWeaponForSituation(bin, inv, targetDist, hasLos, hasSafeAlternative, powerBoost);
             if (bin == Archetype.FavoriteWeaponBin && score > 0f)
-                score += 120f;
+            {
+                score += 220f;
+                if (bin == PlayerInventory.BinLightsaber && targetDist <= 2.6f)
+                    score += 180f;
+            }
+            else if (bin == _tacticalBiasWeaponBin && score > 0f)
+            {
+                score += 90f;
+            }
 
             if (score > bestScore)
             {
@@ -240,21 +263,56 @@ public sealed class DmBotController
 
         // 1. Target Acquisition
         PlayerState? bestEnemy = FindBestEnemy(sim, selfPlayer, eyePos, out Vector3 enemyPos, out Vector3 enemyCenter, out float enemyDist, out bool hasLos);
+        int prevTrackedTargetId = _trackedTargetThingId;
         UpdateTrackedTargetVelocity(dt, bestEnemy, enemyPos);
 
-        // 2. Choose weapon across all 10 bins
+        if (bestEnemy != null && hasLos)
+        {
+            if (_losLostTimer >= 0.6f || prevTrackedTargetId != bestEnemy.ThingIndex)
+            {
+                _reactionTimer = Skill switch
+                {
+                    BotSkill.Easy => 0.42f,
+                    BotSkill.Medium => 0.24f,
+                    _ => 0.10f
+                };
+            }
+            _losLostTimer = 0f;
+        }
+        else if (_tacticalBiasTimer <= 0f)
+        {
+            RefreshTacticalBiasWeapon(selfPlayer.Inventory);
+        }
+
+        // 2. Choose weapon across all 10 bins with switch hysteresis
         float boost = MathF.Max(1f, selfPlayer.Inventory.GetInv(PlayerInventory.BinPowerBoost));
         float evalDist = bestEnemy != null ? enemyDist : 2.5f;
         int chosenWeapon = SelectBestWeapon(selfPlayer.Inventory, evalDist, hasLos, boost);
+        int curBin = selfPlayer.CurWeaponBin;
+        bool curHasSplashRisk =
+            (curBin == PlayerInventory.BinThermDet && evalDist < 0.65f) ||
+            (curBin == PlayerInventory.BinRailDet && evalDist < 0.70f) ||
+            (curBin == PlayerInventory.BinSeqCharge && evalDist < 0.55f);
+        if (_lastRequestedWeaponBin >= 0 &&
+            _weaponSwitchCooldown > 0f &&
+            WorldSimulation.IsValidWeaponBin(curBin) &&
+            HasUsableAmmo(selfPlayer.Inventory, curBin) &&
+            !curHasSplashRisk)
+        {
+            chosenWeapon = curBin;
+        }
         decision.DesiredWeaponBin = chosenWeapon;
 
         if (_lastRequestedWeaponBin != chosenWeapon)
         {
             _lastRequestedWeaponBin = chosenWeapon;
+            _weaponSwitchCooldown = 2.0f;
             _chargeElapsed = 0f;
             _chargeTarget = 0f;
             _burstElapsed = 0f;
+            _burstTarget = 0f;
             _burstPauseRemaining = 0f;
+            _lockedShotMode = 0;
             _saberSwingingTimer = 0f;
             _saberPauseRemaining = 0f;
             // Ensure at least 1 released tick when swapping away from held trigger weapons
@@ -392,58 +450,64 @@ public sealed class DmBotController
         bool hasSafeAlternative,
         float boost)
     {
-        float rangePenalty = 0f;
         switch (bin)
         {
             case PlayerInventory.BinFists:
                 return dist <= 0.38f ? 180f : 12f;
 
             case PlayerInventory.BinLightsaber:
-                if (dist <= 0.75f) return 760f;
-                if (dist <= 1.6f) return 440f;
-                return hasLos ? 160f : 260f;
+                if (dist <= 0.85f) return 730f;
+                if (dist <= 1.75f) return 520f;
+                return hasLos ? 300f : 360f;
 
             case PlayerInventory.BinBryar:
-                return (hasLos ? 460f : 240f) + MathF.Min(40f, inv.EnergyAmmo);
+                return (dist > 3.5f ? 590f : 540f) + (hasLos ? 20f : 0f);
 
             case PlayerInventory.BinStRifle:
-                return (dist >= 0.4f && dist <= 4.5f ? 560f : 430f) + (hasLos ? 80f : 0f);
+                return (dist is >= 0.4f and <= 3.6f ? 580f : 470f) + (hasLos ? 20f : 0f);
 
             case PlayerInventory.BinRepeater:
-                rangePenalty = dist > 5.0f ? -120f : 0f;
-                return (boost >= 1.5f ? 780f : 670f) + rangePenalty + (hasLos ? 90f : 0f);
+            {
+                float score = dist > 4.2f
+                    ? 440f
+                    : (dist is >= 0.6f and <= 3.2f ? 595f : 535f);
+                if (boost >= 1.5f) score += 25f;
+                if (hasLos) score += 20f;
+                if (inv.PowerAmmo < 25f) score -= 60f;
+                return score;
+            }
 
             case PlayerInventory.BinBowcaster:
                 if (!hasLos && dist < 3.5f)
-                    return 620f; // Bounce mode handles corners well
-                return dist is >= 0.6f and <= 5.5f ? 630f : 480f;
+                    return 610f; // Bounce mode handles corners well
+                return dist is >= 0.8f and <= 5.5f ? 605f : 500f;
 
             case PlayerInventory.BinThermDet:
                 if (dist < 0.65f && hasSafeAlternative)
                     return -500f;
                 if (dist is >= 0.9f and <= 3.6f)
-                    return hasLos ? 520f : 610f;
-                return 250f;
+                    return hasLos ? 550f : 620f;
+                return 280f;
 
             case PlayerInventory.BinRailDet:
                 if (dist < 0.70f && hasSafeAlternative)
                     return -500f;
-                return (dist >= 1.0f ? 720f : 420f) + (hasLos ? 80f : 40f);
+                return (dist >= 1.2f ? 625f : 440f) + (hasLos ? 25f : 10f);
 
             case PlayerInventory.BinSeqCharge:
                 if (_seqDropCooldown > 0f && hasSafeAlternative)
                     return 40f;
                 if (dist < 0.50f && hasSafeAlternative)
                     return -400f;
-                return dist is >= 0.6f and <= 2.2f ? 380f : 190f;
+                return dist is >= 0.6f and <= 2.4f ? 430f : 220f;
 
             case PlayerInventory.BinConcRifle:
-                if (dist < 1.10f)
+                if (dist < 1.15f)
                 {
                     // Concussion secondary (+concblast2) is safe at close range!
-                    return inv.PowerAmmo >= 4f && hasLos ? 730f : 150f;
+                    return inv.PowerAmmo >= 4f && hasLos ? 490f : 150f;
                 }
-                return inv.PowerAmmo >= 8f ? 840f : 660f;
+                return inv.PowerAmmo >= 16f ? 630f : (inv.PowerAmmo >= 8f ? 560f : 420f);
 
             default:
                 return -1f;
@@ -464,6 +528,13 @@ public sealed class DmBotController
         ref Vector3 aimDir,
         ref float pitch)
     {
+        if (_reactionTimer > 0f &&
+            weaponBin != PlayerInventory.BinFists &&
+            weaponBin != PlayerInventory.BinLightsaber)
+        {
+            return;
+        }
+
         switch (weaponBin)
         {
             case PlayerInventory.BinFists:
@@ -512,47 +583,57 @@ public sealed class DmBotController
                 break;
 
             case PlayerInventory.BinBryar:
-            case PlayerInventory.BinStRifle:
-                if (hasLos && dist <= 12.0f)
+                if (TryPrepareBurstWindow(dt, hasLos && dist <= 12.0f))
                 {
-                    bool useSpread = weaponBin == PlayerInventory.BinStRifle && dist < 1.5f;
-                    if (useSpread)
-                        decision.SecondaryFireHeld = true;
-                    else
-                        decision.PrimaryFireHeld = true;
+                    if (_burstTarget <= 0f)
+                    {
+                        _lockedShotMode = 0;
+                        _burstTarget = NextSkillRange(0.55f, 0.35f, 0.85f, 0.45f, 1.10f, 0.45f);
+                        _burstElapsed = 0f;
+                    }
+                    StepBurstHold(
+                        dt,
+                        _burstElapsed + dt >= _burstTarget ? NextSkillRange(0.55f, 0.30f, 0.35f, 0.20f, 0.22f, 0.16f) : 0f,
+                        ref decision);
+                }
+                break;
+
+            case PlayerInventory.BinStRifle:
+                if (TryPrepareBurstWindow(dt, hasLos && dist <= 11.0f))
+                {
+                    if (_burstTarget <= 0f)
+                    {
+                        _lockedShotMode = (dist < 1.35f && _rng.NextDouble() < 0.45) ? 1 : 0;
+                        _burstTarget = NextSkillRange(0.30f, 0.18f, 0.42f, 0.22f, 0.50f, 0.28f);
+                        _burstElapsed = 0f;
+                    }
+                    StepBurstHold(
+                        dt,
+                        _burstElapsed + dt >= _burstTarget ? NextSkillRange(0.70f, 0.35f, 0.45f, 0.30f, 0.30f, 0.20f) : 0f,
+                        ref decision);
                 }
                 break;
 
             case PlayerInventory.BinRepeater:
-                if (hasLos && dist <= 10.0f)
+                if (TryPrepareBurstWindow(dt, hasLos && dist <= 10.0f))
                 {
-                    if (_burstPauseRemaining > 0f)
+                    if (_burstTarget <= 0f)
                     {
-                        _burstPauseRemaining -= dt;
-                        // Released briefly so repeat-1.wav fires and spread resets
+                        _lockedShotMode = (dist <= 1.25f && Skill >= BotSkill.Medium && _rng.NextDouble() < 0.35) ? 1 : 0;
+                        _burstTarget = _lockedShotMode == 1
+                            ? 0.22f
+                            : NextSkillRange(0.22f, 0.14f, 0.30f, 0.18f, 0.38f, 0.22f);
+                        _burstElapsed = 0f;
                     }
-                    else
+                    // Release between bursts so repeat-1.wav fires and spread resets
+                    float pauseOnEnd = 0f;
+                    if (_burstElapsed + dt >= _burstTarget)
                     {
-                        _burstElapsed += dt;
-                        if (_burstElapsed >= _burstTarget)
-                        {
-                            _burstElapsed = 0f;
-                            _burstTarget = 0.65f + (float)_rng.NextDouble() * 0.65f;
-                            _burstPauseRemaining = 0.18f;
-                        }
-                        else if (dist <= 1.3f && Skill >= BotSkill.Medium)
-                        {
-                            decision.SecondaryFireHeld = true;
-                        }
-                        else
-                        {
-                            decision.PrimaryFireHeld = true;
-                        }
+                        pauseOnEnd = _lockedShotMode == 1
+                            ? 0.65f + (float)_rng.NextDouble() * 0.30f
+                            : NextSkillRange(0.75f, 0.35f, 0.50f, 0.30f, 0.35f, 0.20f);
                     }
-                }
-                else
-                {
-                    _burstElapsed = 0f;
+                    StepBurstHold(dt, pauseOnEnd, ref decision);
                 }
                 break;
 
@@ -630,21 +711,18 @@ public sealed class DmBotController
                 break;
 
             case PlayerInventory.BinRailDet:
-                if (dist < 0.70f)
-                    break;
-
-                if (hasLos)
+                if (TryPrepareBurstWindow(dt, dist >= 0.70f && (hasLos || dist <= 3.5f)))
                 {
-                    bool stickyTrap = _rng.NextDouble() < 0.20;
-                    if (stickyTrap)
-                        decision.SecondaryFireHeld = true;
-                    else
-                        decision.PrimaryFireHeld = true;
-                }
-                else if (dist <= 3.5f)
-                {
-                    // Lob sticky rail charge around cover
-                    decision.SecondaryFireHeld = true;
+                    if (_burstTarget <= 0f)
+                    {
+                        _lockedShotMode = (!hasLos || _rng.NextDouble() < 0.20) ? 1 : 0;
+                        _burstTarget = 0.16f;
+                        _burstElapsed = 0f;
+                    }
+                    StepBurstHold(
+                        dt,
+                        _burstElapsed + dt >= _burstTarget ? NextSkillRange(1.9f, 0.6f, 1.45f, 0.45f, 1.15f, 0.35f) : 0f,
+                        ref decision);
                 }
                 break;
 
@@ -665,16 +743,75 @@ public sealed class DmBotController
                 break;
 
             case PlayerInventory.BinConcRifle:
-                if (hasLos && dist <= 9.0f)
+                if (TryPrepareBurstWindow(dt, hasLos && dist <= 9.0f))
                 {
-                    bool useBeamSecondary = dist < 1.10f || inv.PowerAmmo < 8f ||
-                        (dist <= 4.5f && _targetVelocity.LengthSquared() > 1.2f && _rng.NextDouble() < 0.35);
-                    if (useBeamSecondary)
-                        decision.SecondaryFireHeld = true;
-                    else
-                        decision.PrimaryFireHeld = true;
+                    if (_burstTarget <= 0f)
+                    {
+                        _lockedShotMode = (dist < 1.10f || inv.PowerAmmo < 8f ||
+                            (dist <= 3.5f && _targetVelocity.LengthSquared() > 1.5f && _rng.NextDouble() < 0.15))
+                            ? 1
+                            : 0;
+                        _burstTarget = 0.16f;
+                        _burstElapsed = 0f;
+                    }
+
+                    // Enforce point-blank safety even if enemy rushes mid-window
+                    if (dist < 1.10f)
+                        _lockedShotMode = 1;
+
+                    StepBurstHold(
+                        dt,
+                        _burstElapsed + dt >= _burstTarget ? NextSkillRange(2.2f, 0.6f, 1.7f, 0.5f, 1.35f, 0.4f) : 0f,
+                        ref decision);
                 }
                 break;
+        }
+    }
+
+    private float NextSkillRange(float easyMin, float easySpan, float medMin, float medSpan, float hardMin, float hardSpan)
+    {
+        float rand = (float)_rng.NextDouble();
+        return Skill switch
+        {
+            BotSkill.Easy => easyMin + rand * easySpan,
+            BotSkill.Medium => medMin + rand * medSpan,
+            _ => hardMin + rand * hardSpan
+        };
+    }
+
+    private bool TryPrepareBurstWindow(float dt, bool canFire)
+    {
+        if (_burstPauseRemaining > 0f)
+        {
+            _burstPauseRemaining -= dt;
+            return false;
+        }
+
+        if (!canFire)
+        {
+            _burstElapsed = 0f;
+            _burstTarget = 0f;
+            return false;
+        }
+
+        return true;
+    }
+
+    private void StepBurstHold(float dt, float pauseOnEnd, ref BotTickDecision decision)
+    {
+        _burstElapsed += dt;
+        if (_burstElapsed < _burstTarget)
+        {
+            if (_lockedShotMode == 1)
+                decision.SecondaryFireHeld = true;
+            else
+                decision.PrimaryFireHeld = true;
+        }
+        else
+        {
+            _burstElapsed = 0f;
+            _burstTarget = 0f;
+            _burstPauseRemaining = pauseOnEnd;
         }
     }
 
@@ -832,7 +969,7 @@ public sealed class DmBotController
             else if (p.WeaponBin >= 0)
             {
                 bool alreadyOwns = inv.GetInv(p.WeaponBin) > 0f;
-                baseValue = alreadyOwns ? 70f : (p.WeaponBin >= PlayerInventory.BinRepeater ? 250f : 180f);
+                baseValue = alreadyOwns ? 65f : (p.WeaponBin == Archetype.FavoriteWeaponBin ? 260f : 205f);
             }
             else if (p.IsAmmo)
                 baseValue = (inv.PowerAmmo < 40f || inv.EnergyAmmo < 40f) ? 160f : 65f;
@@ -937,39 +1074,53 @@ public sealed class DmBotController
         return aimTarget + _aimJitterOffset;
     }
 
+    private void RefreshTacticalBiasWeapon(PlayerInventory inv)
+    {
+        Span<int> candidates = stackalloc int[10];
+        int count = 0;
+        for (int bin = PlayerInventory.BinBryar; bin <= PlayerInventory.BinLightsaber; bin++)
+        {
+            if (HasUsableAmmo(inv, bin))
+                candidates[count++] = bin;
+        }
+
+        _tacticalBiasWeaponBin = count > 0 ? candidates[_rng.Next(count)] : -1;
+        _tacticalBiasTimer = 15f + (float)_rng.NextDouble() * 7f;
+    }
+
     private int SelectForcePower(PlayerInventory inv, bool hasEnemy, bool hasLos, float enemyDist, bool isMoving)
     {
         if (_forceCooldown > 0f || inv.ForceMana < 20f)
             return 0;
 
-        if (inv.Health < 60f && inv.GetInv(PlayerInventory.BinForceHeal) > 0f)
+        if (inv.Health < 55f && inv.GetInv(PlayerInventory.BinForceHeal) > 0f)
         {
-            _forceCooldown = 3.0f;
+            _forceCooldown = 6.0f;
             return PlayerInventory.BinForceHeal;
         }
 
-        if (hasEnemy && hasLos && enemyDist <= 3.5f)
+        if (hasEnemy && hasLos)
         {
-            if (inv.GetInv(PlayerInventory.BinForceLightning) > 0f && inv.ForceMana >= 25f)
+            if (enemyDist <= 1.45f && inv.GetInv(PlayerInventory.BinForceLightning) > 0f && inv.ForceMana >= 45f)
             {
-                _forceCooldown = 1.8f;
+                _forceCooldown = Skill == BotSkill.Hard ? 6.5f : 9.0f;
                 return PlayerInventory.BinForceLightning;
             }
-            if (inv.GetInv(PlayerInventory.BinForceDestruction) > 0f && enemyDist >= 1.2f && inv.ForceMana >= 40f)
+            if (enemyDist is >= 1.2f and <= 4.0f && inv.GetInv(PlayerInventory.BinForceDestruction) > 0f && inv.ForceMana >= 50f)
             {
-                _forceCooldown = 3.5f;
+                _forceCooldown = 7.5f;
                 return PlayerInventory.BinForceDestruction;
             }
-            if (inv.GetInv(PlayerInventory.BinForceThrow) > 0f && enemyDist >= 0.7f && inv.ForceMana >= 25f)
+            if (enemyDist is >= 0.8f and <= 2.6f && inv.GetInv(PlayerInventory.BinForceThrow) > 0f && inv.ForceMana >= 35f)
             {
-                _forceCooldown = 2.8f;
+                _forceCooldown = 6.5f;
                 return PlayerInventory.BinForceThrow;
             }
         }
 
-        if (isMoving && hasEnemy && enemyDist > 3.0f && inv.GetInv(PlayerInventory.BinForceSpeed) > 0f && inv.ForceMana >= 30f)
+        if (isMoving && hasEnemy && enemyDist > 3.5f && inv.GetInv(PlayerInventory.BinForceSpeed) > 0f && inv.ForceMana >= 40f)
         {
-            _forceCooldown = 8.0f;
+            _forceCooldown = 10.0f;
             return PlayerInventory.BinForceSpeed;
         }
 
@@ -983,6 +1134,10 @@ public sealed class DmBotController
         _forceCooldown = MathF.Max(0f, _forceCooldown - dt);
         _stuckSidestepTimer = MathF.Max(0f, _stuckSidestepTimer - dt);
         _jumpCooldown = MathF.Max(0f, _jumpCooldown - dt);
+        _reactionTimer = MathF.Max(0f, _reactionTimer - dt);
+        _weaponSwitchCooldown = MathF.Max(0f, _weaponSwitchCooldown - dt);
+        _tacticalBiasTimer = MathF.Max(0f, _tacticalBiasTimer - dt);
+        _losLostTimer = MathF.Min(10f, _losLostTimer + dt);
 
         _strafeTimer += dt;
         if (_strafeTimer >= 1.8f)

@@ -275,11 +275,24 @@ public sealed class DedicatedGameServer : IDisposable
                 };
                 if (loadout.JediRank > 0)
                 {
+                    bool isDarkArchetype =
+                        archetype.PreferredModelHint.Contains("Sariss", StringComparison.OrdinalIgnoreCase) ||
+                        archetype.PreferredModelHint.Contains("Jerec", StringComparison.OrdinalIgnoreCase) ||
+                        archetype.PreferredModelHint.Contains("Boc", StringComparison.OrdinalIgnoreCase) ||
+                        archetype.PreferredModelHint.Contains("Yun", StringComparison.OrdinalIgnoreCase);
+
+                    byte powerRank = (byte)(skill == BotSkill.Hard ? 2 : 1);
                     for (int i = 0; i < PlayerCustomizationCatalog.ForcePowers.Count; i++)
                     {
                         int bin = PlayerCustomizationCatalog.ForcePowers[i].Bin;
-                        if (bin is PlayerInventory.BinForceJump or PlayerInventory.BinForceSpeed or PlayerInventory.BinForceHeal or PlayerInventory.BinForceLightning)
-                            loadout.ForceRanks[i] = (byte)(skill == BotSkill.Hard ? 3 : 2);
+                        bool assign = bin is PlayerInventory.BinForceJump or PlayerInventory.BinForceSpeed ||
+                            (isDarkArchetype
+                                ? (bin is PlayerInventory.BinForceLightning or PlayerInventory.BinForceThrow ||
+                                   (skill == BotSkill.Hard && bin == PlayerInventory.BinForceDestruction))
+                                : bin is PlayerInventory.BinForceHeal or PlayerInventory.BinForcePull);
+
+                        if (assign)
+                            loadout.ForceRanks[i] = powerRank;
                     }
                 }
             }

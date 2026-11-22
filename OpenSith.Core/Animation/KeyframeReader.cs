@@ -55,6 +55,19 @@ public static class KeyframeReader
                 {
                     track.JointCount = int.Parse(tokens[1], CultureInfo.InvariantCulture);
                 }
+                else if (tokens[0].Equals("TYPE", StringComparison.OrdinalIgnoreCase) && tokens.Length > 1)
+                {
+                    string rawType = tokens[1];
+                    if (rawType.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (int.TryParse(rawType.AsSpan(2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out int hexMask))
+                            track.NodeMask = hexMask;
+                    }
+                    else if (int.TryParse(rawType, NumberStyles.Integer, CultureInfo.InvariantCulture, out int decMask))
+                    {
+                        track.NodeMask = decMask;
+                    }
+                }
             }
             else if (currentSection == "KEYFRAME NODES")
             {

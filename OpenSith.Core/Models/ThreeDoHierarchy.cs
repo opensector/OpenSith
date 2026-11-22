@@ -168,7 +168,19 @@ public struct SithMatrix34
 /// </summary>
 public static class ThreeDoHierarchy
 {
-    public static Matrix4x4[] ComputeTransforms(ThreeDoModel model, KeyframeTrack? keyframe = null, float time = 0f)
+    public static Matrix4x4[] ComputeTransforms(ThreeDoModel model, KeyframeTrack? keyframe = null, float time = 0f) =>
+        ComputeTransforms(model, keyframe, time, overlayKeyframe: null, overlayTime: 0f);
+
+    /// <summary>
+    /// Computes skeletal hierarchy transforms with an optional upper-body/joint-masked overlay keyframe
+    /// (following Sith Engine <c>TYPE</c> node mask blending over a full-body base track).
+    /// </summary>
+    public static Matrix4x4[] ComputeTransforms(
+        ThreeDoModel model,
+        KeyframeTrack? baseKeyframe,
+        float baseTime,
+        KeyframeTrack? overlayKeyframe,
+        float overlayTime)
     {
         int numNodes = model.Nodes.Count;
         if (numNodes == 0) return Array.Empty<Matrix4x4>();
@@ -178,9 +190,23 @@ public static class ThreeDoHierarchy
         {
             Vector3 pos;
             Vector3 pyr;
-            if (keyframe != null && keyframe.NodeEntries.TryGetValue(i, out var entries) && entries.Count > 0)
+
+            bool hasOverlayEntries = overlayKeyframe != null &&
+                overlayKeyframe.NodeEntries.TryGetValue(i, out var ovEntries) &&
+                ovEntries.Count > 0;
+            int nodeType = model.Nodes[i].NodeType;
+            int overlayMask = overlayKeyframe?.NodeMask ?? 0;
+            bool useOverlay = hasOverlayEntries &&
+                overlayMask != 0 &&
+                (nodeType == 0 ? overlayMask == 0xFFFF : (nodeType & overlayMask) != 0);
+
+            if (useOverlay)
             {
-                keyframe.SampleNode(i, time, out pos, out pyr);
+                overlayKeyframe!.SampleNode(i, overlayTime, out pos, out pyr);
+            }
+            else if (baseKeyframe != null && baseKeyframe.NodeEntries.TryGetValue(i, out var entries) && entries.Count > 0)
+            {
+                baseKeyframe.SampleNode(i, baseTime, out pos, out pyr);
             }
             else
             {

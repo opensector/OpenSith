@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Numerics;
 using OpenSith.Core.Animation;
+using OpenSith.Core.Cog;
 using OpenSith.Core.Models;
 using OpenSith.Core.Simulation;
 using OpenSith.Core.Vfs;
@@ -44,6 +45,7 @@ public sealed class ThingMeshRenderer : IDisposable
 
     private readonly Dictionary<int, AnimatedThingGpu> _animatedInstances = new();
     private readonly Dictionary<int, (string Action, int Mode, bool Loop)> _desiredAnimations = new();
+    private readonly Dictionary<int, (string ActionOrKeyframe, int Mode, bool Loop)> _desiredOverlays = new();
     private readonly Dictionary<int, (string KeyframeName, int Mode, bool Loop)> _pendingKeyframes = new();
     private readonly Dictionary<int, float> _pendingDistances = new();
     private readonly Dictionary<string, AnimatedThingGpu> _viewmodelInstances = new(StringComparer.OrdinalIgnoreCase);
@@ -121,7 +123,19 @@ public sealed class ThingMeshRenderer : IDisposable
         public int SubmodeFlags;
         public float PendingDistanceMoved;
         public float AnimTime;
+        public KeyframeTrack? OverlayKeyframe;
+        public string OverlayAction = string.Empty;
+        public int OverlayMode;
+        public bool OverlayLoop = true;
+        public float OverlayAnimTime;
     }
+
+    public readonly record struct PlayerAnimationSelection(
+        int Mode,
+        string BaseAction,
+        bool BaseLoop,
+        string? OverlayActionOrKey,
+        bool OverlayLoop);
 
     public ThingMeshRenderer(GL gl, IVirtualFileSystem vfs, TextureManager textureManager)
     {
@@ -153,6 +167,69 @@ public sealed class ThingMeshRenderer : IDisposable
         }
     }
 
+    /// <summary>
+    /// Resolves puppet mode, base locomotion track, and upper-body firing overlay for a player or bot.
+    /// </summary>
+    public static PlayerAnimationSelection ResolvePlayerAnimationState(
+        bool isDead,
+        bool isUnderwater,
+        bool isAirborneSustained,
+        bool isMoving,
+        bool isFiring,
+        int weaponBin,
+        Vector2 horizVelocity,
+        float yawDeg)
+    {
+        bool isSaber = weaponBin == PlayerInventory.BinLightsaber;
+        bool isFists = weaponBin == PlayerInventory.BinFists;
+        int mode = isUnderwater ? (isSaber ? 5 : (isFists ? 3 : 4)) : (isSaber ? 2 : (isFists ? 0 : 1));
+        if (isDead)
+            return new(mode, "death", false, null, false);
+
+        string baseAction;
+        if (!isUnderwater && isAirborneSustained)
+        {
+            baseAction = "fall";
+        }
+        else if (isMoving)
+        {
+            if (isUnderwater)
+            {
+                baseAction = "run";
+            }
+            else if (horizVelocity.LengthSquared() > 1e-4f)
+            {
+                float yawRad = yawDeg * (MathF.PI / 180f);
+                Vector2 fwd = new(-MathF.Sin(yawRad), MathF.Cos(yawRad));
+                Vector2 right = new(MathF.Cos(yawRad), MathF.Sin(yawRad));
+                Vector2 moveDir = Vector2.Normalize(horizVelocity);
+                float fwdDot = Vector2.Dot(moveDir, fwd);
+                float rightDot = Vector2.Dot(moveDir, right);
+
+                if (fwdDot < -0.55f)
+                    baseAction = "walkback";
+                else if (MathF.Abs(rightDot) > 0.72f && MathF.Abs(fwdDot) < 0.55f)
+                    baseAction = rightDot > 0f ? "straferight" : "strafeleft";
+                else
+                    baseAction = "run";
+            }
+            else
+            {
+                baseAction = "run";
+            }
+        }
+        else
+        {
+            baseAction = "stand";
+        }
+
+        string? overlay = null;
+        if (isFiring)
+            overlay = (isSaber && !isUnderwater) ? "kysabrf1.key" : "fire";
+
+        return new(mode, baseAction, true, overlay, true);
+    }
+
     public void Update(float dt)
     {
         _globalTime += dt;
@@ -166,6 +243,9 @@ public sealed class ThingMeshRenderer : IDisposable
             {
                 anim.AnimTime += dt;
             }
+
+            if (anim.OverlayKeyframe != null)
+                anim.OverlayAnimTime += dt;
 
             anim.PendingDistanceMoved = 0f;
         }
@@ -195,12 +275,77 @@ public sealed class ThingMeshRenderer : IDisposable
         var keyframe = !string.IsNullOrEmpty(keyName) ? GetOrCreateKeyframe(keyName) : null;
         if (keyframe != null)
         {
+            float nextAnimTime = 0.0f;
+            if ((anim.SubmodeFlags & 0x01) != 0 &&
+                (submodeFlags & 0x01) != 0 &&
+                anim.Keyframe.Duration > 0f &&
+                keyframe.Duration > 0f)
+            {
+                float phase = (anim.AnimTime % anim.Keyframe.Duration) / anim.Keyframe.Duration;
+                if (phase < 0f)
+                    phase += 1f;
+                nextAnimTime = phase * keyframe.Duration;
+            }
+
             anim.Keyframe = keyframe;
             anim.Action = action;
             anim.Mode = mode;
             anim.Loop = loop;
             anim.SubmodeFlags = submodeFlags;
-            anim.AnimTime = 0.0f;
+            anim.AnimTime = nextAnimTime;
+        }
+    }
+
+    /// <summary>
+    /// Sets or clears a joint-masked upper-body overlay animation (by puppet action or explicit <c>.key</c> filename)
+    /// blended atop the Thing's full-body locomotion track using the keyframe's <see cref="KeyframeTrack.NodeMask"/>.
+    /// </summary>
+    public void SetThingOverlayAnimation(int thingIndex, string? actionOrKeyframe, int mode = 0, bool loop = true)
+    {
+        if (string.IsNullOrWhiteSpace(actionOrKeyframe))
+        {
+            _desiredOverlays.Remove(thingIndex);
+            if (_animatedInstances.TryGetValue(thingIndex, out var clearedAnim))
+            {
+                clearedAnim.OverlayKeyframe = null;
+                clearedAnim.OverlayAction = string.Empty;
+                clearedAnim.OverlayAnimTime = 0f;
+            }
+            return;
+        }
+
+        _desiredOverlays[thingIndex] = (actionOrKeyframe, mode, loop);
+
+        if (!_animatedInstances.TryGetValue(thingIndex, out var anim))
+            return;
+
+        if (anim.OverlayAction.Equals(actionOrKeyframe, StringComparison.OrdinalIgnoreCase) &&
+            anim.OverlayMode == mode &&
+            anim.OverlayLoop == loop &&
+            anim.OverlayKeyframe != null)
+        {
+            return;
+        }
+
+        KeyframeTrack? keyframe = null;
+        if (actionOrKeyframe.EndsWith(".key", StringComparison.OrdinalIgnoreCase))
+        {
+            keyframe = GetOrCreateKeyframe(actionOrKeyframe);
+        }
+        else if (anim.Puppet != null &&
+                 ResolvePuppetSubmode(anim.Puppet, mode, actionOrKeyframe, out string? keyName, out _) &&
+                 !string.IsNullOrEmpty(keyName))
+        {
+            keyframe = GetOrCreateKeyframe(keyName);
+        }
+
+        if (keyframe != null)
+        {
+            anim.OverlayKeyframe = keyframe;
+            anim.OverlayAction = actionOrKeyframe;
+            anim.OverlayMode = mode;
+            anim.OverlayLoop = loop;
+            anim.OverlayAnimTime = 0f;
         }
     }
 
@@ -441,7 +586,36 @@ public sealed class ThingMeshRenderer : IDisposable
         }
 
         float sampleTime = GetAnimatedSampleTime(anim);
-        return TryComputeNodeTransform(anim.Model, anim.Keyframe, sampleTime, nodeIndex, out nodeLocalTransform);
+        return TryGetThingNodeTransform(anim, nodeIndex, sampleTime, out nodeLocalTransform);
+    }
+
+    private static bool TryGetThingNodeTransform(
+        AnimatedThingGpu anim,
+        int nodeIndex,
+        float baseSampleTime,
+        out Matrix4x4 nodeLocalTransform)
+    {
+        if (nodeIndex < 0 || nodeIndex >= anim.Model.Nodes.Count)
+        {
+            nodeLocalTransform = Matrix4x4.Identity;
+            return false;
+        }
+
+        float overlaySampleTime = GetOverlaySampleTime(anim);
+        Matrix4x4[] nodeTransforms = ThreeDoHierarchy.ComputeTransforms(
+            anim.Model,
+            anim.Keyframe,
+            baseSampleTime,
+            anim.OverlayKeyframe,
+            overlaySampleTime);
+        if (nodeIndex >= nodeTransforms.Length)
+        {
+            nodeLocalTransform = Matrix4x4.Identity;
+            return false;
+        }
+
+        nodeLocalTransform = nodeTransforms[nodeIndex];
+        return true;
     }
 
     /// <summary>
@@ -465,6 +639,16 @@ public sealed class ThingMeshRenderer : IDisposable
         return anim.Loop
             ? anim.AnimTime
             : MathF.Min(anim.AnimTime, MathF.Max(0f, anim.Keyframe.Duration - 0.001f));
+    }
+
+    private static float GetOverlaySampleTime(AnimatedThingGpu anim)
+    {
+        if (anim.OverlayKeyframe == null)
+            return 0f;
+
+        return anim.OverlayLoop
+            ? anim.OverlayAnimTime
+            : MathF.Min(anim.OverlayAnimTime, MathF.Max(0f, anim.OverlayKeyframe.Duration - 0.001f));
     }
 
     /// <summary>
@@ -1044,7 +1228,13 @@ public sealed class ThingMeshRenderer : IDisposable
         var key = anim.Keyframe;
 
         // Compute animated node hierarchy using authentic LucasArts Sith Engine hierarchy
-        Matrix4x4[] nodeTransforms = ThreeDoHierarchy.ComputeTransforms(model, key, time);
+        float overlayTime = GetOverlaySampleTime(anim);
+        Matrix4x4[] nodeTransforms = ThreeDoHierarchy.ComputeTransforms(
+            model,
+            key,
+            time,
+            anim.OverlayKeyframe,
+            overlayTime);
         int nodeCount = nodeTransforms.Length;
 
         // Transform vertices on CPU
@@ -1158,6 +1348,8 @@ public sealed class ThingMeshRenderer : IDisposable
         if (_pendingDistances.Remove(thing.ThingIndex, out float pendingDist))
             animGpu.PendingDistanceMoved = pendingDist;
         _animatedInstances[thing.ThingIndex] = animGpu;
+        if (_desiredOverlays.TryGetValue(thing.ThingIndex, out var desiredOverlay))
+            SetThingOverlayAnimation(thing.ThingIndex, desiredOverlay.ActionOrKeyframe, desiredOverlay.Mode, desiredOverlay.Loop);
         return animGpu;
     }
 
@@ -1211,6 +1403,8 @@ public sealed class ThingMeshRenderer : IDisposable
             }
             else break;
         }
+        if (thing.TemplateName.Equals("walkplayer", StringComparison.OrdinalIgnoreCase) || thing.IsPlayerSpawn)
+            return "ky.pup";
         return null;
     }
 
@@ -1615,6 +1809,7 @@ public sealed class ThingMeshRenderer : IDisposable
             _gl.DeleteVertexArray(anim.Vao);
         }
         _animatedInstances.Clear();
+        _desiredOverlays.Clear();
         _pendingKeyframes.Clear();
 
         foreach (var vm in _viewmodelInstances.Values)

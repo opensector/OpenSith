@@ -1194,7 +1194,7 @@ public static partial class Program
         // Sync player Thing position, yaw, and puppet animation
         int renderPlayerId = localPlayerId >= 0 ? localPlayerId : 0;
         var lpState = _worldSim.LocalPlayer;
-        bool usingSaber = lpState?.CurWeaponBin == PlayerInventory.BinLightsaber;
+        int spWeaponBin = lpState?.CurWeaponBin ?? PlayerInventory.BinBryar;
         bool isFiring = lpState != null && (lpState.ActiveFireMode >= 0 || lpState.FireWait > 0f);
         if (_level != null && renderPlayerId >= 0 && renderPlayerId < _level.Things.Count && _player != null)
         {
@@ -1203,17 +1203,20 @@ public static partial class Program
             kyle.PitchYawRoll = new Vector3(0f, _camera.Yaw, 0f);
             kyle.SectorIndex = _player.CurrentSectorIndex;
 
-            int kyMode = _player.IsUnderwater
-                ? (usingSaber ? 5 : 4)
-                : (usingSaber ? 2 : 1);
-            string kyAction = isDead
-                ? "death"
-                : (isFiring ? "fire" : (_playerMoving ? "run" : "stand"));
-            _thingRenderer?.SetThingAnimation(renderPlayerId, kyAction, kyMode, loop: !isDead);
-
-            float dist = isDead
-                ? 0f
-                : Vector2.Distance(oldPlayerXY, new Vector2(_player.Position.X, _player.Position.Y));
+            Vector2 localDeltaXY = new(_player.Position.X - oldPlayerXY.X, _player.Position.Y - oldPlayerXY.Y);
+            float dist = isDead ? 0f : localDeltaXY.Length();
+            Vector2 localVelXY = dt > 1e-4f ? localDeltaXY / dt : Vector2.Zero;
+            var animSel = ThingMeshRenderer.ResolvePlayerAnimationState(
+                isDead,
+                _player.IsUnderwater,
+                !_player.IsGrounded && !_player.IsUnderwater,
+                _playerMoving,
+                isFiring,
+                spWeaponBin,
+                localVelXY,
+                _camera.Yaw);
+            _thingRenderer?.SetThingAnimation(renderPlayerId, animSel.BaseAction, animSel.Mode, animSel.BaseLoop);
+            _thingRenderer?.SetThingOverlayAnimation(renderPlayerId, animSel.OverlayActionOrKey, animSel.Mode, animSel.OverlayLoop);
             _thingRenderer?.SetThingDistanceMoved(renderPlayerId, dist);
         }
 

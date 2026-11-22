@@ -24,10 +24,17 @@ public static partial class Program
         public float Pitch;
         public float Yaw;
         public bool IsDead;
+        public bool IsMovingFlag;
+        public bool IsFiringFlag;
+        public bool IsUnderwaterFlag;
+        public bool IsAirborneFlag;
         public bool SaberActive;
         public int WeaponBin;
         public byte ModelIndex;
         public byte SaberColorIndex = PlayerCustomizationCatalog.DefaultSaberColorIndex;
+        public Vector2 SmoothedHorizVel;
+        public float AirborneSeconds;
+        public float MoveGraceSeconds;
         public bool Initialized;
     }
 
@@ -273,6 +280,15 @@ public static partial class Program
         {
             Vector3 oldPos = rp.Position;
             rp.Position = Vector3.Lerp(rp.Position, rp.TargetPosition, lerpAlpha);
+            Vector2 deltaXY = new(rp.Position.X - oldPos.X, rp.Position.Y - oldPos.Y);
+            float dist = deltaXY.Length();
+            Vector2 instVel = dt > 1e-4f ? deltaXY / dt : Vector2.Zero;
+            rp.SmoothedHorizVel = Vector2.Lerp(rp.SmoothedHorizVel, instVel, Math.Clamp(dt * 12f, 0f, 1f));
+            float smoothedSpeed = rp.SmoothedHorizVel.Length();
+            rp.AirborneSeconds = (!rp.IsDead && rp.IsAirborneFlag && !rp.IsUnderwaterFlag) ? (rp.AirborneSeconds + dt) : 0f;
+            bool movingNow = !rp.IsDead && (rp.IsMovingFlag || smoothedSpeed > 0.12f);
+            rp.MoveGraceSeconds = movingNow ? 0.12f : MathF.Max(0f, rp.MoveGraceSeconds - dt);
+
             if (thingId >= 0 && thingId < _level.Things.Count)
             {
                 var thing = _level.Things[thingId];
@@ -282,11 +298,20 @@ public static partial class Program
                     : _player.PelvisOffset;
                 thing.Position = rp.Position + new Vector3(0f, 0f, rpPelvis);
                 thing.PitchYawRoll = new Vector3(0f, rp.Yaw, 0f);
+
+                var animSel = ThingMeshRenderer.ResolvePlayerAnimationState(
+                    rp.IsDead,
+                    rp.IsUnderwaterFlag,
+                    rp.AirborneSeconds >= 0.14f,
+                    movingNow || rp.MoveGraceSeconds > 0f,
+                    rp.IsFiringFlag,
+                    rp.WeaponBin,
+                    rp.SmoothedHorizVel,
+                    rp.Yaw);
+                _thingRenderer?.SetThingAnimation(thingId, animSel.BaseAction, animSel.Mode, animSel.BaseLoop);
+                _thingRenderer?.SetThingOverlayAnimation(thingId, animSel.OverlayActionOrKey, animSel.Mode, animSel.OverlayLoop);
                 if (!rp.IsDead)
-                {
-                    float dist = Vector2.Distance(new Vector2(oldPos.X, oldPos.Y), new Vector2(rp.Position.X, rp.Position.Y));
                     _thingRenderer?.SetThingDistanceMoved(thingId, dist);
-                }
             }
         }
 
@@ -352,7 +377,6 @@ public static partial class Program
         }
 
         int weaponBin = _latestSnapshot?.Local.CurWeaponBin ?? PlayerInventory.BinBryar;
-        bool usingSaber = weaponBin == PlayerInventory.BinLightsaber;
         bool primaryHeld = !menuOpen && !isDead && (_mouseLeftDown || _fireKeyPrimary);
         bool secondaryHeld = !menuOpen && !isDead && (_mouseRightDown || _fireKeySecondary);
 
@@ -364,12 +388,20 @@ public static partial class Program
             localThing.PitchYawRoll = new Vector3(0f, _camera.Yaw, 0f);
             localThing.SectorIndex = _player.CurrentSectorIndex;
 
-            int kyMode = _player.IsUnderwater ? (usingSaber ? 5 : 4) : (usingSaber ? 2 : 1);
-            string kyAction = isDead
-                ? "death"
-                : ((primaryHeld || secondaryHeld) ? "fire" : (_playerMoving ? "run" : "stand"));
-            _thingRenderer?.SetThingAnimation(_netLocalThingId, kyAction, kyMode, loop: !isDead);
-            float dist = isDead ? 0f : Vector2.Distance(oldPlayerXY, new Vector2(_player.Position.X, _player.Position.Y));
+            Vector2 localDeltaXY = new(_player.Position.X - oldPlayerXY.X, _player.Position.Y - oldPlayerXY.Y);
+            float dist = isDead ? 0f : localDeltaXY.Length();
+            Vector2 localVelXY = dt > 1e-4f ? localDeltaXY / dt : Vector2.Zero;
+            var animSel = ThingMeshRenderer.ResolvePlayerAnimationState(
+                isDead,
+                _player.IsUnderwater,
+                !_player.IsGrounded && !_player.IsUnderwater,
+                _playerMoving,
+                primaryHeld || secondaryHeld,
+                weaponBin,
+                localVelXY,
+                _camera.Yaw);
+            _thingRenderer?.SetThingAnimation(_netLocalThingId, animSel.BaseAction, animSel.Mode, animSel.BaseLoop);
+            _thingRenderer?.SetThingOverlayAnimation(_netLocalThingId, animSel.OverlayActionOrKey, animSel.Mode, animSel.OverlayLoop);
             _thingRenderer?.SetThingDistanceMoved(_netLocalThingId, dist);
         }
 
@@ -637,29 +669,25 @@ public static partial class Program
             }
 
             if (!rp.Initialized || Vector3.DistanceSquared(rp.Position, ps.Position) > 4.0f)
+            {
                 rp.Position = ps.Position;
+                rp.SmoothedHorizVel = Vector2.Zero;
+                rp.AirborneSeconds = 0f;
+                rp.MoveGraceSeconds = 0f;
+            }
             rp.TargetPosition = ps.Position;
             rp.Pitch = ps.Pitch;
             rp.Yaw = ps.Yaw;
             rp.IsDead = (ps.AnimFlags & RemotePlayerAnimFlags.IsDead) != 0;
+            rp.IsMovingFlag = (ps.AnimFlags & RemotePlayerAnimFlags.IsMoving) != 0;
+            rp.IsFiringFlag = (ps.AnimFlags & RemotePlayerAnimFlags.IsFiring) != 0;
+            rp.IsUnderwaterFlag = (ps.AnimFlags & RemotePlayerAnimFlags.IsUnderwater) != 0;
+            rp.IsAirborneFlag = (ps.AnimFlags & RemotePlayerAnimFlags.IsAirborne) != 0;
             rp.SaberActive = (ps.AnimFlags & RemotePlayerAnimFlags.SaberActive) != 0;
             rp.WeaponBin = ps.WeaponBin;
             rp.ModelIndex = ps.ModelIndex;
             rp.SaberColorIndex = ps.SaberColorIndex;
             rp.Initialized = true;
-
-            bool isSaber = ps.WeaponBin == PlayerInventory.BinLightsaber;
-            bool isUnder = (ps.AnimFlags & RemotePlayerAnimFlags.IsUnderwater) != 0;
-            bool isAirborne = (ps.AnimFlags & RemotePlayerAnimFlags.IsAirborne) != 0;
-            int mode = isUnder ? (isSaber ? 5 : 4) : (isSaber ? 2 : 1);
-            string action = rp.IsDead
-                ? "death"
-                : ((ps.AnimFlags & RemotePlayerAnimFlags.IsFiring) != 0
-                    ? "fire"
-                    : (!isUnder && isAirborne
-                        ? "fall"
-                        : ((ps.AnimFlags & RemotePlayerAnimFlags.IsMoving) != 0 ? "run" : "stand")));
-            _thingRenderer?.SetThingAnimation(ps.ThingIndex, action, mode, loop: !rp.IsDead);
         }
 
         // Hide remote players who left

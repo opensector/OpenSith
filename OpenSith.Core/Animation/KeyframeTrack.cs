@@ -27,6 +27,7 @@ public sealed class KeyframeTrack
     public float Fps { get; set; } = 15.0f;
     public int TotalFrames { get; set; }
     public int JointCount { get; set; }
+    public int NodeMask { get; set; } = 0xFFFF;
 
     public Dictionary<int, List<KeyframeEntry>> NodeEntries { get; } = new();
     public Dictionary<string, int> NodeNameToIndex { get; } = new(StringComparer.OrdinalIgnoreCase);
