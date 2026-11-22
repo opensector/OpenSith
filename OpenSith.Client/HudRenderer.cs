@@ -140,6 +140,18 @@ public sealed class HudRenderer : IDisposable
     }
 
     /// <summary>
+    /// Row entry displayed by <see cref="RenderScoreboard"/> in multiplayer sessions.
+    /// </summary>
+    public readonly record struct ScoreboardRow(
+        string Name,
+        int Team,
+        int Kills,
+        int Deaths,
+        int Score,
+        bool IsLocal,
+        bool IsDead);
+
+    /// <summary>
     /// Renders the 2D Jedi Knight HUD overlay while preserving caller OpenGL state.
     /// </summary>
     public void Render(
@@ -156,7 +168,81 @@ public sealed class HudRenderer : IDisposable
         float forceMana = 0f,
         float maxForceMana = 0f,
         float battery = 200f,
-        bool fieldLightOn = false)
+        bool fieldLightOn = false,
+        string? activeForceLabel = null)
+    {
+        ExecuteHudPass(screenWidth, screenHeight, hudScale =>
+        {
+            if (isDead)
+                DrawSolidRect(0.0f, 0.0f, screenWidth, screenHeight, new Vector4(0.45f, 0.02f, 0.02f, 0.22f));
+            else
+                DrawCrosshair(screenWidth * 0.5f, screenHeight * 0.5f, hudScale, selectedWeapon);
+
+            DrawBottomLeftStatus(screenHeight, hudScale, health, maxHealth, shields);
+            DrawBottomRightStatus(screenWidth, screenHeight, hudScale, ammo, selectedWeapon, forceMana, maxForceMana, battery, fieldLightOn, activeForceLabel);
+            DrawStatusMessages(screenWidth, hudScale, isDead, statusMessage);
+        });
+    }
+
+    /// <summary>
+    /// Renders a semi-transparent multiplayer scoreboard overlay (e.g. while holding Tab).
+    /// </summary>
+    public void RenderScoreboard(
+        int screenWidth,
+        int screenHeight,
+        string headerTitle,
+        IReadOnlyList<ScoreboardRow> rows)
+    {
+        if (rows == null || _msgFont is null)
+            return;
+
+        ExecuteHudPass(screenWidth, screenHeight, hudScale =>
+        {
+            float panelW = MathF.Min(screenWidth * 0.80f, 360.0f * hudScale);
+            float lineH = MathF.Max(12.0f, _msgFont.Font.LineHeight + 4) * hudScale;
+            float panelH = MathF.Min(screenHeight * 0.80f, (rows.Count + 3) * lineH + 16.0f * hudScale);
+            float left = MathF.Floor((screenWidth - panelW) * 0.5f);
+            float top = MathF.Floor((screenHeight - panelH) * 0.5f);
+
+            DrawSolidRect(left, top, panelW, panelH, new Vector4(0.03f, 0.05f, 0.08f, 0.78f));
+
+            float y = top + 8.0f * hudScale;
+            DrawCenteredSftText(_msgFont, string.IsNullOrWhiteSpace(headerTitle) ? "MULTIPLAYER SCOREBOARD" : headerTitle, screenWidth, y, hudScale);
+            y += lineH * 1.25f;
+
+            float colName = left + 14.0f * hudScale;
+            float colKills = left + panelW - 140.0f * hudScale;
+            float colDeaths = left + panelW - 92.0f * hudScale;
+            float colScore = left + panelW - 44.0f * hudScale;
+
+            DrawSftText(_msgFont, "PLAYER", colName, y, hudScale);
+            DrawSftText(_msgFont, "K", colKills, y, hudScale);
+            DrawSftText(_msgFont, "D", colDeaths, y, hudScale);
+            DrawSftText(_msgFont, "SCORE", colScore - 16.0f * hudScale, y, hudScale);
+            y += lineH;
+
+            foreach (var row in rows)
+            {
+                if (y + lineH > top + panelH - 6.0f * hudScale)
+                    break;
+
+                if (row.IsLocal)
+                    DrawSolidRect(left + 6.0f * hudScale, y - 1.0f * hudScale, panelW - 12.0f * hudScale, lineH, new Vector4(0.12f, 0.36f, 0.22f, 0.35f));
+
+                string label = row.IsDead ? $"{row.Name} [DEAD]" : row.Name;
+                if (row.Team > 0)
+                    label = $"[T{row.Team}] {label}";
+
+                DrawSftText(_msgFont, label, colName, y, hudScale);
+                DrawSftText(_msgFont, row.Kills.ToString(), colKills, y, hudScale);
+                DrawSftText(_msgFont, row.Deaths.ToString(), colDeaths, y, hudScale);
+                DrawSftText(_msgFont, row.Score.ToString(), colScore, y, hudScale);
+                y += lineH;
+            }
+        });
+    }
+
+    private void ExecuteHudPass(int screenWidth, int screenHeight, Action<float> drawAction)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -198,15 +284,7 @@ public sealed class HudRenderer : IDisposable
             _gl.BindVertexArray(_vao);
 
             float hudScale = MathF.Max(1.0f, MathF.Round(screenHeight / 480.0f));
-
-            if (isDead)
-                DrawSolidRect(0.0f, 0.0f, screenWidth, screenHeight, new Vector4(0.45f, 0.02f, 0.02f, 0.22f));
-            else
-                DrawCrosshair(screenWidth * 0.5f, screenHeight * 0.5f, hudScale, selectedWeapon);
-
-            DrawBottomLeftStatus(screenHeight, hudScale, health, maxHealth, shields);
-            DrawBottomRightStatus(screenWidth, screenHeight, hudScale, ammo, selectedWeapon, forceMana, maxForceMana, battery, fieldLightOn);
-            DrawStatusMessages(screenWidth, hudScale, isDead, statusMessage);
+            drawAction(hudScale);
         }
         finally
         {
@@ -299,7 +377,8 @@ public sealed class HudRenderer : IDisposable
         float forceMana,
         float maxForceMana,
         float battery,
-        bool fieldLightOn)
+        bool fieldLightOn,
+        string? activeForceLabel)
     {
         if (_statusRight is null)
             return;
@@ -350,6 +429,15 @@ public sealed class HudRenderer : IDisposable
             bool noAmmoDisplay = selectedWeapon == PlayerInventory.BinFists || selectedWeapon == PlayerInventory.BinLightsaber;
             string ammoText = noAmmoDisplay ? ":::" : $"{Math.Clamp(ammo, 0, 999):D3}";
             DrawSftText(_amoNums, ammoText, rightX + 13.0f * hudScale, rightY + 19.0f * hudScale, hudScale);
+        }
+
+        if (_msgFont is not null && !string.IsNullOrWhiteSpace(activeForceLabel))
+        {
+            float labelW = MeasureSftTextWidth(_msgFont, activeForceLabel, hudScale);
+            float labelX = MathF.Max(8.0f, screenWidth - labelW - 10.0f * hudScale);
+            float labelY = MathF.Max(8.0f, rightY - (_msgFont.Font.LineHeight + 6) * hudScale);
+            DrawSolidRect(labelX - 4.0f * hudScale, labelY - 2.0f * hudScale, labelW + 8.0f * hudScale, (_msgFont.Font.LineHeight + 4) * hudScale, new Vector4(0f, 0f, 0f, 0.45f));
+            DrawSftText(_msgFont, activeForceLabel, labelX, labelY, hudScale);
         }
     }
 

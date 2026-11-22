@@ -185,7 +185,10 @@ public sealed class SaberRenderer : IDisposable
         Vector3 bladeForwardDir,
         Vector3 bladeColor,
         float swingProgress,
-        float lengthScale = 1.0f)
+        float lengthScale = 1.0f,
+        string sideMat = DefaultSideMaterialName,
+        string tipMat = DefaultTipMaterialName,
+        float bladeLength = BladeLength)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -200,7 +203,10 @@ public sealed class SaberRenderer : IDisposable
             bladeColor,
             auraScale: 1.0f + 0.35f * swingArc,
             auraAlphaBoost: 1.0f + 0.45f * swingArc,
-            lengthScale: lengthScale);
+            lengthScale: lengthScale,
+            sideMat: sideMat,
+            tipMat: tipMat,
+            bladeLength: bladeLength);
     }
 
     /// <summary>

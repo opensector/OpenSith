@@ -48,6 +48,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
     private readonly List<AiSoundEvent> _soundEvents = [];
     private readonly List<Projectile> _projectiles = [];
     private readonly Dictionary<string, int> _activeLoopingSounds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<int, int> _attachedSoundThings = new();
     private int _nextHeadlessSoundChannel = 1;
     private readonly IAudioSink? _audio;
     private bool _startupRun;
@@ -87,6 +88,14 @@ public sealed partial class WorldSimulation : ICogWorldContext
     private readonly Dictionary<int, int> _thingParents = new();
     private readonly Dictionary<int, float> _thingLights = new();
     private readonly Dictionary<int, int> _thingCollideTypes = new();
+    private readonly record struct SpawnMarker(int ThingIndex, Vector3 Position, Vector3 PitchYawRoll, int SectorIndex);
+
+    private readonly HashSet<int> _replicatedDynamicThings = [];
+    private readonly List<SpawnMarker> _initialSpawnMarkers = [];
+    private readonly Vector3[] _initialThingPositions;
+    private readonly Vector3[] _initialThingPyrs;
+    private readonly uint[] _initialThingFlags;
+    private readonly int[] _initialThingSectors;
     private int _nextKeyTrackId = 1;
 
     /// <summary>
@@ -134,13 +143,17 @@ public sealed partial class WorldSimulation : ICogWorldContext
     public Action<int, float>? OnSectorLightChanged;
     public Action<int, Vector2, float>? OnSurfaceScroll;
     public event Action<int, string, bool>? OnPlayThingKeyframe;
+    public event Action<int, int, string, string>? OnPlayerKilled;
+    public event Action<int, Vector3, Vector3, int>? OnPlayerRespawned;
+    public event Action<int, int, string, Vector3, float>? OnLoopingSoundStarted;
+    public event Action<int, float>? OnLoopingSoundStopped;
 
     public static readonly Vector3 BoltColorRed = new(1.0f, 0.12f, 0.06f);
     public static readonly Vector3 BoltColorGreen = new(0.15f, 1.0f, 0.25f);
     public static readonly Vector3 BoltColorGold = new(1.0f, 0.78f, 0.12f);
 
     /// <summary>
-    /// Active 3D blaster projectile travelling through the level.
+    /// Active 3D blaster/ordnance projectile travelling through the level.
     /// </summary>
     public sealed class Projectile
     {
@@ -148,6 +161,8 @@ public sealed partial class WorldSimulation : ICogWorldContext
         public Vector3 Velocity;
         public Vector3 Direction;
         public float Damage;
+        public float MinDamage;
+        public float DamageDecayRate;
         public float Lifetime;
         public int OwnerThingIndex;
         public bool IsEnemy;
@@ -155,7 +170,15 @@ public sealed partial class WorldSimulation : ICogWorldContext
         public Vector3 BoltColor = BoltColorRed;
         public bool UseGravity;
         public bool Bounce;
+        public bool LaserBounce;
+        public int BouncesRemaining;
+        public bool Sticky;
+        public bool IsStuck;
+        public float ArmedElapsed;
+        public bool ProximityDetonate;
+        public float ProximityRange = 0.45f;
         public bool ExplodeOnImpact = true;
+        public bool ExplodeOnTimeout;
         public string? ExplodeTemplate;
         public string? FleshHitTemplate;
         public int DamageClass = 2;
@@ -238,6 +261,12 @@ public sealed partial class WorldSimulation : ICogWorldContext
         public int LastDamagerThingId = -1;
     }
 
+    private readonly IReadOnlyList<ModelSelectionEntry> _modelCatalog;
+    private readonly IReadOnlyList<SaberColorOption> _saberCatalog;
+
+    public IReadOnlyList<ModelSelectionEntry> ModelCatalog => _modelCatalog;
+    public IReadOnlyList<SaberColorOption> SaberCatalog => _saberCatalog;
+
     public int ActiveCogCount => _cogVm.Instances.Count;
     public int ActiveNpcCount => _npcs.Count;
     public int FramedThingCount => _thingFrames.Count;
@@ -262,6 +291,8 @@ public sealed partial class WorldSimulation : ICogWorldContext
         IsDedicatedServer = isDedicatedServer;
         _strings = UniStringTable.LoadFromVfs(_vfs);
         _itemDefinitions = LoadItemDefinitions(_vfs);
+        _modelCatalog = PlayerCustomizationCatalog.LoadModels(_vfs);
+        _saberCatalog = PlayerCustomizationCatalog.LoadSaberColors(_vfs);
         _surfaceToSector = BuildSurfaceToSectorMap(_level);
         _cogVm = new CogVm(this)
         {
@@ -305,13 +336,83 @@ public sealed partial class WorldSimulation : ICogWorldContext
             _players.Add(localPlayer);
         }
 
+        _initialSpawnMarkers.Clear();
+        foreach (var t in _level.Things)
+        {
+            if (t.IsPlayerSpawn)
+                _initialSpawnMarkers.Add(new SpawnMarker(t.ThingIndex, t.Position, t.PitchYawRoll, t.SectorIndex));
+        }
+
+        if (isDedicatedServer || isMultiplayer)
+        {
+            foreach (var t in _level.Things)
+            {
+                if (t.IsPlayerSpawn && !_playersByThing.ContainsKey(t.ThingIndex))
+                {
+                    t.ThingFlags |= (uint)(SithThingFlags.Disabled | SithThingFlags.Invisible);
+                    t.IsNonSolid = true;
+                    _thingFlags[t.ThingIndex] = (int)t.ThingFlags;
+                }
+            }
+        }
+
         InitializeAdjoinSnapshots();
         InitializeGeoModes();
         ParseThingFrames();
         LoadLevelCogs();
         LoadNpcs();
+
+        _initialThingPositions = new Vector3[_level.Things.Count];
+        _initialThingPyrs = new Vector3[_level.Things.Count];
+        _initialThingFlags = new uint[_level.Things.Count];
+        _initialThingSectors = new int[_level.Things.Count];
+        for (int i = 0; i < _level.Things.Count; i++)
+        {
+            _initialThingPositions[i] = _level.Things[i].Position;
+            _initialThingPyrs[i] = _level.Things[i].PitchYawRoll;
+            _initialThingFlags[i] = _level.Things[i].ThingFlags;
+            _initialThingSectors[i] = _level.Things[i].SectorIndex;
+        }
+
         if (runStartupCogs)
             StartLevel();
+    }
+
+    /// <summary>
+    /// Returns all initial player spawn markers present in the loaded level.
+    /// </summary>
+    public IReadOnlyList<JklThing> GetAllPlayerSpawns() =>
+        _initialSpawnMarkers.ConvertAll(m => _level.Things[m.ThingIndex]);
+
+    private SpawnMarker? PickBestMultiplayerSpawnMarker(int excludeThingId = -1, bool requireUnused = false)
+    {
+        SpawnMarker? best = null;
+        float bestMinDistSq = -1f;
+
+        foreach (var marker in _initialSpawnMarkers)
+        {
+            if (requireUnused && _playersByThing.ContainsKey(marker.ThingIndex))
+                continue;
+
+            float minDistSq = float.MaxValue;
+            foreach (var other in _players)
+            {
+                if (other.ThingIndex == excludeThingId || other.Inventory.IsDead)
+                    continue;
+
+                float dSq = Vector3.DistanceSquared(marker.Position, GetPlayerWorldPos(other));
+                if (dSq < minDistSq)
+                    minDistSq = dSq;
+            }
+
+            if (best == null || minDistSq > bestMinDistSq)
+            {
+                best = marker;
+                bestMinDistSq = minDistSq;
+            }
+        }
+
+        return best;
     }
 
     /// <summary>
@@ -319,38 +420,65 @@ public sealed partial class WorldSimulation : ICogWorldContext
     /// </summary>
     public PlayerState AddPlayer(int playerSlot, string name = "", int team = 0)
     {
-        JklThing? candidateSpawn = null;
-        foreach (var t in _level.Things)
-        {
-            if (t.IsPlayerSpawn && !_playersByThing.ContainsKey(t.ThingIndex))
-            {
-                candidateSpawn = t;
-                break;
-            }
-        }
+        SpawnMarker? candidateMarker = PickBestMultiplayerSpawnMarker(requireUnused: true);
 
         int thingIndex;
-        if (candidateSpawn != null)
+        if (candidateMarker is { } marker)
         {
-            thingIndex = candidateSpawn.ThingIndex;
-            candidateSpawn.ThingFlags &= ~(uint)(SithThingFlags.Disabled | SithThingFlags.Destroyed | SithThingFlags.Invisible);
+            thingIndex = marker.ThingIndex;
+            var candidateSpawn = _level.Things[thingIndex];
+            candidateSpawn.Position = marker.Position;
+            candidateSpawn.PitchYawRoll = marker.PitchYawRoll;
+            candidateSpawn.SectorIndex = marker.SectorIndex;
+            uint baseFlags = thingIndex < _initialThingFlags.Length
+                ? _initialThingFlags[thingIndex]
+                : candidateSpawn.ThingFlags;
+            candidateSpawn.ThingFlags = baseFlags & ~(uint)(SithThingFlags.Disabled | SithThingFlags.Destroyed | SithThingFlags.Invisible);
             candidateSpawn.IsNonSolid = false;
             _thingFlags[thingIndex] = (int)candidateSpawn.ThingFlags;
         }
         else
         {
-            var templateSpawn = _level.GetPlayerSpawn();
+            SpawnMarker? baseMarker = PickBestMultiplayerSpawnMarker(requireUnused: false);
+            var fallbackSpawn = _level.GetPlayerSpawn();
+            Vector3 spawnPos = baseMarker?.Position ?? fallbackSpawn?.Position ?? Vector3.Zero;
+            Vector3 spawnPyr = baseMarker?.PitchYawRoll ?? fallbackSpawn?.PitchYawRoll ?? Vector3.Zero;
+            int spawnSector = baseMarker?.SectorIndex ?? fallbackSpawn?.SectorIndex ?? 0;
+
+            bool crowded = false;
+            foreach (var existing in _players)
+            {
+                if (Vector3.DistanceSquared(spawnPos, GetPlayerWorldPos(existing)) < 0.04f)
+                {
+                    crowded = true;
+                    break;
+                }
+            }
+
+            if (crowded)
+            {
+                float angle = (playerSlot % 8) * (MathF.PI * 0.25f);
+                Vector3 candidateOffset = new(MathF.Cos(angle) * 0.25f, MathF.Sin(angle) * 0.25f, 0f);
+                Vector3 rayStart = spawnPos + new Vector3(0f, 0f, 0.12f);
+                Vector3 rayEnd = rayStart + candidateOffset;
+                spawnPos = TryRaycastWorldWithHit(rayStart, rayEnd, out Vector3 hitPt, out _, out _)
+                    ? Vector3.Lerp(spawnPos, new Vector3(hitPt.X, hitPt.Y, spawnPos.Z), 0.5f)
+                    : spawnPos + candidateOffset;
+            }
+
             thingIndex = _level.Things.Count;
-            _level.Things.Add(new JklThing
+            var addedThing = new JklThing
             {
                 ThingIndex = thingIndex,
-                TemplateName = templateSpawn?.TemplateName ?? "walkplayer",
-                SectorIndex = templateSpawn?.SectorIndex ?? 0,
-                Position = templateSpawn?.Position ?? Vector3.Zero,
-                PitchYawRoll = templateSpawn?.PitchYawRoll ?? Vector3.Zero,
+                TemplateName = fallbackSpawn?.TemplateName ?? "walkplayer",
+                SectorIndex = spawnSector,
+                Position = spawnPos,
+                PitchYawRoll = spawnPyr,
                 Model3D = "ky.3do",
                 ThingFlags = (uint)(SithThingFlags.EmitLight | SithThingFlags.Captured | SithThingFlags.Splashes)
-            });
+            };
+            _level.Things.Add(addedThing);
+            _thingFlags[thingIndex] = (int)addedThing.ThingFlags;
         }
 
         var spawnThing = _level.Things[thingIndex];
@@ -396,7 +524,113 @@ public sealed partial class WorldSimulation : ICogWorldContext
     }
 
     /// <summary>
-    /// Removes a player from the active session and clears its thing state.
+    /// Applies character model, lightsaber color, Force rank/powers, and optional all-weapons
+    /// sandbox grant to player <paramref name="thingId"/> (used by SP menus, CLI flags, and MP sync).
+    /// </summary>
+    public void ApplyPlayerCustomization(int thingId, PlayerLoadoutConfig config, bool refillVitalsAndAmmo = true)
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        if (!TryResolvePlayer(thingId, out var player))
+            return;
+
+        PlayerLoadoutConfig applied = config.Clone();
+        applied.ClampToPolicy(
+            PlayerLoadoutConfig.MaxJediRank,
+            allowAllWeapons: true,
+            _modelCatalog.Count,
+            _saberCatalog.Count);
+
+        player.Loadout = applied;
+        player.ModelIndex = applied.ModelIndex;
+        player.SaberColorIndex = applied.SaberColorIndex;
+
+        if (_modelCatalog.Count > 0 &&
+            player.ThingIndex >= 0 &&
+            player.ThingIndex < _level.Things.Count)
+        {
+            _level.Things[player.ThingIndex].Model3D = _modelCatalog[player.ModelIndex].Model3D;
+        }
+
+        SaberColorOption saber = PlayerCustomizationCatalog.ResolveSaberOption(_saberCatalog, player.SaberColorIndex);
+        JkSetSaberInfo(
+            player.ThingIndex,
+            saber.SideMaterial,
+            saber.TipMaterial,
+            0.0032f,
+            0.0018f,
+            0.12f,
+            "+ssparks_wall",
+            "+ssparks_blood",
+            "+ssparks_saber");
+
+        int rank = Math.Clamp(applied.JediRank, 0, PlayerLoadoutConfig.MaxJediRank);
+        player.Inventory.ForceRank = rank;
+        float maxMana = player.Inventory.MaxForceMana;
+        player.Inventory.ForceMana = refillVitalsAndAmmo
+            ? maxMana
+            : MathF.Min(player.Inventory.ForceMana, maxMana);
+
+        int firstUnlockedForceBin = -1;
+        for (int i = 0; i < PlayerCustomizationCatalog.ForcePowers.Count; i++)
+        {
+            int bin = PlayerCustomizationCatalog.ForcePowers[i].Bin;
+            int pRank = rank > 0 ? Math.Clamp((int)applied.ForceRanks[i], 0, PlayerLoadoutConfig.MaxForcePowerRank) : 0;
+            player.Inventory.SetInv(bin, pRank);
+            player.Inventory.SetInvAvailable(bin, pRank > 0);
+            if (firstUnlockedForceBin < 0 && pRank > 0)
+                firstUnlockedForceBin = bin;
+        }
+
+        if (player.Inventory.GetInv(player.SelectedForceBin) <= 0f && firstUnlockedForceBin > 0)
+            player.SelectedForceBin = firstUnlockedForceBin;
+
+        bool canGrantWeapons = applied.GrantAllWeapons &&
+            (refillVitalsAndAmmo || (!player.SandboxWeaponsGranted && !player.Inventory.IsDead));
+        if (canGrantWeapons)
+        {
+            int[] singleBins =
+            [
+                PlayerInventory.BinFists,
+                PlayerInventory.BinBryar,
+                PlayerInventory.BinStRifle,
+                PlayerInventory.BinBowcaster,
+                PlayerInventory.BinRepeater,
+                PlayerInventory.BinRailDet,
+                PlayerInventory.BinConcRifle,
+                PlayerInventory.BinLightsaber
+            ];
+            foreach (int bin in singleBins)
+            {
+                player.Inventory.SetInv(bin, 1f);
+                player.Inventory.SetInvAvailable(bin, true);
+            }
+
+            if (player.Inventory.GetInv(PlayerInventory.BinThermDet) < 20f)
+                player.Inventory.SetInv(PlayerInventory.BinThermDet, 20f);
+            if (player.Inventory.GetInv(PlayerInventory.BinSeqCharge) < 20f)
+                player.Inventory.SetInv(PlayerInventory.BinSeqCharge, 20f);
+            if (player.Inventory.RailCharges < 30f)
+                player.Inventory.RailCharges = 30f;
+            if (player.Inventory.EnergyAmmo < 500f)
+                player.Inventory.EnergyAmmo = 500f;
+            if (player.Inventory.PowerAmmo < 500f)
+                player.Inventory.PowerAmmo = 500f;
+
+            if (refillVitalsAndAmmo)
+            {
+                if (player.Inventory.Battery < 200f)
+                    player.Inventory.Battery = 200f;
+                if (player.Inventory.Shields < 100f)
+                    player.Inventory.Shields = 100f;
+            }
+            player.Inventory.SetInvAvailable(PlayerInventory.BinThermDet, true);
+            player.Inventory.SetInvAvailable(PlayerInventory.BinSeqCharge, true);
+            player.SandboxWeaponsGranted = true;
+        }
+    }
+
+    /// <summary>
+    /// Removes a player from the active session and clears all per-thing runtime state.
     /// </summary>
     public bool RemovePlayer(int thingIndex)
     {
@@ -422,6 +656,25 @@ public sealed partial class WorldSimulation : ICogWorldContext
         _activeCogPlayerContext = _activeCogPlayerContext == thingIndex ? null : _activeCogPlayerContext;
         if (_localPlayerThingIndex == thingIndex)
             _localPlayerThingIndex = -1;
+
+        _actorFlags.Remove(thingIndex);
+        _actorExtraSpeeds.Remove(thingIndex);
+        _jkFlags.Remove(thingIndex);
+        StopAllLoopingSoundsForThing(thingIndex, 0.05f);
+        _thingVelocities.Remove(thingIndex);
+        _thingRotVels.Remove(thingIndex);
+        _thingTimers.Remove(thingIndex);
+        _thingPulses.Remove(thingIndex);
+        _weaponMeshes.Remove(thingIndex);
+        _saberInfos.Remove(thingIndex);
+        _amputatedJoints.Remove(thingIndex);
+        _thingLights.Remove(thingIndex);
+        _thingParents.Remove(thingIndex);
+        _thingAttachFlags.Remove(thingIndex);
+        _hiddenBySim.Remove(thingIndex);
+        _curGeoModes.Remove(thingIndex);
+        _thingCollideTypes.Remove(thingIndex);
+        _thingUserData.Remove(thingIndex);
 
         if (thingIndex >= 0 && thingIndex < _level.Things.Count)
             DestroyThing(thingIndex);
@@ -487,6 +740,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
         {
             velocity = player.VelocityOverride;
             player.HasVelocityOverride = false;
+            _thingVelocities.Remove(playerThingId);
             return true;
         }
 
@@ -992,6 +1246,12 @@ public sealed partial class WorldSimulation : ICogWorldContext
         UpdatePlayerWeapons(dt);
         UpdateThingMotions(dt);
 
+        if (_attachedSoundThings.Count > 0 && _audio != null && _audio.IsAvailable)
+        {
+            foreach (var (channelId, ownerThingId) in _attachedSoundThings)
+                _audio.SetSoundPosition(channelId, GetThingPos(ownerThingId));
+        }
+
         try
         {
             _cogVm.Update(dt);
@@ -1107,32 +1367,108 @@ public sealed partial class WorldSimulation : ICogWorldContext
 
     /// <summary>
     /// Resets player health and shields for respawn while preserving level progress and inventory.
+    /// In multiplayer sessions, restores standard gear and relocates the player to a safe spawn point.
     /// </summary>
     public void RespawnPlayer(int thingId = -1)
     {
         if (!TryResolvePlayer(thingId, out var player))
             return;
 
+        _destroyedThings.Remove(player.ThingIndex);
         player.Inventory.ResetForRespawn();
         player.StatusMessage = null;
         player.StatusTimer = 0f;
         player.ActiveFireMode = -1;
+        player.FireRate = 0f;
         player.FireWait = 0f;
         player.MountWait = 0f;
+        player.FireHoldElapsed = 0f;
+        player.FiredThisTick = false;
+        player.ActiveBinFireTimers.Clear();
+        StopAllLoopingSoundsForThing(player.ThingIndex, 0.05f);
         player.SaberDamageActive = false;
-
-        var spawn = _level.GetPlayerSpawn();
-        player.PrevSectorIndex = spawn?.SectorIndex ?? -1;
+        player.SaberActiveTimer = 0f;
+        player.SaberHitThisSwing.Clear();
+        player.HasVelocityOverride = false;
+        player.VelocityOverride = Vector3.Zero;
+        player.PendingPlatformDelta = Vector3.Zero;
+        player.SandboxWeaponsGranted = false;
+        _thingVelocities.Remove(player.ThingIndex);
 
         if (IsMultiplayer)
         {
+            ClearActorFlags(player.ThingIndex, 0x4 | 0x80 | 0x800 | 0x40000);
+            _actorExtraSpeeds.Remove(player.ThingIndex);
+            _jkFlags[player.ThingIndex] = 0;
+            player.InvActivated.Clear();
+            player.BinWaitTimers.Clear();
+            player.ActiveBinStartTime.Clear();
+
+            player.Inventory.Shields = 100f;
+            player.Inventory.EnergyAmmo = MathF.Max(player.Inventory.EnergyAmmo, 50f);
+            player.Inventory.Battery = 100f;
+            player.Inventory.SetInv(PlayerInventory.BinFists, 1f);
+            player.Inventory.HasBryar = true;
+            player.Inventory.HasLightsaber = true;
+            player.Inventory.SetInv(PlayerInventory.BinFieldLight, 1f);
+            player.Inventory.SetInvAvailable(PlayerInventory.BinFieldLight, true);
+
+            SpawnMarker? marker = PickBestMultiplayerSpawnMarker(excludeThingId: player.ThingIndex, requireUnused: false);
+            var fallbackSpawn = _level.GetPlayerSpawn();
+            Vector3 spawnPos = marker?.Position ?? fallbackSpawn?.Position ?? Vector3.Zero;
+            Vector3 spawnPyr = marker?.PitchYawRoll ?? fallbackSpawn?.PitchYawRoll ?? Vector3.Zero;
+            int spawnSector = marker?.SectorIndex ?? fallbackSpawn?.SectorIndex ?? 0;
+
+            if (player.ThingIndex >= 0 && player.ThingIndex < _level.Things.Count)
+            {
+                var pt = _level.Things[player.ThingIndex];
+                pt.Position = spawnPos;
+                pt.PitchYawRoll = spawnPyr;
+                pt.SectorIndex = spawnSector;
+                uint baseFlags = player.ThingIndex < _initialThingFlags.Length
+                    ? _initialThingFlags[player.ThingIndex]
+                    : pt.ThingFlags;
+                pt.ThingFlags = baseFlags & ~(uint)(SithThingFlags.Disabled | SithThingFlags.Destroyed | SithThingFlags.Invisible);
+                pt.IsNonSolid = false;
+                _thingFlags[player.ThingIndex] = (int)pt.ThingFlags;
+            }
+
+            player.WorldPosition = spawnPos;
+            player.HasInputPosition = true;
+            player.PrevSectorIndex = spawnSector;
+            float yawRad = spawnPyr.Y * (MathF.PI / 180f);
+            player.AimDirection = Vector3.Normalize(new Vector3(-MathF.Sin(yawRad), MathF.Cos(yawRad), 0f));
+            player.HasAimDirection = true;
+
+            bool hadNewPlayerCog = false;
             var classCog = GetOrCreatePlayerClassCog(player);
             if (classCog != null && classCog.Program.Labels.ContainsKey("newplayer"))
             {
+                hadNewPlayerCog = true;
                 WithPlayerCogContext(player.ThingIndex, () =>
                     SafeSendMessage(classCog, "newplayer", senderRef: player.ThingIndex, senderId: 0, sourceRef: player.ThingIndex, senderType: 3));
             }
+
+            if (!hadNewPlayerCog)
+            {
+                int fallbackWeapon = AutoSelectWeapon(player.ThingIndex, 0);
+                SelectWeapon(player.ThingIndex, fallbackWeapon > 0 ? fallbackWeapon : PlayerInventory.BinBryar);
+            }
+
+            if (player.Loadout != null)
+                ApplyPlayerCustomization(player.ThingIndex, player.Loadout);
+
+            OnPlayerRespawned?.Invoke(player.ThingIndex, spawnPos, spawnPyr, spawnSector);
+            if (player.ThingIndex == _localPlayerThingIndex)
+                OnPlayerTeleported?.Invoke(spawnPos, spawnPyr, spawnSector);
+            return;
         }
+
+        if (player.Loadout != null)
+            ApplyPlayerCustomization(player.ThingIndex, player.Loadout);
+
+        var singleSpawn = _level.GetPlayerSpawn();
+        player.PrevSectorIndex = singleSpawn?.SectorIndex ?? -1;
     }
 
     /// <summary>
@@ -3123,7 +3459,12 @@ public sealed partial class WorldSimulation : ICogWorldContext
                 _audio?.PlaySoundPos("kdie01.wav", _level.Things[victim.ThingIndex].Position, 0.9f, 0.5f, 6.0f);
 
             RecordPlayerDeath(victim, attackerThingId);
+            string attackerName = attackerThingId >= 0 && _playersByThing.TryGetValue(attackerThingId, out var attackerPlayer)
+                ? attackerPlayer.Name
+                : (attackerThingId >= 0 && _npcs.TryGetValue(attackerThingId, out var attackerNpc) ? attackerNpc.Thing.TemplateName : string.Empty);
+            OnPlayerKilled?.Invoke(victim.ThingIndex, attackerThingId, victim.Name, attackerName);
             DispatchPlayerKilledMessages(victim, attackerThingId);
+            StopAllLoopingSoundsForThing(victim.ThingIndex, 0.05f);
         }
 
         Console.WriteLine($"[COMBAT] Player Thing {victim.ThingIndex} hit by Thing {attackerThingId} for {damage:F0} dmg (HP={victim.Inventory.Health:F0}, Shields={victim.Inventory.Shields:F0})");
@@ -3209,10 +3550,30 @@ public sealed partial class WorldSimulation : ICogWorldContext
         return (resolvedModel, BoltColorRed);
     }
 
-    private static Vector3 ResolveBoltColorForModel(string? modelName)
+    private static Vector3 ResolveBoltColorForModel(string? modelName, string? templateName = null)
     {
+        if (!string.IsNullOrWhiteSpace(templateName))
+        {
+            string tmplLow = templateName.ToLowerInvariant();
+            if (tmplLow.Contains("conc"))
+                return new Vector3(0.30f, 0.84f, 1.00f);
+            if (tmplLow.Contains("crossbow"))
+                return new Vector3(0.20f, 1.00f, 0.55f);
+            if (tmplLow.Contains("raildet"))
+                return new Vector3(1.00f, 0.45f, 0.12f);
+            if (tmplLow.Contains("force_dest"))
+                return new Vector3(0.95f, 0.92f, 0.40f);
+        }
+
         if (string.IsNullOrWhiteSpace(modelName))
             return BoltColorRed;
+
+        if (modelName.Contains("con", StringComparison.OrdinalIgnoreCase))
+            return new Vector3(0.30f, 0.84f, 1.00f);
+        if (modelName.Contains("bow", StringComparison.OrdinalIgnoreCase))
+            return new Vector3(0.20f, 1.00f, 0.55f);
+        if (modelName.Contains("rld", StringComparison.OrdinalIgnoreCase))
+            return new Vector3(1.00f, 0.45f, 0.12f);
 
         if (modelName.Contains("bry1", StringComparison.OrdinalIgnoreCase) ||
             modelName.Contains("grlaser", StringComparison.OrdinalIgnoreCase) ||
@@ -3244,10 +3605,51 @@ public sealed partial class WorldSimulation : ICogWorldContext
             proj.Lifetime -= dt;
             if (proj.Lifetime <= 0f)
             {
-                if (!string.IsNullOrWhiteSpace(proj.ExplodeTemplate) && proj.Bounce)
+                if (!string.IsNullOrWhiteSpace(proj.ExplodeTemplate) && proj.ExplodeOnTimeout)
                     TriggerExplosion(proj.Position, proj.ExplodeTemplate, proj.OwnerThingIndex);
 
                 _projectiles.RemoveAt(i);
+                continue;
+            }
+
+            if (proj.IsStuck)
+            {
+                proj.ArmedElapsed += dt;
+                if (proj.ProximityDetonate && proj.ArmedElapsed >= 0.8f)
+                {
+                    bool triggered = false;
+                    float rangeSq = proj.ProximityRange * proj.ProximityRange;
+                    foreach (var npc in _npcs.Values)
+                    {
+                        if (!npc.IsAlive || npc.Thing.ThingIndex == proj.OwnerThingIndex)
+                            continue;
+                        if (Vector3.DistanceSquared(proj.Position, npc.Thing.Position + new Vector3(0f, 0f, 0.10f)) <= rangeSq)
+                        {
+                            triggered = true;
+                            break;
+                        }
+                    }
+
+                    if (!triggered)
+                    {
+                        foreach (var targetPlayer in _players)
+                        {
+                            if (targetPlayer.Inventory.IsDead || targetPlayer.ThingIndex == proj.OwnerThingIndex)
+                                continue;
+                            if (Vector3.DistanceSquared(proj.Position, GetPlayerWorldPos(targetPlayer) + new Vector3(0f, 0f, 0.10f)) <= rangeSq)
+                            {
+                                triggered = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (triggered)
+                    {
+                        TriggerExplosion(proj.Position, proj.ExplodeTemplate, proj.OwnerThingIndex);
+                        _projectiles.RemoveAt(i);
+                    }
+                }
                 continue;
             }
 
@@ -3294,7 +3696,7 @@ public sealed partial class WorldSimulation : ICogWorldContext
                 if (targetPlayer.ThingIndex < 0 || targetPlayer.ThingIndex >= _level.Things.Count)
                     continue;
 
-                Vector3 targetTorso = _level.Things[targetPlayer.ThingIndex].Position + new Vector3(0f, 0f, 0.13f);
+                Vector3 targetTorso = GetPlayerWorldPos(targetPlayer) + new Vector3(0f, 0f, 0.13f);
                 float hitRadius = 0.08f + proj.Radius;
                 float distSq = DistanceSqPointToSegment(targetTorso, start, endPos, out float segT);
                 if (distSq <= hitRadius * hitRadius && segT < bestT)
@@ -3395,11 +3797,38 @@ public sealed partial class WorldSimulation : ICogWorldContext
 
             if (hitWall)
             {
+                Vector3 fallbackNormal = proj.Direction.LengthSquared() > 1e-6f
+                    ? Vector3.Normalize(-proj.Direction)
+                    : Vector3.UnitZ;
+                Vector3 normal = hitSurfaceId >= 0 && hitSurfaceId < _level.Surfaces.Count
+                    ? _level.Surfaces[hitSurfaceId].Normal
+                    : fallbackNormal;
+
+                if (proj.Sticky)
+                {
+                    proj.Position = endPos + normal * 0.015f;
+                    proj.Velocity = Vector3.Zero;
+                    proj.UseGravity = false;
+                    proj.IsStuck = true;
+                    _audio?.PlaySoundPos("ThermClick01.wav", proj.Position, 0.55f, 0.3f, 5.0f);
+                    continue;
+                }
+
+                if (proj.LaserBounce && proj.BouncesRemaining > 0)
+                {
+                    Vector3 reflected = Vector3.Reflect(proj.Velocity, normal) * 0.95f;
+                    proj.Velocity = reflected;
+                    proj.Position = endPos + normal * 0.015f;
+                    if (reflected.LengthSquared() > 1e-6f)
+                        proj.Direction = Vector3.Normalize(reflected);
+                    proj.BouncesRemaining--;
+                    _audio?.PlaySoundPos("ricochet01.wav", endPos, 0.55f, 0.3f, 5.0f);
+                    SpawnSparks(endPos, normal, count: 8);
+                    continue;
+                }
+
                 if (proj.Bounce && !proj.ExplodeOnImpact)
                 {
-                    Vector3 normal = hitSurfaceId >= 0 && hitSurfaceId < _level.Surfaces.Count
-                        ? _level.Surfaces[hitSurfaceId].Normal
-                        : Vector3.UnitZ;
                     Vector3 reflected = Vector3.Reflect(proj.Velocity, normal) * 0.55f;
                     if (reflected.LengthSquared() < 0.04f)
                         reflected = Vector3.Zero;
@@ -3421,6 +3850,8 @@ public sealed partial class WorldSimulation : ICogWorldContext
             }
 
             proj.Position = nextPos;
+            if (proj.DamageDecayRate > 0f && proj.Damage > proj.MinDamage)
+                proj.Damage = MathF.Max(proj.MinDamage, proj.Damage - proj.DamageDecayRate * dt);
         }
     }
 
@@ -3913,25 +4344,73 @@ public sealed partial class WorldSimulation : ICogWorldContext
             return 0;
 
         bool looping = (flags & 0x01) != 0;
+        bool followThing = (flags & 0x80) != 0 || (flags & 0x100) != 0;
         string loopKey = looping ? $"{thingId}:{sound}" : string.Empty;
         if (looping && _activeLoopingSounds.TryGetValue(loopKey, out int existingChannel))
             return existingChannel;
 
+        Vector3 pos = GetThingPos(thingId);
         if (_audio == null || !_audio.IsAvailable)
         {
             int synthetic = _nextHeadlessSoundChannel++;
             if (looping)
+            {
                 _activeLoopingSounds[loopKey] = synthetic;
+                if (followThing)
+                    _attachedSoundThings[synthetic] = thingId;
+                OnLoopingSoundStarted?.Invoke(synthetic, followThing ? thingId : -1, sound, pos, volume);
+            }
             return synthetic;
         }
 
-        Vector3 pos = GetThingPos(thingId);
         float minR = minRad > 0f ? minRad : 0.5f;
         float maxR = maxRad > minR ? maxRad : 8.0f;
-        int channel = _audio.PlaySoundPos(sound, pos, volume, minR, maxR, looping);
+        bool isLocalListenerLoop = !IsDedicatedServer && looping && followThing && thingId == _localPlayerThingIndex;
+        int channel = isLocalListenerLoop
+            ? _audio.PlaySoundLocal(sound, volume, looping: true)
+            : _audio.PlaySoundPos(sound, pos, volume, minR, maxR, looping);
+
         if (looping && channel > 0)
+        {
             _activeLoopingSounds[loopKey] = channel;
+            if (followThing && !isLocalListenerLoop)
+                _attachedSoundThings[channel] = thingId;
+            OnLoopingSoundStarted?.Invoke(channel, followThing ? thingId : -1, sound, pos, volume);
+        }
         return channel;
+    }
+
+    private void StopAllLoopingSoundsForThing(int thingId, float fadeOut = 0.05f)
+    {
+        if (_activeLoopingSounds.Count == 0 && _attachedSoundThings.Count == 0)
+            return;
+
+        List<int>? channels = null;
+        string prefix = $"{thingId}:";
+        foreach (var kvp in _activeLoopingSounds)
+        {
+            if (kvp.Key.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                channels ??= [];
+                if (!channels.Contains(kvp.Value))
+                    channels.Add(kvp.Value);
+            }
+        }
+        foreach (var kvp in _attachedSoundThings)
+        {
+            if (kvp.Value == thingId)
+            {
+                channels ??= [];
+                if (!channels.Contains(kvp.Key))
+                    channels.Add(kvp.Key);
+            }
+        }
+
+        if (channels != null)
+        {
+            foreach (int ch in channels)
+                StopSound(ch, fadeOut);
+        }
     }
 
     public void PlaySoundLocal(string sound, float volume = 1.0f)
@@ -4036,6 +4515,10 @@ public sealed partial class WorldSimulation : ICogWorldContext
                     TriggerExplosion(pos, template, _activeCogPlayerContext ?? _localPlayerThingIndex);
                 else
                     SpawnVisualEffectFromTemplate(template, pos);
+            }
+            else if (string.Equals(type, "particle", StringComparison.OrdinalIgnoreCase))
+            {
+                SpawnParticleCloudFromTemplate(template, pos);
             }
             else if (!string.IsNullOrWhiteSpace(sprite))
             {
@@ -4833,6 +5316,58 @@ public sealed partial class WorldSimulation : ICogWorldContext
             // Advance 3s post-intro timer (e.g. 07_rahnlines.cog user1 unlock) cleanly
             _cogVm.Update(3.5f);
             ShowStatusMessage("DUEL STARTED", 2.0f);
+        }
+    }
+
+    /// <summary>
+    /// Snapshot of a non-player dynamic entity whose transform or flags changed from level startup.
+    /// </summary>
+    public readonly record struct DynamicThingState(
+        int ThingIndex,
+        Vector3 Position,
+        Vector3 PitchYawRoll,
+        uint ThingFlags,
+        int SectorIndex);
+
+    /// <summary>
+    /// Collects non-player things whose transform, flags, or destruction state diverged from initial level load.
+    /// Untouched stationary framed doors are excluded until activated so level door counts do not exhaust MTU.
+    /// </summary>
+    public void CollectDynamicThingStates(List<DynamicThingState> output)
+    {
+        output.Clear();
+        int count = Math.Min(_level.Things.Count, _initialThingPositions.Length);
+        for (int i = 0; i < count; i++)
+        {
+            if (_playersByThing.ContainsKey(i))
+                continue;
+
+            var t = _level.Things[i];
+            if (t.IsPlayerSpawn)
+                continue;
+
+            bool movedOrChanged =
+                (_thingMotions.TryGetValue(i, out var motion) && (motion.IsMoving || motion.CurrentFrame != 0)) ||
+                _destroyedThings.Contains(i) ||
+                _thingVelocities.ContainsKey(i) ||
+                _thingRotVels.ContainsKey(i) ||
+                t.SectorIndex != _initialThingSectors[i] ||
+                t.ThingFlags != _initialThingFlags[i] ||
+                Vector3.DistanceSquared(t.Position, _initialThingPositions[i]) > 1e-6f ||
+                Vector3.DistanceSquared(t.PitchYawRoll, _initialThingPyrs[i]) > 1e-4f;
+
+            if (movedOrChanged)
+                _replicatedDynamicThings.Add(i);
+
+            if (_replicatedDynamicThings.Contains(i))
+            {
+                output.Add(new DynamicThingState(
+                    t.ThingIndex,
+                    t.Position,
+                    t.PitchYawRoll,
+                    t.ThingFlags,
+                    t.SectorIndex));
+            }
         }
     }
 }

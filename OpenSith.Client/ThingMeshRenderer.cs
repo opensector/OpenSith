@@ -109,6 +109,7 @@ public sealed class ThingMeshRenderer : IDisposable
         public uint Vbo;
         public uint Ebo;
         public List<MaterialBatch> Batches = new();
+        public string ModelName = string.Empty;
         public ThreeDoModel Model = null!;
         public PuppetDefinition? Puppet;
         public KeyframeTrack Keyframe = null!;
@@ -297,6 +298,30 @@ public sealed class ThingMeshRenderer : IDisposable
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Renders a third-person held weapon mesh (e.g. <c>rptg.3do</c>, <c>bryg.3do</c>, <c>sabg.3do</c>)
+    /// attached to the actor's primary weapon joint (<c>k_rhand</c> / PUP joint 3 / node 12).
+    /// </summary>
+    public void RenderAttachedWeaponMesh(ShaderProgram shader, JklThing thing, string? weaponModelName)
+    {
+        if (string.IsNullOrWhiteSpace(weaponModelName))
+            return;
+
+        var gpuModel = GetOrCreateGpuModel(weaponModelName);
+        if (gpuModel == null)
+            return;
+
+        Matrix4x4 thingWorld = SithMatrix34.Build34(thing.PitchYawRoll, thing.Position).ToMatrix4x4();
+        Matrix4x4 weaponWorld = TryGetThingPrimaryWeaponNodeTransform(thing.ThingIndex, out Matrix4x4 handLocal)
+            ? handLocal * thingWorld
+            : Matrix4x4.CreateTranslation(0.0104f, 0.0557f, -0.0129f) * thingWorld;
+
+        shader.SetUniform("uModel", weaponWorld);
+        shader.SetUniform("uAlpha", 1.0f);
+        DrawGpuModel(shader, gpuModel.Vao, gpuModel.Batches);
+        shader.SetUniform("uModel", Matrix4x4.Identity);
     }
 
     public const float ViewmodelVerticalFovDegrees = 73.739795f;
@@ -626,29 +651,25 @@ public sealed class ThingMeshRenderer : IDisposable
             foreach (var fx in effects)
             {
                 float lifeFrac = Math.Clamp(fx.Age / MathF.Max(0.01f, fx.Duration), 0f, 1f);
-                float alpha = Math.Clamp(1.0f - lifeFrac, 0.05f, 1.0f);
-                float scaleCurve = 0.65f + lifeFrac * 0.55f;
-                float w = MathF.Max(0.05f, fx.Width * scaleCurve);
-                float h = MathF.Max(0.05f, fx.Height * scaleCurve);
-
-                Matrix4x4 billboard = new(
-                    right.X * w, right.Y * w, right.Z * w, 0f,
-                    up.X * h, up.Y * h, up.Z * h, 0f,
-                    back.X, back.Y, back.Z, 0f,
-                    fx.Position.X, fx.Position.Y, fx.Position.Z, 1f);
-
-                var texInfo = _textureManager.GetOrCreateTexture(fx.MaterialName);
-                _gl.BindTexture(TextureTarget.Texture2D, texInfo.Handle);
                 if (fx.IsAdditive)
                     _gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.One);
                 else
                     _gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
 
-                shader.SetUniform("uModel", billboard);
-                shader.SetUniform("uTint", fx.ColorTint == Vector3.One ? Vector3.Zero : fx.ColorTint * alpha);
-                shader.SetUniform("uAlpha", alpha);
+                switch (fx.Kind)
+                {
+                    case WorldSimulation.VisualEffectKind.ParticleRing:
+                        RenderParticleRingEffect(shader, quadModel, right, up, back, fx, lifeFrac);
+                        break;
 
-                _gl.DrawElements(PrimitiveType.Triangles, (uint)quadModel.Batches[0].ElementCount, DrawElementsType.UnsignedInt, (void*)0);
+                    case WorldSimulation.VisualEffectKind.BeamTrail:
+                        RenderBeamTrailEffect(shader, camera, quadModel, right, up, back, fx, lifeFrac);
+                        break;
+
+                    default:
+                        RenderBillboardEffect(shader, quadModel, right, up, back, fx, lifeFrac);
+                        break;
+                }
             }
         }
         finally
@@ -681,6 +702,234 @@ public sealed class ThingMeshRenderer : IDisposable
                 _gl.Enable(EnableCap.DepthTest);
             else
                 _gl.Disable(EnableCap.DepthTest);
+        }
+    }
+
+    private unsafe void RenderBillboardEffect(
+        ShaderProgram shader,
+        ThreeDoGpuModel quadModel,
+        Vector3 right,
+        Vector3 up,
+        Vector3 back,
+        WorldSimulation.VisualEffect fx,
+        float lifeFrac)
+    {
+        var cels = _textureManager.GetOrCreateTextureCels(fx.MaterialName);
+        int celIdx = cels.Length > 1 ? Math.Clamp((int)(lifeFrac * cels.Length), 0, cels.Length - 1) : 0;
+        float alpha = cels.Length > 1
+            ? Math.Clamp(1.0f - MathF.Max(0f, lifeFrac - 0.65f) / 0.35f, 0.1f, 1.0f)
+            : Math.Clamp(1.0f - lifeFrac, 0.05f, 1.0f);
+        float scaleCurve = cels.Length > 1 ? (0.85f + lifeFrac * 0.35f) : (0.65f + lifeFrac * 0.55f);
+        float w = MathF.Max(0.05f, fx.Width * scaleCurve);
+        float h = MathF.Max(0.05f, fx.Height * scaleCurve);
+
+        DrawEffectQuad(shader, quadModel, cels[celIdx].Handle, fx.Position, right * w, up * h, back, fx.ColorTint, alpha);
+    }
+
+    private void RenderParticleRingEffect(
+        ShaderProgram shader,
+        ThreeDoGpuModel quadModel,
+        Vector3 right,
+        Vector3 up,
+        Vector3 back,
+        WorldSimulation.VisualEffect fx,
+        float lifeFrac)
+    {
+        uint texHandle = string.IsNullOrWhiteSpace(fx.MaterialName)
+            ? _textureManager.DefaultWhiteTexture
+            : _textureManager.GetOrCreateTexture(fx.MaterialName).Handle;
+        uint whiteHandle = _textureManager.DefaultWhiteTexture;
+
+        float ease = 1.0f - MathF.Pow(1.0f - lifeFrac, 2.2f);
+        float maxRadius = MathF.Max(0.15f, fx.ExpandRadius);
+        float alpha = Math.Clamp((1.0f - lifeFrac) * 1.15f, 0.05f, 1.0f);
+        float size = MathF.Max(0.025f, fx.Width * (1.25f - 0.55f * lifeFrac));
+        bool isFlatRing = fx.PitchSpreadDeg <= 15f;
+        int count = Math.Clamp(fx.ParticleCount > 0 ? fx.ParticleCount : 48, 12, 96);
+        float spreadRad = fx.PitchSpreadDeg * (MathF.PI / 180f);
+        int baseSeed = HashEffectSeed(fx.Position);
+
+        for (int i = 0; i < count; i++)
+        {
+            uint h0 = NextHash((uint)(baseSeed + i * 7919));
+            uint h1 = NextHash(h0);
+            uint h2 = NextHash(h1);
+            float yaw = (i / (float)count) * MathF.Tau + ((h0 & 0x3FF) / 1024f - 0.5f) * 0.45f;
+            float pitch = isFlatRing
+                ? (((h1 & 0x3FF) / 1024f - 0.5f) * 2f * spreadRad)
+                : (MathF.Asin(Math.Clamp(((h1 & 0x3FF) / 512f) - 1f, -0.99f, 0.99f)));
+            float radialScale = isFlatRing ? (0.65f + ((h2 & 0xFF) / 255f) * 0.45f) : (0.35f + ((h2 & 0xFF) / 255f) * 0.70f);
+            float cosP = MathF.Cos(pitch);
+            Vector3 dir = new(cosP * MathF.Cos(yaw), cosP * MathF.Sin(yaw), MathF.Sin(pitch));
+            Vector3 pPos = fx.Position + dir * (maxRadius * ease * radialScale);
+
+            DrawEffectQuad(shader, quadModel, whiteHandle, pPos, right * size, up * size, back, fx.ColorTint, alpha * 0.9f);
+        }
+
+        // Concussion-style outer expanding shockwave halo ring
+        if (isFlatRing)
+        {
+            const int ringDots = 24;
+            float ringR = maxRadius * ease;
+            float dotSize = size * 1.4f;
+            uint haloTex = texHandle != 0 ? texHandle : whiteHandle;
+            for (int i = 0; i < ringDots; i++)
+            {
+                float a = (i / (float)ringDots) * MathF.Tau;
+                Vector3 pPos = fx.Position + new Vector3(MathF.Cos(a) * ringR, MathF.Sin(a) * ringR, 0f);
+                DrawEffectQuad(shader, quadModel, haloTex, pPos, right * dotSize, up * dotSize, back, fx.ColorTint, alpha * 0.75f);
+            }
+        }
+    }
+
+    private unsafe void RenderBeamTrailEffect(
+        ShaderProgram shader,
+        Camera camera,
+        ThreeDoGpuModel quadModel,
+        Vector3 right,
+        Vector3 up,
+        Vector3 back,
+        WorldSimulation.VisualEffect fx,
+        float lifeFrac)
+    {
+        Vector3 delta = fx.EndPosition - fx.Position;
+        float len = delta.Length();
+        if (len < 1e-4f)
+            return;
+
+        Vector3 dir = delta / len;
+        Vector3 ortho1 = Vector3.Cross(dir, Vector3.UnitZ);
+        if (ortho1.LengthSquared() < 1e-5f)
+            ortho1 = Vector3.Cross(dir, Vector3.UnitX);
+        ortho1 = Vector3.Normalize(ortho1);
+        Vector3 ortho2 = Vector3.Normalize(Vector3.Cross(dir, ortho1));
+
+        uint whiteTex = _textureManager.DefaultWhiteTexture;
+        float alpha = Math.Clamp(1.0f - lifeFrac * 0.85f, 0.1f, 1.0f);
+
+        if (fx.JitterRadius > 0.001f)
+        {
+            int steps = Math.Clamp((int)(len / MathF.Max(0.06f, fx.TrailSegmentSize)), 4, 28);
+            int timeBucket = (int)(fx.Age * 33f);
+            int baseSeed = HashEffectSeed(fx.Position) ^ (timeBucket * 48611);
+
+            for (int bolt = 0; bolt < 2; bolt++)
+            {
+                Vector3 prev = fx.Position;
+                for (int s = 1; s <= steps; s++)
+                {
+                    float t = s / (float)steps;
+                    Vector3 pt = Vector3.Lerp(fx.Position, fx.EndPosition, t);
+                    if (s < steps)
+                    {
+                        uint h1 = NextHash((uint)(baseSeed + bolt * 997 + s * 313));
+                        uint h2 = NextHash(h1);
+                        float envelope = MathF.Sin(t * MathF.PI);
+                        float j1 = (((h1 & 0x3FF) / 512f) - 1f) * fx.JitterRadius * envelope * (bolt == 0 ? 1.0f : 1.5f);
+                        float j2 = (((h2 & 0x3FF) / 512f) - 1f) * fx.JitterRadius * envelope * (bolt == 0 ? 1.0f : 1.5f);
+                        pt += ortho1 * j1 + ortho2 * j2;
+                    }
+
+                    DrawBeamRibbon(shader, quadModel, camera, whiteTex, prev, pt, 0.032f, fx.ColorTint, alpha * 0.85f);
+                    DrawBeamRibbon(shader, quadModel, camera, whiteTex, prev, pt, 0.011f, Vector3.One, alpha);
+                    prev = pt;
+                }
+            }
+            return;
+        }
+
+        // Concussion secondary wave: glowing cyan core beam + perpendicular expanding shockwave rings
+        DrawBeamRibbon(shader, quadModel, camera, whiteTex, fx.Position, fx.EndPosition, 0.055f * (1.2f - 0.5f * lifeFrac), fx.ColorTint, alpha * 0.9f);
+        DrawBeamRibbon(shader, quadModel, camera, whiteTex, fx.Position, fx.EndPosition, 0.020f, Vector3.One, alpha);
+
+        float spacing = MathF.Max(0.22f, fx.TrailSegmentSize);
+        int ringCount = Math.Clamp((int)(len / spacing), 2, 24);
+        float ringRadius = 0.03f + lifeFrac * 0.19f;
+        float dotSize = 0.045f * (1.0f - 0.4f * lifeFrac);
+        for (int r = 1; r <= ringCount; r++)
+        {
+            Vector3 center = Vector3.Lerp(fx.Position, fx.EndPosition, r / (float)(ringCount + 1));
+            const int dotsPerRing = 8;
+            for (int d = 0; d < dotsPerRing; d++)
+            {
+                float a = (d / (float)dotsPerRing) * MathF.Tau;
+                Vector3 dotPos = center + (ortho1 * MathF.Cos(a) + ortho2 * MathF.Sin(a)) * ringRadius;
+                DrawEffectQuad(shader, quadModel, whiteTex, dotPos, right * dotSize, up * dotSize, back, fx.ColorTint, alpha * 0.85f);
+            }
+        }
+    }
+
+    private unsafe void DrawBeamRibbon(
+        ShaderProgram shader,
+        ThreeDoGpuModel quadModel,
+        Camera camera,
+        uint texHandle,
+        Vector3 p0,
+        Vector3 p1,
+        float width,
+        Vector3 tint,
+        float alpha)
+    {
+        Vector3 seg = p1 - p0;
+        if (seg.LengthSquared() < 1e-8f)
+            return;
+
+        Vector3 mid = (p0 + p1) * 0.5f;
+        Vector3 tangent = Vector3.Normalize(seg);
+        Vector3 toCam = camera.Position - mid;
+        Vector3 viewDir = toCam.LengthSquared() > 1e-6f ? Vector3.Normalize(toCam) : camera.Forward;
+        Vector3 side = Vector3.Cross(viewDir, tangent);
+        if (side.LengthSquared() < 1e-5f)
+            side = Vector3.Cross(camera.Right, tangent);
+        side = side.LengthSquared() > 1e-5f ? Vector3.Normalize(side) : camera.Right;
+        Vector3 faceNorm = Vector3.Normalize(Vector3.Cross(side, tangent));
+
+        DrawEffectQuad(shader, quadModel, texHandle, mid, side * width, seg, faceNorm, tint, alpha);
+    }
+
+    private unsafe void DrawEffectQuad(
+        ShaderProgram shader,
+        ThreeDoGpuModel quadModel,
+        uint texHandle,
+        Vector3 center,
+        Vector3 axisX,
+        Vector3 axisY,
+        Vector3 axisZ,
+        Vector3 colorTint,
+        float alpha)
+    {
+        Matrix4x4 model = new(
+            axisX.X, axisX.Y, axisX.Z, 0f,
+            axisY.X, axisY.Y, axisY.Z, 0f,
+            axisZ.X, axisZ.Y, axisZ.Z, 0f,
+            center.X, center.Y, center.Z, 1f);
+
+        _gl.BindTexture(TextureTarget.Texture2D, texHandle);
+        shader.SetUniform("uModel", model);
+        shader.SetUniform("uTint", colorTint == Vector3.One ? Vector3.Zero : colorTint * alpha);
+        shader.SetUniform("uAlpha", alpha);
+
+        _gl.DrawElements(PrimitiveType.Triangles, (uint)quadModel.Batches[0].ElementCount, DrawElementsType.UnsignedInt, (void*)0);
+    }
+
+    private static int HashEffectSeed(Vector3 pos)
+    {
+        int hx = (int)MathF.Round(pos.X * 100f);
+        int hy = (int)MathF.Round(pos.Y * 100f);
+        int hz = (int)MathF.Round(pos.Z * 100f);
+        return unchecked((hx * 73856093) ^ (hy * 19349663) ^ (hz * 83492791));
+    }
+
+    private static uint NextHash(uint x)
+    {
+        unchecked
+        {
+            x ^= x >> 16;
+            x *= 0x7feb352du;
+            x ^= x >> 15;
+            x *= 0x846ca68bu;
+            x ^= x >> 16;
+            return x;
         }
     }
 
@@ -829,8 +1078,21 @@ public sealed class ThingMeshRenderer : IDisposable
 
     private AnimatedThingGpu? GetOrCreateAnimatedInstance(JklThing thing, string modelName, JklLevel level)
     {
+        float carriedAnimTime = 0f;
         if (_animatedInstances.TryGetValue(thing.ThingIndex, out var existing))
-            return existing;
+        {
+            if (string.Equals(existing.ModelName, modelName, StringComparison.OrdinalIgnoreCase))
+                return existing;
+
+            carriedAnimTime = existing.AnimTime;
+            if (existing.Puppet != null && !_desiredAnimations.ContainsKey(thing.ThingIndex))
+                _desiredAnimations[thing.ThingIndex] = (existing.Action, existing.Mode, existing.Loop);
+
+            _gl.DeleteBuffer(existing.Vbo);
+            _gl.DeleteBuffer(existing.Ebo);
+            _gl.DeleteVertexArray(existing.Vao);
+            _animatedInstances.Remove(thing.ThingIndex);
+        }
 
         // Determine if template has a puppet (optional for PlayKey-driven 3DOs)
         string? puppetName = FindPuppetForThing(thing, level);
@@ -846,7 +1108,7 @@ public sealed class ThingMeshRenderer : IDisposable
                 {
                     return EnsureAnimatedInstanceForKeyframe(
                         thing, pendingModel, pendingKeyframe,
-                        pending.KeyframeName, pending.Mode, pending.Loop, puppet);
+                        pending.KeyframeName, pending.Mode, pending.Loop, puppet, modelName: modelName, initialAnimTime: carriedAnimTime);
                 }
             }
         }
@@ -870,7 +1132,7 @@ public sealed class ThingMeshRenderer : IDisposable
 
         return EnsureAnimatedInstanceForKeyframe(
             thing, threeDo, keyframe,
-            desired.Item1, desired.Item2, desired.Item3, puppet, submodeFlags);
+            desired.Item1, desired.Item2, desired.Item3, puppet, submodeFlags, modelName, carriedAnimTime);
     }
 
     private AnimatedThingGpu EnsureAnimatedInstanceForKeyframe(
@@ -881,9 +1143,13 @@ public sealed class ThingMeshRenderer : IDisposable
         int mode,
         bool loop,
         PuppetDefinition? puppet = null,
-        int submodeFlags = 0)
+        int submodeFlags = 0,
+        string modelName = "",
+        float initialAnimTime = 0f)
     {
         var animGpu = BuildAnimatedThingGpu(threeDo, keyframe);
+        animGpu.ModelName = modelName;
+        animGpu.AnimTime = initialAnimTime;
         animGpu.Puppet = puppet;
         animGpu.Action = actionOrKeyframeName;
         animGpu.Mode = mode;

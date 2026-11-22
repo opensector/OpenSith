@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Numerics;
 using OpenSith.Core.Cog;
+using OpenSith.Core.Data;
 
 namespace OpenSith.Core.Simulation;
 
@@ -49,6 +50,7 @@ public sealed class PlayerState
     public float FireWait { get; set; }
     public float MountWait { get; set; }
     public float FireHoldElapsed { get; set; }
+    public bool FiredThisTick { get; set; }
     public bool SaberDamageActive { get; set; }
     public float SaberActiveTimer { get; set; }
     public float SaberDamage { get; set; }
@@ -72,6 +74,12 @@ public sealed class PlayerState
     // Per-player COG ownership
     public CogInstance? ClassCog { get; set; }
     public Dictionary<int, CogInstance> BinCogs { get; } = new();
+
+    // Appearance & customization loadout (synced SP & MP)
+    public int ModelIndex { get; set; }
+    public int SaberColorIndex { get; set; } = PlayerCustomizationCatalog.DefaultSaberColorIndex;
+    public PlayerLoadoutConfig? Loadout { get; set; }
+    public bool SandboxWeaponsGranted { get; set; }
 
     // Per-player notifications & trigger tracking
     public string? StatusMessage { get; set; }

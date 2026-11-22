@@ -30,6 +30,11 @@ public sealed partial class WorldSimulation
     /// </summary>
     public event Action<Vector3, Vector3, int>? OnPlayerTeleported;
 
+    /// <summary>
+    /// Invoked when <c>TeleportThing</c> moves any registered player (<c>thingId, pos, pyr, sector</c>).
+    /// </summary>
+    public event Action<int, Vector3, Vector3, int>? OnAnyPlayerTeleported;
+
     private void UpdateThingTimersAndPulses(float dt)
     {
         if (dt <= 0f)
@@ -331,6 +336,7 @@ public sealed partial class WorldSimulation
             player.WorldPosition = dest.Position;
             player.HasInputPosition = true;
             UpdatePlayerSectorTransitions(player, thing.SectorIndex);
+            OnAnyPlayerTeleported?.Invoke(thingId, dest.Position, dest.PitchYawRoll, thing.SectorIndex);
             if (thingId == _localPlayerThingIndex)
                 OnPlayerTeleported?.Invoke(dest.Position, dest.PitchYawRoll, thing.SectorIndex);
         }
@@ -470,6 +476,7 @@ public sealed partial class WorldSimulation
 
     public void StopSound(int channel, float fadeOut)
     {
+        bool wasAttachedOrLooping = channel > 0 && _attachedSoundThings.Remove(channel);
         if (channel > 0 && _activeLoopingSounds.Count > 0)
         {
             List<string>? toRemove = null;
@@ -483,11 +490,14 @@ public sealed partial class WorldSimulation
             }
             if (toRemove != null)
             {
+                wasAttachedOrLooping = true;
                 foreach (string key in toRemove)
                     _activeLoopingSounds.Remove(key);
             }
         }
         _audio?.StopSound(channel, fadeOut);
+        if (wasAttachedOrLooping)
+            OnLoopingSoundStopped?.Invoke(channel, fadeOut);
     }
 
     public void ChangeSoundPitch(int channel, float pitch, float changeTime) =>

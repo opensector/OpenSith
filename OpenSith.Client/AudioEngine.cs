@@ -39,6 +39,7 @@ public sealed unsafe class AudioEngine : IAudioSink, IDisposable
     private readonly List<uint> _loopingSources = [];
     private readonly Dictionary<int, uint> _channelSources = new();
     private readonly Dictionary<uint, int> _sourceChannels = new();
+    private readonly HashSet<int> _relativeChannels = [];
     private readonly Dictionary<int, SoundRampState> _ramps = new();
 
     private ALContext? _alc;
@@ -246,7 +247,9 @@ public sealed unsafe class AudioEngine : IAudioSink, IDisposable
         _al.SetSourceProperty(src, SourceBoolean.Looping, looping);
         _al.SetSourceProperty(src, SourceFloat.Gain, Math.Clamp(volume, 0f, 2f));
         _al.SourcePlay(src);
-        return RegisterChannel(src);
+        int channel = RegisterChannel(src);
+        _relativeChannels.Add(channel);
+        return channel;
     }
 
     /// <summary>
@@ -284,6 +287,18 @@ public sealed unsafe class AudioEngine : IAudioSink, IDisposable
         _al.SetSourceProperty(src, SourceFloat.Gain, Math.Clamp(volume, 0f, 2f));
         _al.SourcePlay(src);
         return RegisterChannel(src);
+    }
+
+    /// <summary>
+    /// Updates the 3D world position of an active positional sound channel.
+    /// </summary>
+    public void SetSoundPosition(int channelId, Vector3 position)
+    {
+        if (!_initialized || _al == null || _disposed || channelId <= 0 || _relativeChannels.Contains(channelId))
+            return;
+
+        if (_channelSources.TryGetValue(channelId, out uint src))
+            _al.SetSourceProperty(src, SourceVector3.Position, position.X, position.Y, position.Z);
     }
 
     /// <summary>
@@ -481,6 +496,7 @@ public sealed unsafe class AudioEngine : IAudioSink, IDisposable
         if (_sourceChannels.Remove(src, out int channelId))
         {
             _channelSources.Remove(channelId);
+            _relativeChannels.Remove(channelId);
             _ramps.Remove(channelId);
         }
     }
@@ -654,6 +670,7 @@ public sealed unsafe class AudioEngine : IAudioSink, IDisposable
                 _loopingSources.Clear();
                 _channelSources.Clear();
                 _sourceChannels.Clear();
+                _relativeChannels.Clear();
                 _ramps.Clear();
 
                 foreach (uint buf in _bufferCache.Values)

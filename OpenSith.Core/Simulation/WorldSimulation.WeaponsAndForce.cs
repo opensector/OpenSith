@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Numerics;
 using OpenSith.Core.AI;
+using OpenSith.Core.Audio;
 using OpenSith.Core.Cog;
 using OpenSith.Core.Data;
 using OpenSith.Core.Materials;
@@ -14,12 +15,21 @@ namespace OpenSith.Core.Simulation;
 
 public sealed partial class WorldSimulation
 {
+    public enum VisualEffectKind : byte
+    {
+        Billboard = 0,
+        ParticleRing = 1,
+        BeamTrail = 2
+    }
+
     /// <summary>
-    /// Active transient sprite/blast/particle visual effect in world space.
+    /// Active transient sprite/blast/particle/beam visual effect in world space.
     /// </summary>
     public sealed class VisualEffect
     {
+        public VisualEffectKind Kind = VisualEffectKind.Billboard;
         public Vector3 Position;
+        public Vector3 EndPosition;
         public string SpriteName = string.Empty;
         public string MaterialName = string.Empty;
         public float Width = 0.25f;
@@ -29,6 +39,11 @@ public sealed partial class WorldSimulation
         public float MaxLight = 0.5f;
         public Vector3 ColorTint = Vector3.One;
         public bool IsAdditive = true;
+        public float ExpandRadius;
+        public int ParticleCount;
+        public float PitchSpreadDeg = 360f;
+        public float TrailSegmentSize = 0.25f;
+        public float JitterRadius;
     }
 
     private static readonly IReadOnlyDictionary<int, string> CanonicalBinCogFallbacks =
@@ -67,10 +82,16 @@ public sealed partial class WorldSimulation
 
     private readonly List<VisualEffect> _visualEffects = [];
     private readonly Dictionary<string, SprSprite?> _sprCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, SoundClass?> _sndCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<CogInstance, int> _playerCogOwners = new();
     private bool _fireWaitExplicitlySet;
 
     public IReadOnlyList<VisualEffect> VisualEffects => _visualEffects;
+
+    /// <summary>
+    /// Invoked whenever a new transient explosion/blast sprite effect is spawned.
+    /// </summary>
+    public event Action<VisualEffect>? OnVisualEffectSpawned;
 
     /// <summary>
     /// Optional explicit Light (1) / Dark (2) campaign alignment choice for <see cref="JkGetChoice"/>.
@@ -247,10 +268,13 @@ public sealed partial class WorldSimulation
 
     public void SelectWeapon(int thingId, int weaponBin)
     {
+        if (!IsValidWeaponBin(weaponBin))
+            return;
+
         if (!TryResolvePlayer(thingId, out var player))
             return;
 
-        if (weaponBin <= 0 || (weaponBin != PlayerInventory.BinFists && player.Inventory.GetInv(weaponBin) <= 0f))
+        if (weaponBin != PlayerInventory.BinFists && player.Inventory.GetInv(weaponBin) <= 0f)
             return;
 
         SelectWeaponInternal(player, weaponBin, assignMode: false);
@@ -273,19 +297,21 @@ public sealed partial class WorldSimulation
         int oldBin = player.CurWeaponBin;
         if (oldBin != weaponBin)
         {
-            player.ActiveFireMode = -1;
-            player.FireRate = 0f;
-            player.FireHoldElapsed = 0f;
-            player.SaberDamageActive = false;
-            player.SaberActiveTimer = 0f;
-            player.SaberHitThisSwing.Clear();
-
             if (player.BinCogs.TryGetValue(oldBin, out var oldCog) &&
                 oldCog.Program.Labels.ContainsKey("deselected"))
             {
                 WithPlayerCogContext(player.ThingIndex, () =>
                     SafeSendMessage(oldCog, "deselected", senderRef: oldBin, senderId: 0, sourceRef: player.ThingIndex, senderType: 3));
             }
+
+            player.ActiveFireMode = -1;
+            player.FireRate = 0f;
+            player.FireHoldElapsed = 0f;
+            player.FiredThisTick = false;
+            player.SaberDamageActive = false;
+            player.SaberActiveTimer = 0f;
+            player.SaberHitThisSwing.Clear();
+            _weaponMeshes.Remove(player.ThingIndex);
         }
 
         player.CurWeaponBin = weaponBin;
@@ -335,6 +361,8 @@ public sealed partial class WorldSimulation
             return false;
         if (player.ActiveFireMode == mode)
             return true;
+        if (player.ActiveFireMode >= 0)
+            EndWeaponFire(player.ThingIndex, player.ActiveFireMode);
 
         var cog = GetOrCreatePlayerBinCog(player, player.CurWeaponBin);
         if (cog == null || !cog.Program.Labels.ContainsKey("activated"))
@@ -391,6 +419,7 @@ public sealed partial class WorldSimulation
         if (safeRate > 0f && player.FireWait <= 0f && player.MountWait <= 0f && !player.Inventory.IsDead)
         {
             TriggerWeaponFire(player, mode);
+            player.FiredThisTick = true;
         }
     }
 
@@ -402,9 +431,14 @@ public sealed partial class WorldSimulation
             return 0f;
 
         float elapsed = player.FireHoldElapsed;
+        float remainingWait = player.FireWait > 0f ? player.FireWait : player.FireRate;
+        if (remainingWait > 0f)
+            player.MountWait = MathF.Max(player.MountWait, remainingWait);
+
         player.ActiveFireMode = -1;
         player.FireRate = 0f;
         player.FireHoldElapsed = 0f;
+        player.FiredThisTick = false;
         return elapsed;
     }
 
@@ -692,7 +726,9 @@ public sealed partial class WorldSimulation
                 }
             }
 
-            if (player.FireWait > 0f)
+            if (player.FiredThisTick)
+                player.FiredThisTick = false;
+            else if (player.FireWait > 0f)
                 player.FireWait = MathF.Max(0f, player.FireWait - dt);
             if (player.MountWait > 0f)
                 player.MountWait = MathF.Max(0f, player.MountWait - dt);
@@ -902,24 +938,23 @@ public sealed partial class WorldSimulation
         Vector3 targetSpawnPos = originPos + right * fireOffset.X + forward * fireOffset.Y + up * fireOffset.Z;
 
         Vector3 aimDir = forward;
-        if (aimError != Vector3.Zero)
+        float errX = float.IsFinite(aimError.X) ? aimError.X : 0f;
+        float errY = float.IsFinite(aimError.Y) ? aimError.Y : 0f;
+        float errZ = float.IsFinite(aimError.Z) ? aimError.Z : 0f;
+        if (errX != 0f || errY != 0f || errZ != 0f)
         {
-            float pitchRad = aimError.X * (MathF.PI / 180f);
-            float yawRad = -aimError.Y * (MathF.PI / 180f);
+            float pitchRad = errX * (MathF.PI / 180f);
+            float yawRad = -errY * (MathF.PI / 180f);
             aimDir = Vector3.Normalize(forward + up * MathF.Sin(pitchRad) + right * MathF.Sin(yawRad));
             right = Vector3.Cross(aimDir, Vector3.UnitZ);
             right = right.LengthSquared() > 1e-6f ? Vector3.Normalize(right) : Vector3.UnitX;
             up = Vector3.Normalize(Vector3.Cross(right, aimDir));
         }
 
-        string tmpl = projectileTemplate?.Trim() ?? string.Empty;
-        string modelName = !string.IsNullOrWhiteSpace(tmpl) ? _level.ResolveModel3D(tmpl) : string.Empty;
-        if (string.IsNullOrWhiteSpace(modelName))
-        {
-            string? spriteRef = ResolveTemplateParam(tmpl, "sprite");
-            modelName = string.IsNullOrWhiteSpace(spriteRef) ? "str0.3do" : string.Empty;
-        }
+        if (!float.IsFinite(scale) || scale < 0f)
+            scale = 1.0f;
 
+        string tmpl = projectileTemplate?.Trim() ?? string.Empty;
         Vector3 localVel = ParseTemplateVector3(tmpl, "vel", new Vector3(0f, 8f, 0f));
         Vector3 worldVel = right * localVel.X + aimDir * localVel.Y + up * localVel.Z;
         if (worldVel.LengthSquared() < 1e-5f)
@@ -941,6 +976,10 @@ public sealed partial class WorldSimulation
         uint physFlags = ParseTemplateHexOrInt(tmpl, "physflags", 0x200);
         uint typeFlags = ParseTemplateHexOrInt(tmpl, "typeflags", 0x40d);
         int damageClass = (int)ParseTemplateHexOrInt(tmpl, "damageclass", 2);
+        float minDamage = MathF.Max(0f, ParseTemplateFloat(tmpl, "mindamage", 0f));
+        float damageDecayRate = MathF.Max(0f, ParseTemplateFloat(tmpl, "rate", 0f));
+        if (baseDamage <= 0f || minDamage >= baseDamage)
+            damageDecayRate = 0f;
         float radius = MathF.Max(ParseTemplateFloat(tmpl, "size", 0.01f), 0.01f);
 
         Vector3 spawnPos = targetSpawnPos;
@@ -956,10 +995,6 @@ public sealed partial class WorldSimulation
             }
         }
 
-        bool useGravity = (physFlags & 0x1) != 0;
-        bool hasSurfaceBounceFlag = (physFlags & 0x20) != 0;
-        bool bounce = hasSurfaceBounceFlag && (typeFlags & 0x4) != 0;
-        bool explodeOnImpact = !bounce;
         string? explodeTpl = ResolveTemplateParam(tmpl, "explode");
         string? fleshHitTpl = ResolveTemplateParam(tmpl, "fleshhit");
 
@@ -970,20 +1005,65 @@ public sealed partial class WorldSimulation
             _audio?.PlaySoundPos(fireSound, spawnPos, 0.85f, 0.5f, 7.0f);
         }
 
+        // Hitscan instant-impact weapons (SITH_WF_INSTANT_IMPACT 0x8000): +concblast2, +force_lightning
+        if ((typeFlags & 0x8000) != 0)
+        {
+            FireInstantBeamWeapon(
+                shooterThing,
+                !shooterIsPlayer,
+                tmpl,
+                originPos,
+                spawnPos,
+                aimDir,
+                baseDamage,
+                damageClass,
+                explodeTpl,
+                fleshHitTpl);
+            return -1;
+        }
+
+        string modelName = !string.IsNullOrWhiteSpace(tmpl) ? _level.ResolveModel3D(tmpl) : string.Empty;
+        if (string.IsNullOrWhiteSpace(modelName))
+        {
+            string? spriteRef = ResolveTemplateParam(tmpl, "sprite");
+            modelName = string.IsNullOrWhiteSpace(spriteRef) ? "str0.3do" : string.Empty;
+        }
+
+        bool useGravity = (physFlags & 0x1) != 0;
+        bool hasSurfaceBounceFlag = (physFlags & 0x20) != 0;
+        bool bounce = hasSurfaceBounceFlag && (typeFlags & 0x4) != 0;
+        bool laserBounce = (typeFlags & 0x80000) != 0;
+        bool sticky = (typeFlags & 0x200000) != 0 && (typeFlags & 0x4) == 0 &&
+            (tmpl.StartsWith("+raildet2", StringComparison.OrdinalIgnoreCase) || (physFlags & 0x88) != 0);
+        if (!sticky && tmpl.StartsWith("+seqchrg", StringComparison.OrdinalIgnoreCase))
+            sticky = true;
+
+        bool proximityDetonate = tmpl.Equals("+seqchrg", StringComparison.OrdinalIgnoreCase);
+        bool explodeOnTimeout = bounce || sticky;
+        bool explodeOnImpact = !bounce && !sticky && !laserBounce;
+
         _projectiles.Add(new Projectile
         {
             Position = spawnPos,
             Direction = Vector3.Normalize(worldVel),
             Velocity = worldVel,
             Damage = baseDamage,
+            MinDamage = minDamage,
+            DamageDecayRate = damageDecayRate,
             Lifetime = lifetime,
             OwnerThingIndex = shooterThing,
             IsEnemy = !shooterIsPlayer,
             ModelName = modelName,
-            BoltColor = ResolveBoltColorForModel(modelName),
+            BoltColor = ResolveBoltColorForModel(modelName, tmpl),
             UseGravity = useGravity,
             Bounce = bounce,
+            LaserBounce = laserBounce,
+            BouncesRemaining = laserBounce ? 3 : 0,
+            Sticky = sticky,
+            ProximityDetonate = proximityDetonate,
+            ProximityRange = 0.45f,
             ExplodeOnImpact = explodeOnImpact,
+            ExplodeOnTimeout = explodeOnTimeout,
             ExplodeTemplate = explodeTpl,
             FleshHitTemplate = fleshHitTpl,
             DamageClass = damageClass,
@@ -991,6 +1071,168 @@ public sealed partial class WorldSimulation
         });
 
         return -1;
+    }
+
+    private void FireInstantBeamWeapon(
+        int shooterThing,
+        bool shooterIsEnemy,
+        string tmpl,
+        Vector3 rayOrigin,
+        Vector3 beamStartPos,
+        Vector3 aimDir,
+        float baseDamage,
+        int damageClass,
+        string? explodeTpl,
+        string? fleshHitTpl)
+    {
+        float range = MathF.Max(0.25f, ParseTemplateFloat(tmpl, "range", 5.0f));
+        float minDamage = ParseTemplateFloat(tmpl, "mindamage", 0f);
+        float damageRate = ParseTemplateFloat(tmpl, "rate", 0f);
+        float impactForce = ParseTemplateFloat(tmpl, "force", 0f);
+        float elementSize = MathF.Max(0.04f, ParseTemplateFloat(tmpl, "elementsize", 0.25f));
+        float trailCylRadius = ParseTemplateFloat(tmpl, "trailcylradius", 0f);
+        bool isLightning = tmpl.Contains("lightning", StringComparison.OrdinalIgnoreCase) || trailCylRadius > 0.001f;
+
+        Vector3 rayEnd = rayOrigin + aimDir * range;
+        float closestDist = range;
+        Vector3 hitPos = rayEnd;
+        bool hitAny = TryRaycastWorldWithHit(rayOrigin, rayEnd, out Vector3 wallHit, out int hitSurfaceId, out _);
+        if (hitAny)
+        {
+            closestDist = Vector3.Distance(rayOrigin, wallHit);
+            hitPos = wallHit;
+        }
+        else
+        {
+            hitSurfaceId = -1;
+        }
+
+        int hitNpcId = -1;
+        int hitPropId = -1;
+        PlayerState? hitPlayer = null;
+        const float beamEntityRadius = 0.045f;
+
+        foreach (var npc in _npcs.Values)
+        {
+            if (!npc.IsAlive || npc.Thing.ThingIndex == shooterThing)
+                continue;
+            if (shooterIsEnemy && npc.Brain.Class.HasInstinct("PrimaryFire"))
+                continue;
+
+            Vector3 npcCenter = npc.Thing.Position + new Vector3(0f, 0f, 0.10f);
+            float hitRadius = MathF.Max(npc.Radius * 1.6f, 0.09f) + beamEntityRadius;
+            float distSq = DistanceSqPointToSegment(npcCenter, rayOrigin, hitPos, out float segT);
+            float distAlongRay = segT * closestDist;
+            if (distSq <= hitRadius * hitRadius && distAlongRay < closestDist)
+            {
+                closestDist = distAlongRay;
+                hitPos = Vector3.Lerp(rayOrigin, hitPos, segT);
+                hitNpcId = npc.Thing.ThingIndex;
+                hitSurfaceId = -1;
+            }
+        }
+
+        foreach (var targetPlayer in _players)
+        {
+            if (targetPlayer.Inventory.IsDead || targetPlayer.ThingIndex == shooterThing ||
+                targetPlayer.ThingIndex < 0 || targetPlayer.ThingIndex >= _level.Things.Count)
+                continue;
+
+            Vector3 targetTorso = _level.Things[targetPlayer.ThingIndex].Position + new Vector3(0f, 0f, 0.13f);
+            float hitRadius = 0.08f + beamEntityRadius;
+            float distSq = DistanceSqPointToSegment(targetTorso, rayOrigin, hitPos, out float segT);
+            float distAlongRay = segT * closestDist;
+            if (distSq <= hitRadius * hitRadius && distAlongRay < closestDist)
+            {
+                closestDist = distAlongRay;
+                hitPos = Vector3.Lerp(rayOrigin, hitPos, segT);
+                hitPlayer = targetPlayer;
+                hitNpcId = -1;
+                hitSurfaceId = -1;
+            }
+        }
+
+        for (int thingId = 0; thingId < _level.Things.Count; thingId++)
+        {
+            if (thingId == shooterThing || !IsDamagableProp(thingId))
+                continue;
+
+            Vector3 propCenter = _level.Things[thingId].Position;
+            float hitRadius = GetPropHitRadius(thingId);
+            float distSq = DistanceSqPointToSegment(propCenter, rayOrigin, hitPos, out float segT);
+            float distAlongRay = segT * closestDist;
+            if (distSq <= hitRadius * hitRadius && distAlongRay < closestDist)
+            {
+                closestDist = distAlongRay;
+                hitPos = Vector3.Lerp(rayOrigin, hitPos, segT);
+                hitPropId = thingId;
+                hitPlayer = null;
+                hitNpcId = -1;
+                hitSurfaceId = -1;
+            }
+        }
+
+        float finalDamage = damageRate > 0f
+            ? MathF.Max(minDamage, baseDamage - damageRate * closestDist)
+            : baseDamage;
+
+        if (hitPropId >= 0)
+        {
+            if (finalDamage > 0f)
+                DispatchThingCogMessageFromSource(hitPropId, shooterThing, "damaged", new CogValue(finalDamage), new CogValue(damageClass));
+            TriggerExplosion(hitPos, fleshHitTpl ?? explodeTpl, shooterThing, directHitThingId: hitPropId, fallbackSound: isLightning ? "ForceLitning02.wav" : "concuss2.wav");
+        }
+        else if (hitNpcId >= 0)
+        {
+            if (finalDamage > 0f)
+                ApplyNpcDamage(hitNpcId, finalDamage, rayOrigin, damageClass, shooterThing);
+            if (impactForce > 0f && _npcs.TryGetValue(hitNpcId, out var npc))
+                npc.Velocity += aimDir * (impactForce * 0.015f);
+            TriggerExplosion(hitPos, fleshHitTpl ?? explodeTpl, shooterThing, directHitThingId: hitNpcId, fallbackSound: isLightning ? "ForceLitning02.wav" : "kbodyhit01.wav");
+        }
+        else if (hitPlayer != null)
+        {
+            if (finalDamage > 0f)
+                ApplyDamageToPlayer(hitPlayer, shooterThing, finalDamage, isLightning ? "ForceLitning02.wav" : "kbodyhit01.wav");
+            if (impactForce > 0f)
+            {
+                float hitMass = hitPlayer.ThingIndex >= 0 && hitPlayer.ThingIndex < _level.Things.Count
+                    ? MathF.Max(1f, ParseTemplateFloat(_level.Things[hitPlayer.ThingIndex].TemplateName, "mass", 150f))
+                    : 150f;
+                AddThingVel(hitPlayer.ThingIndex, aimDir * (impactForce / hitMass));
+            }
+            TriggerExplosion(hitPos, fleshHitTpl ?? explodeTpl, shooterThing, directHitThingId: hitPlayer.ThingIndex, fallbackSound: isLightning ? "ForceLitning02.wav" : "kbodyhit01.wav");
+        }
+        else if (hitAny)
+        {
+            if (hitSurfaceId >= 0 && finalDamage > 0f)
+                DispatchSurfaceDamaged(hitSurfaceId, finalDamage, damageClass, shooterThing);
+            TriggerExplosion(hitPos, explodeTpl, shooterThing, fallbackSound: isLightning ? "ForceLitning02.wav" : "concuss2.wav");
+        }
+
+        string? trailThing = ResolveTemplateParam(tmpl, "trailthing");
+        string? trailMat = !string.IsNullOrWhiteSpace(trailThing)
+            ? ResolveTemplateParam(trailThing, "material")
+            : null;
+
+        var beamVfx = new VisualEffect
+        {
+            Kind = VisualEffectKind.BeamTrail,
+            Position = beamStartPos,
+            EndPosition = hitPos,
+            SpriteName = tmpl,
+            MaterialName = !string.IsNullOrWhiteSpace(trailMat) ? trailMat : (isLightning ? "00ramp4.mat" : "dusty.mat"),
+            Width = isLightning ? 0.025f : 0.14f,
+            Height = isLightning ? 0.025f : 0.14f,
+            Duration = isLightning ? 0.24f : 0.45f,
+            MaxLight = 0.6f,
+            ColorTint = isLightning ? new Vector3(0.58f, 0.85f, 1.0f) : new Vector3(0.35f, 0.85f, 1.0f),
+            IsAdditive = true,
+            TrailSegmentSize = elementSize,
+            JitterRadius = isLightning ? MathF.Max(0.035f, trailCylRadius) : 0f
+        };
+        _visualEffects.Add(beamVfx);
+        OnVisualEffectSpawned?.Invoke(beamVfx);
     }
 
     private bool HasEntityObstruction(
@@ -1085,6 +1327,14 @@ public sealed partial class WorldSimulation
         }
 
         string tmpl = explosionTemplate.Trim();
+        string? tmplType = ResolveTemplateParam(tmpl, "type");
+        if (string.Equals(tmplType, "particle", StringComparison.OrdinalIgnoreCase))
+        {
+            SpawnParticleCloudFromTemplate(tmpl, position, fallbackRadius: 0.35f);
+            _audio?.PlaySoundPos(fallbackSound, position, 0.75f, 0.5f, 6.0f);
+            return;
+        }
+
         float damage = ParseTemplateFloat(tmpl, "damage", 0f);
         float range = ParseTemplateFloat(tmpl, "range", 0f);
         float force = ParseTemplateFloat(tmpl, "force", 0f);
@@ -1096,17 +1346,141 @@ public sealed partial class WorldSimulation
 
         SpawnVisualEffectFromTemplate(tmpl, position, duration, maxLight);
 
+        string? createThing = ResolveTemplateParam(tmpl, "creatething");
+        if (!string.IsNullOrWhiteSpace(createThing) && !createThing.Equals("none", StringComparison.OrdinalIgnoreCase))
+            SpawnParticleCloudFromTemplate(createThing, position, fallbackRadius: range > 0f ? range : 0.45f, fallbackDuration: duration);
+
         if (range > 0f && (damage > 0f || force > 0f))
-        {
             ApplyExplosionSplashDamage(position, range, damage, force, damageClass, ownerThingIndex, directHitThingId);
+
+        string? soundClassName = ResolveTemplateParam(tmpl, "soundclass");
+        if (!string.IsNullOrWhiteSpace(soundClassName) &&
+            !soundClassName.Equals("none", StringComparison.OrdinalIgnoreCase) &&
+            TryResolveSoundClassEntry(soundClassName, SoundEvent.Create, out var sndEntry) &&
+            sndEntry.HasSound)
+        {
+            float vol = sndEntry.MaxVolume > 0f ? sndEntry.MaxVolume : 1.0f;
+            float minR = sndEntry.MinRadius > 0f ? sndEntry.MinRadius : 0.8f;
+            float maxR = sndEntry.MaxRadius > minR ? sndEntry.MaxRadius : 10.0f;
+            _audio?.PlaySoundPos(sndEntry.SoundFileName, position, vol, minR, maxR);
+        }
+        else if (damage > 0f && range >= 0.25f)
+        {
+            _audio?.PlaySoundPos("ThermalExpl01.wav", position, 0.95f, 0.8f, 12.0f);
+        }
+        else
+        {
+            _audio?.PlaySoundPos(fallbackSound, position, 0.75f, 0.5f, 6.0f);
         }
 
-        if (damage > 0f && range >= 0.25f)
-            _audio?.PlaySoundPos("ThermalExpl01.wav", position, 0.95f, 0.8f, 12.0f);
-        else
-            _audio?.PlaySoundPos(fallbackSound, position, 0.75f, 0.5f, 6.0f);
-
         SpawnSparks(position, Vector3.UnitZ, count: range > 0.2f ? 16 : 8);
+    }
+
+    private void SpawnParticleCloudFromTemplate(
+        string templateName,
+        Vector3 position,
+        float fallbackRadius = 0.45f,
+        float fallbackDuration = 0.5f)
+    {
+        if (string.IsNullOrWhiteSpace(templateName))
+            return;
+
+        string tmpl = templateName.Trim();
+        float timer = ParseTemplateFloat(tmpl, "timer", fallbackDuration);
+        if (timer <= 0f) timer = MathF.Max(0.25f, fallbackDuration);
+        float tmplRange = ParseTemplateFloat(tmpl, "range", 0f);
+        float expandRadius = MathF.Max(fallbackRadius, tmplRange);
+        int count = Math.Clamp((int)ParseTemplateFloat(tmpl, "count", 48f), 16, 96);
+        float pitchSpread = ParseTemplateFloat(tmpl, "pitchrange", 360f);
+        float elemSize = MathF.Max(0.015f, ParseTemplateFloat(tmpl, "elementsize", 0.012f));
+        string? matName = ResolveTemplateParam(tmpl, "material");
+
+        Vector3 tint = ResolveParticleTint(tmpl);
+        var ringFx = new VisualEffect
+        {
+            Kind = VisualEffectKind.ParticleRing,
+            Position = position,
+            SpriteName = tmpl,
+            MaterialName = !string.IsNullOrWhiteSpace(matName) ? matName : "dusty.mat",
+            Width = MathF.Max(0.03f, elemSize * 2.5f),
+            Height = MathF.Max(0.03f, elemSize * 2.5f),
+            Duration = MathF.Max(0.28f, timer * 2.5f),
+            MaxLight = 0.5f,
+            ColorTint = tint,
+            IsAdditive = true,
+            ExpandRadius = expandRadius,
+            ParticleCount = count,
+            PitchSpreadDeg = pitchSpread
+        };
+        _visualEffects.Add(ringFx);
+        OnVisualEffectSpawned?.Invoke(ringFx);
+    }
+
+    private static Vector3 ResolveParticleTint(string templateName)
+    {
+        string low = templateName.ToLowerInvariant();
+        if (low.Contains("conc")) return new Vector3(0.32f, 0.84f, 1.0f);
+        if (low.Contains("lightning")) return new Vector3(0.58f, 0.85f, 1.0f);
+        if (low.Contains("dest")) return new Vector3(0.85f, 1.0f, 0.45f);
+        if (low.Contains("fire")) return new Vector3(1.0f, 0.56f, 0.14f);
+        if (low.Contains("saber")) return new Vector3(1.0f, 0.90f, 0.55f);
+        return new Vector3(0.85f, 0.80f, 0.72f);
+    }
+
+    private bool TryResolveSoundClassEntry(
+        string soundClassName,
+        SoundEvent evt,
+        [NotNullWhen(true)] out SoundClassEntry? entry)
+    {
+        entry = null;
+        if (string.IsNullOrWhiteSpace(soundClassName))
+            return false;
+
+        if (!_sndCache.TryGetValue(soundClassName, out var snd))
+        {
+            string[] candidates =
+            [
+                $"misc/snd/{soundClassName}",
+                $"sound/{soundClassName}",
+                soundClassName
+            ];
+
+            foreach (string path in candidates)
+            {
+                string? resolved = _vfs.FileExists(path) ? path : (_vfs.FileExists(path.ToLowerInvariant()) ? path.ToLowerInvariant() : null);
+                if (resolved != null)
+                {
+                    try
+                    {
+                        snd = SndReader.Parse(_vfs.ReadAllText(resolved), soundClassName);
+                        break;
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+            _sndCache[soundClassName] = snd;
+        }
+
+        if (snd == null)
+            return false;
+
+        entry = snd.GetFirst(evt);
+        if (entry != null && entry.HasSound)
+            return true;
+
+        foreach (var candidate in snd.AllEntries)
+        {
+            if (candidate.HasSound)
+            {
+                entry = candidate;
+                return true;
+            }
+        }
+
+        entry = null;
+        return false;
     }
 
     private void SpawnVisualEffectFromTemplate(string templateName, Vector3 position, float duration = -1f, float maxLight = 0.5f)
@@ -1145,10 +1519,17 @@ public sealed partial class WorldSimulation
         }
 
         if (string.IsNullOrWhiteSpace(matName))
-            matName = "detx.mat";
-
-        _visualEffects.Add(new VisualEffect
         {
+            if (string.IsNullOrWhiteSpace(spriteName) || spriteName.Equals("none", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            string stem = Path.GetFileNameWithoutExtension(spriteName);
+            matName = !string.IsNullOrWhiteSpace(stem) ? $"{stem}.mat" : "detx.mat";
+        }
+
+        var vfx = new VisualEffect
+        {
+            Kind = VisualEffectKind.Billboard,
             Position = finalPos,
             SpriteName = spriteName ?? string.Empty,
             MaterialName = matName,
@@ -1159,7 +1540,9 @@ public sealed partial class WorldSimulation
             MaxLight = maxLight,
             ColorTint = Vector3.One,
             IsAdditive = true
-        });
+        };
+        _visualEffects.Add(vfx);
+        OnVisualEffectSpawned?.Invoke(vfx);
     }
 
     private void ApplyExplosionSplashDamage(
@@ -1169,20 +1552,24 @@ public sealed partial class WorldSimulation
         float force,
         int damageClass,
         int ownerThingIndex,
-        int skipDirectHitThingId)
+        int directHitThingId)
     {
+        float invRange = 1.0f / MathF.Max(0.01f, range);
+
         foreach (var npc in _npcs.Values)
         {
             if (!npc.IsAlive)
                 continue;
 
             Vector3 npcCenter = npc.Thing.Position + new Vector3(0f, 0f, 0.10f);
-            float dist = Vector3.Distance(origin, npcCenter);
-            if (dist > range || !HasLineOfSight(origin, npcCenter))
+            bool isDirectHit = npc.Thing.ThingIndex == directHitThingId;
+            float dist = isDirectHit ? 0f : Vector3.Distance(origin, npcCenter);
+            if (dist > range || (!isDirectHit && !HasLineOfSight(origin, npcCenter)))
                 continue;
 
-            float falloff = Math.Clamp(1f - (dist / MathF.Max(0.01f, range)), 0.15f, 1f);
-            if (damage > 0f && npc.Thing.ThingIndex != skipDirectHitThingId)
+            float ratio = dist * invRange;
+            float falloff = Math.Clamp(1f - ratio * ratio, 0.25f, 1f);
+            if (damage > 0f)
                 ApplyNpcDamage(npc.Thing.ThingIndex, damage * falloff, origin, damageClass, ownerThingIndex);
 
             if (force > 0f)
@@ -1198,25 +1585,28 @@ public sealed partial class WorldSimulation
             if (player.Inventory.IsDead || player.ThingIndex < 0 || player.ThingIndex >= _level.Things.Count)
                 continue;
 
-            Vector3 pCenter = _level.Things[player.ThingIndex].Position + new Vector3(0f, 0f, 0.10f);
-            float dist = Vector3.Distance(origin, pCenter);
-            if (dist > range || !HasLineOfSight(origin, pCenter))
+            Vector3 pCenter = GetPlayerWorldPos(player) + new Vector3(0f, 0f, 0.10f);
+            bool isDirectHit = player.ThingIndex == directHitThingId;
+            float dist = isDirectHit ? 0f : Vector3.Distance(origin, pCenter);
+            if (dist > range || (!isDirectHit && !HasLineOfSight(origin, pCenter)))
                 continue;
 
-            float falloff = Math.Clamp(1f - (dist / MathF.Max(0.01f, range)), 0.15f, 1f);
-            if (damage > 0f && player.ThingIndex != skipDirectHitThingId)
+            float ratio = dist * invRange;
+            float falloff = Math.Clamp(1f - ratio * ratio, 0.25f, 1f);
+            if (damage > 0f)
                 ApplyDamageToPlayer(player, ownerThingIndex, damage * falloff, "kbodyhit01.wav");
 
             if (force > 0f)
             {
                 Vector3 pushDir = dist > 1e-4f ? Vector3.Normalize(pCenter - origin) : Vector3.UnitZ;
-                SetThingVel(player.ThingIndex, GetThingVel(player.ThingIndex) + pushDir * (force * 0.015f * falloff) + new Vector3(0f, 0f, 0.4f * falloff));
+                float mass = MathF.Max(1f, ParseTemplateFloat(_level.Things[player.ThingIndex].TemplateName, "mass", 150f));
+                AddThingVel(player.ThingIndex, pushDir * (force * falloff / mass) + new Vector3(0f, 0f, MathF.Min(0.8f, force * 0.002f * falloff)));
             }
         }
 
         for (int thingId = 0; thingId < _level.Things.Count; thingId++)
         {
-            if (thingId == skipDirectHitThingId || !IsDamagableProp(thingId))
+            if (!IsDamagableProp(thingId))
                 continue;
 
             Vector3 propPos = _level.Things[thingId].Position;
@@ -1224,8 +1614,9 @@ public sealed partial class WorldSimulation
             if (dist > range || !HasLineOfSight(origin, propPos))
                 continue;
 
-            float falloff = Math.Clamp(1f - (dist / MathF.Max(0.01f, range)), 0.15f, 1f);
-            if (damage > 0f)
+            float ratio = dist * invRange;
+            float falloff = Math.Clamp(1f - ratio * ratio, 0.25f, 1f);
+            if (damage > 0f && thingId != directHitThingId)
                 DispatchThingCogMessageFromSource(thingId, ownerThingIndex, "damaged", new CogValue(damage * falloff), new CogValue(damageClass));
         }
     }
@@ -1246,6 +1637,9 @@ public sealed partial class WorldSimulation
 
     public bool UseItem(int playerThing, int itemBin)
     {
+        if (!IsValidItemBin(itemBin))
+            return false;
+
         if (!TryResolvePlayer(playerThing, out var player))
             return false;
         if (player.Inventory.IsDead || IsActorFrozen(player.ThingIndex))
@@ -1266,8 +1660,20 @@ public sealed partial class WorldSimulation
         return true;
     }
 
+    internal static bool IsValidWeaponBin(int bin) =>
+        bin >= PlayerInventory.BinFists && bin <= PlayerInventory.BinLightsaber;
+
+    internal static bool IsValidItemBin(int bin) =>
+        (bin >= 40 && bin <= 51) || bin == PlayerInventory.BinShields;
+
+    internal static bool IsValidForceBin(int bin) =>
+        bin >= PlayerInventory.BinForceJump && bin <= PlayerInventory.BinForceDeadlySight;
+
     public bool BeginForcePower(int playerThing, int forceBin, Vector3 aimDir)
     {
+        if (!IsValidForceBin(forceBin))
+            return false;
+
         if (!TryResolvePlayer(playerThing, out var player))
             return false;
 
@@ -1301,6 +1707,9 @@ public sealed partial class WorldSimulation
 
     public bool EndForcePower(int playerThing, int forceBin)
     {
+        if (!IsValidForceBin(forceBin))
+            return false;
+
         if (!TryResolvePlayer(playerThing, out var player))
             return false;
 

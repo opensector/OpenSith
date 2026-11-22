@@ -23,6 +23,3 @@ desktop.ini
 # Logs & temporary files
 *.log
 *.tmp
-
-# Internal dev / RE notes
-DECOMPILER_ANALYSIS_REPORT.md

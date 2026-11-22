@@ -22,6 +22,8 @@ public interface IAudioSink
 
     void StopSound(int channelId, float fadeOut = 0f);
 
+    void SetSoundPosition(int channelId, Vector3 position) { }
+
     void ChangeSoundPitch(int channelId, float pitch, float changeTime = 0f);
 
     void ChangeSoundVol(int channelId, float volume, float fadeTime = 0f);

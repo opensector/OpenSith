@@ -1,5 +1,6 @@
 <Solution>
   <Project Path="OpenSith.Client/OpenSith.Client.csproj" />
   <Project Path="OpenSith.Core/OpenSith.Core.csproj" />
+  <Project Path="OpenSith.Server/OpenSith.Server.csproj" />
   <Project Path="OpenSith.Tests/OpenSith.Tests.csproj" />
 </Solution>

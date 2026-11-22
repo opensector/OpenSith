@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using OpenSith.Core.Data;
 using OpenSith.Core.Materials;
 using OpenSith.Core.Vfs;
 using OpenSith.Core.World;
@@ -18,6 +19,7 @@ public enum MenuScreen
     None,
     MainMenu,
     LevelSelect,
+    Customize,
     PauseMenu,
     LevelComplete,
     Loading
@@ -34,13 +36,18 @@ public enum MenuActionKind
     ResumeGame,
     RestartLevel,
     NextLevel,
+    ApplyCustomization,
     Quit
 }
 
 /// <summary>
 /// Immutable action returned by <see cref="MenuRenderer"/> in response to keyboard or mouse input.
 /// </summary>
-public readonly record struct MenuAction(MenuActionKind Kind, string? JklFile = null, int Difficulty = 1)
+public readonly record struct MenuAction(
+    MenuActionKind Kind,
+    string? JklFile = null,
+    int Difficulty = 1,
+    PlayerLoadoutConfig? Loadout = null)
 {
     public static MenuAction None => new(MenuActionKind.None);
     public static MenuAction StartNewGame => new(MenuActionKind.StartNewGame);
@@ -48,6 +55,7 @@ public readonly record struct MenuAction(MenuActionKind Kind, string? JklFile = 
     public static MenuAction ResumeGame => new(MenuActionKind.ResumeGame);
     public static MenuAction RestartLevel => new(MenuActionKind.RestartLevel);
     public static MenuAction NextLevel => new(MenuActionKind.NextLevel);
+    public static MenuAction ApplyCustomization(PlayerLoadoutConfig loadout) => new(MenuActionKind.ApplyCustomization, null, 1, loadout);
     public static MenuAction Quit => new(MenuActionKind.Quit);
 }
 
@@ -106,6 +114,7 @@ public sealed class MenuRenderer : IDisposable
         Resume,
         NewGame,
         SelectLevel,
+        Customize,
         RestartLevel,
         MainMenu,
         NextLevel,
@@ -119,6 +128,8 @@ public sealed class MenuRenderer : IDisposable
 
     private static readonly VirtualRect LevelListBounds = new(60.0f, 88.0f, 520.0f, VisibleLevelRows * 24.0f);
     private const float LevelRowHeight = 24.0f;
+    private static readonly VirtualRect CustBackBounds = new(60.0f, 420.0f, 160.0f, 32.0f);
+    private static readonly VirtualRect CustApplyBounds = new(340.0f, 420.0f, 240.0f, 32.0f);
 
     private readonly GL _gl;
     private readonly ShaderProgram _shader;
@@ -145,6 +156,11 @@ public sealed class MenuRenderer : IDisposable
     private MenuScreen _currentScreen = MenuScreen.MainMenu;
     private MenuScreen _previousScreen = MenuScreen.MainMenu;
     private IReadOnlyList<EpisodeEntry> _episodes = Array.Empty<EpisodeEntry>();
+    private IReadOnlyList<ModelSelectionEntry> _modelOptions = [new ModelSelectionEntry(0, "ky.3do", "ky.snd", "Katarn")];
+    private IReadOnlyList<SaberColorOption> _saberOptions = PlayerCustomizationCatalog.DefaultSaberColors;
+    private PlayerLoadoutConfig _editingLoadout = new();
+    private int _custFocusIndex;
+    private int _custHoverIndex = -1;
     private int _selectedButtonIndex;
     private int _selectedEpisodeIndex;
     private int _levelScrollOffset;
@@ -165,7 +181,33 @@ public sealed class MenuRenderer : IDisposable
             _selectedButtonIndex = 0;
             _hoveredButton = null;
             _hoveredEpisodeIndex = -1;
+            _custFocusIndex = 0;
+            _custHoverIndex = -1;
         }
+    }
+
+    public void ConfigureCustomization(
+        IReadOnlyList<ModelSelectionEntry>? models,
+        IReadOnlyList<SaberColorOption>? sabers,
+        PlayerLoadoutConfig? initialLoadout)
+    {
+        if (models != null && models.Count > 0)
+            _modelOptions = models;
+        if (sabers != null && sabers.Count > 0)
+            _saberOptions = sabers;
+        if (initialLoadout != null)
+            SyncLoadout(initialLoadout);
+    }
+
+    public void SyncLoadout(PlayerLoadoutConfig loadout)
+    {
+        ArgumentNullException.ThrowIfNull(loadout);
+        _editingLoadout = loadout.Clone();
+        _editingLoadout.ClampToPolicy(
+            PlayerLoadoutConfig.MaxJediRank,
+            allowAllWeapons: true,
+            _modelOptions.Count,
+            _saberOptions.Count);
     }
 
     public bool HasLoadedLevel { get; set; }
@@ -312,6 +354,9 @@ public sealed class MenuRenderer : IDisposable
         if (_currentScreen == MenuScreen.LevelSelect)
             return HandleLevelSelectKey(key);
 
+        if (_currentScreen == MenuScreen.Customize)
+            return HandleCustomizeKey(key);
+
         IReadOnlyList<MenuButton> buttons = GetScreenButtons(_currentScreen);
         if (buttons.Count == 0)
             return MenuAction.None;
@@ -361,12 +406,19 @@ public sealed class MenuRenderer : IDisposable
     {
         _hoveredButton = null;
         _hoveredEpisodeIndex = -1;
+        _custHoverIndex = -1;
 
         if (_currentScreen == MenuScreen.None || _currentScreen == MenuScreen.Loading)
             return;
 
         if (!TryWindowToVirtual(x, y, winW, winH, out Vector2 vPos))
             return;
+
+        if (_currentScreen == MenuScreen.Customize)
+        {
+            HandleCustomizeMove(vPos.X, vPos.Y);
+            return;
+        }
 
         if (_currentScreen == MenuScreen.LevelSelect && LevelListBounds.Contains(vPos.X, vPos.Y))
         {
@@ -398,6 +450,9 @@ public sealed class MenuRenderer : IDisposable
 
         if (!TryWindowToVirtual(x, y, winW, winH, out Vector2 vPos))
             return MenuAction.None;
+
+        if (_currentScreen == MenuScreen.Customize)
+            return HandleCustomizeClick(vPos.X, vPos.Y);
 
         if (_currentScreen == MenuScreen.LevelSelect && LevelListBounds.Contains(vPos.X, vPos.Y))
         {
@@ -492,6 +547,9 @@ public sealed class MenuRenderer : IDisposable
                 case MenuScreen.LevelSelect:
                     RenderLevelSelect();
                     break;
+                case MenuScreen.Customize:
+                    RenderCustomize();
+                    break;
                 case MenuScreen.PauseMenu:
                     RenderPauseMenu();
                     break;
@@ -530,6 +588,273 @@ public sealed class MenuRenderer : IDisposable
                 _gl.Enable(EnableCap.CullFace);
             else
                 _gl.Disable(EnableCap.CullFace);
+        }
+    }
+
+    private void RenderCustomize()
+    {
+        DrawBackground(_bkEsc ?? _bkSingle);
+
+        SftAtlas? titleFont = _largeFontActive ?? _largeFontNormal ?? _medFontActive;
+        if (titleFont is not null)
+            DrawCenteredSftText(titleFont, "CUSTOMIZE / FORCE", 18.0f, Vector4.One);
+
+        DrawSolidRect(30.0f, 54.0f, 580.0f, 354.0f, new Vector4(0.0f, 0.0f, 0.0f, 0.65f));
+
+        SftAtlas? font = _smallFont ?? _medFontNormal ?? _largeFontNormal;
+        if (font is not null)
+        {
+            ModelSelectionEntry model = _modelOptions.Count > 0
+                ? _modelOptions[Math.Clamp(_editingLoadout.ModelIndex, 0, _modelOptions.Count - 1)]
+                : new ModelSelectionEntry(0, "ky.3do", "ky.snd", "Katarn");
+            SaberColorOption saber = PlayerCustomizationCatalog.ResolveSaberOption(_saberOptions, _editingLoadout.SaberColorIndex);
+            string presetLabel = _editingLoadout.DetectPreset() switch
+            {
+                ForcePreset.None => "NONE",
+                ForcePreset.LightJedi => "LIGHT JEDI",
+                ForcePreset.DarkJedi => "DARK JEDI",
+                ForcePreset.MasterSandbox => "MASTER SANDBOX",
+                _ => "CUSTOM"
+            };
+
+            string[] topLabels =
+            [
+                $"MODEL:        < [{_editingLoadout.ModelIndex + 1:D2}/{_modelOptions.Count:D2}] {model.DisplayName.ToUpperInvariant()} ({model.Model3D.ToUpperInvariant()}) >",
+                $"SABER COLOR:  < {saber.Name.ToUpperInvariant()} >",
+                $"FORCE PRESET: < {presetLabel} >",
+                $"JEDI RANK:    < {_editingLoadout.JediRank} ({_editingLoadout.JediRank * 50} MANA) >",
+                $"ALL WEAPONS:  < {(_editingLoadout.GrantAllWeapons ? "ON" : "OFF")} >"
+            ];
+
+            for (int r = 0; r < topLabels.Length; r++)
+            {
+                VirtualRect rect = GetCustRowBounds(r);
+                bool active = _custFocusIndex == r || _custHoverIndex == r;
+                if (active)
+                    DrawSolidRect(rect.X, rect.Y, rect.Width, rect.Height, new Vector4(0.72f, 0.56f, 0.16f, 0.35f));
+
+                Vector4 col = active ? new Vector4(1.0f, 0.96f, 0.55f, 1.0f) : new Vector4(0.86f, 0.88f, 0.84f, 1.0f);
+                float ty = rect.Y + MathF.Max(1.0f, (rect.Height - font.Font.LineHeight) * 0.5f);
+                DrawSftText(font, topLabels[r], rect.X + 8.0f, ty, col);
+
+                if (r == 1)
+                {
+                    DrawSolidRect(420.0f, rect.Y + 4.0f, 130.0f, rect.Height - 8.0f, new Vector4(saber.FallbackRgb, 1.0f));
+                    DrawSolidRect(422.0f, rect.Y + 7.0f, 126.0f, rect.Height - 14.0f, new Vector4(Vector3.Lerp(saber.FallbackRgb, Vector3.One, 0.65f), 0.9f));
+                }
+            }
+
+            DrawSolidRect(40.0f, 180.0f, 560.0f, 1.0f, new Vector4(0.60f, 0.62f, 0.55f, 0.45f));
+            DrawSftText(font, "FORCE POWERS (LEFT/RIGHT OR CLICK 0-4):", 40.0f, 185.0f, new Vector4(0.82f, 0.86f, 0.72f, 1.0f));
+
+            for (int i = 0; i < PlayerCustomizationCatalog.ForcePowers.Count; i++)
+            {
+                int rowIdx = 5 + i;
+                VirtualRect rect = GetCustRowBounds(rowIdx);
+                bool active = _custFocusIndex == rowIdx || _custHoverIndex == rowIdx;
+                if (active)
+                    DrawSolidRect(rect.X, rect.Y, rect.Width, rect.Height, new Vector4(0.72f, 0.56f, 0.16f, 0.35f));
+
+                ForcePowerOption fp = PlayerCustomizationCatalog.ForcePowers[i];
+                int rank = Math.Clamp((int)_editingLoadout.ForceRanks[i], 0, PlayerLoadoutConfig.MaxForcePowerRank);
+                string stars = rank > 0
+                    ? new string('*', rank) + new string('-', 4 - rank)
+                    : "----";
+                string text = $"[{fp.Alignment}] {fp.Name.ToUpperInvariant()}: {stars}";
+
+                Vector4 col = active
+                    ? new Vector4(1.0f, 0.96f, 0.55f, 1.0f)
+                    : (rank > 0 ? new Vector4(0.85f, 0.96f, 0.88f, 1.0f) : new Vector4(0.65f, 0.68f, 0.65f, 1.0f));
+                float ty = rect.Y + MathF.Max(1.0f, (rect.Height - font.Font.LineHeight) * 0.5f);
+                DrawSftText(font, text, rect.X + 6.0f, ty, col);
+            }
+
+            DrawCenteredSftText(font, "ARROWS ADJUST | ENTER APPLY | ESC CANCEL", 392.0f, new Vector4(0.75f, 0.78f, 0.72f, 0.9f));
+        }
+
+        RenderCustomBottomButton(CustBackBounds, "BACK", _custFocusIndex == 19 || _custHoverIndex == 19);
+        RenderCustomBottomButton(CustApplyBounds, "APPLY & RESUME", _custFocusIndex == 20 || _custHoverIndex == 20);
+    }
+
+    private void RenderCustomBottomButton(VirtualRect bounds, string label, bool isActive)
+    {
+        SftAtlas? font = isActive ? (_medFontActive ?? _smallFont) : (_medFontNormal ?? _smallFont);
+        if (font is null)
+            return;
+
+        DrawSolidRect(bounds.X, bounds.Y, bounds.Width, bounds.Height,
+            isActive ? new Vector4(0.72f, 0.56f, 0.16f, 0.45f) : new Vector4(0.12f, 0.14f, 0.16f, 0.65f));
+        float textW = MeasureSftTextWidth(font, label);
+        float textX = bounds.X + MathF.Floor((bounds.Width - textW) * 0.5f);
+        float textY = bounds.Y + MathF.Floor((bounds.Height - font.Font.LineHeight) * 0.5f);
+        if (isActive && font.Font.TryGetGlyph('>', out SftGlyph arrow))
+            DrawSftText(font, ">", textX - arrow.Width - 6.0f, textY, Vector4.One);
+        DrawSftText(font, label, textX, textY, Vector4.One);
+    }
+
+    private static VirtualRect GetCustRowBounds(int index)
+    {
+        if (index < 5)
+            return new VirtualRect(40.0f, 62.0f + index * 22.0f, 560.0f, 20.0f);
+
+        int fpIdx = index - 5;
+        int col = fpIdx < 7 ? 0 : 1;
+        int row = fpIdx < 7 ? fpIdx : fpIdx - 7;
+        return new VirtualRect(40.0f + col * 284.0f, 204.0f + row * 25.0f, 276.0f, 22.0f);
+    }
+
+    private MenuAction HandleCustomizeKey(Key key)
+    {
+        if (key == Key.Escape)
+        {
+            CurrentScreen = _previousScreen == MenuScreen.PauseMenu ? MenuScreen.PauseMenu : MenuScreen.MainMenu;
+            return MenuAction.None;
+        }
+
+        if (key is Key.Up or Key.W)
+        {
+            _custFocusIndex = (_custFocusIndex - 1 + 21) % 21;
+            return MenuAction.None;
+        }
+
+        if (key is Key.Down or Key.S or Key.Tab)
+        {
+            _custFocusIndex = (_custFocusIndex + 1) % 21;
+            return MenuAction.None;
+        }
+
+        if (key is Key.Left or Key.A)
+        {
+            if (_custFocusIndex >= 19)
+                _custFocusIndex = _custFocusIndex == 19 ? 20 : 19;
+            else
+                AdjustCustomizeRow(_custFocusIndex, -1);
+            return MenuAction.None;
+        }
+
+        if (key is Key.Right or Key.D)
+        {
+            if (_custFocusIndex >= 19)
+                _custFocusIndex = _custFocusIndex == 19 ? 20 : 19;
+            else
+                AdjustCustomizeRow(_custFocusIndex, +1);
+            return MenuAction.None;
+        }
+
+        if (key is Key.Enter or Key.KeypadEnter or Key.Space)
+        {
+            if (_custFocusIndex == 19)
+            {
+                CurrentScreen = _previousScreen == MenuScreen.PauseMenu ? MenuScreen.PauseMenu : MenuScreen.MainMenu;
+                return MenuAction.None;
+            }
+            if (_custFocusIndex == 20 || key is Key.Enter or Key.KeypadEnter)
+            {
+                return MenuAction.ApplyCustomization(_editingLoadout.Clone());
+            }
+            AdjustCustomizeRow(_custFocusIndex, +1);
+            return MenuAction.None;
+        }
+
+        return MenuAction.None;
+    }
+
+    private void HandleCustomizeMove(float vx, float vy)
+    {
+        for (int i = 0; i < 19; i++)
+        {
+            if (GetCustRowBounds(i).Contains(vx, vy))
+            {
+                _custHoverIndex = i;
+                _custFocusIndex = i;
+                return;
+            }
+        }
+        if (CustBackBounds.Contains(vx, vy))
+        {
+            _custHoverIndex = 19;
+            _custFocusIndex = 19;
+            return;
+        }
+        if (CustApplyBounds.Contains(vx, vy))
+        {
+            _custHoverIndex = 20;
+            _custFocusIndex = 20;
+        }
+    }
+
+    private MenuAction HandleCustomizeClick(float vx, float vy)
+    {
+        if (CustBackBounds.Contains(vx, vy))
+        {
+            CurrentScreen = _previousScreen == MenuScreen.PauseMenu ? MenuScreen.PauseMenu : MenuScreen.MainMenu;
+            return MenuAction.None;
+        }
+
+        if (CustApplyBounds.Contains(vx, vy))
+            return MenuAction.ApplyCustomization(_editingLoadout.Clone());
+
+        for (int i = 0; i < 19; i++)
+        {
+            VirtualRect rect = GetCustRowBounds(i);
+            if (rect.Contains(vx, vy))
+            {
+                _custFocusIndex = i;
+                int delta = (i < 5 && vx < rect.X + rect.Width * 0.45f) ? -1 : +1;
+                AdjustCustomizeRow(i, delta);
+                return MenuAction.None;
+            }
+        }
+
+        return MenuAction.None;
+    }
+
+    private void AdjustCustomizeRow(int rowIndex, int delta)
+    {
+        switch (rowIndex)
+        {
+            case 0:
+                if (_modelOptions.Count > 0)
+                    _editingLoadout.ModelIndex = (_editingLoadout.ModelIndex + delta + _modelOptions.Count) % _modelOptions.Count;
+                break;
+
+            case 1:
+                if (_saberOptions.Count > 0)
+                    _editingLoadout.SaberColorIndex = (_editingLoadout.SaberColorIndex + delta + _saberOptions.Count) % _saberOptions.Count;
+                break;
+
+            case 2:
+            {
+                ForcePreset[] cycle = [ForcePreset.None, ForcePreset.LightJedi, ForcePreset.DarkJedi, ForcePreset.MasterSandbox];
+                ForcePreset cur = _editingLoadout.DetectPreset();
+                int idx = Array.IndexOf(cycle, cur);
+                int nextIdx = idx < 0
+                    ? (delta > 0 ? 1 : cycle.Length - 1)
+                    : (idx + delta + cycle.Length) % cycle.Length;
+                _editingLoadout.ApplyPreset(cycle[nextIdx]);
+                break;
+            }
+
+            case 3:
+                _editingLoadout.JediRank = (_editingLoadout.JediRank + delta + (PlayerLoadoutConfig.MaxJediRank + 1)) % (PlayerLoadoutConfig.MaxJediRank + 1);
+                break;
+
+            case 4:
+                _editingLoadout.GrantAllWeapons = !_editingLoadout.GrantAllWeapons;
+                break;
+
+            default:
+            {
+                int fpIdx = rowIndex - 5;
+                if (fpIdx >= 0 && fpIdx < PlayerLoadoutConfig.ForcePowerCount)
+                {
+                    int mod = PlayerLoadoutConfig.MaxForcePowerRank + 1;
+                    _editingLoadout.ForceRanks[fpIdx] = (byte)((_editingLoadout.ForceRanks[fpIdx] + delta + mod) % mod);
+                    if (_editingLoadout.ForceRanks[fpIdx] > 0 && _editingLoadout.JediRank == 0)
+                        _editingLoadout.JediRank = 4;
+                }
+                break;
+            }
         }
     }
 
@@ -759,10 +1084,10 @@ public sealed class MenuRenderer : IDisposable
         {
             case MenuScreen.MainMenu:
             {
-                var list = new List<MenuButton>(4);
-                float y = HasLoadedLevel ? 185.0f : 202.0f;
-                float step = HasLoadedLevel ? 39.0f : 44.0f;
-                float height = HasLoadedLevel ? 38.0f : 42.0f;
+                var list = new List<MenuButton>(5);
+                float y = HasLoadedLevel ? 168.0f : 185.0f;
+                float step = HasLoadedLevel ? 35.0f : 40.0f;
+                float height = HasLoadedLevel ? 33.0f : 38.0f;
 
                 if (HasLoadedLevel)
                 {
@@ -773,6 +1098,8 @@ public sealed class MenuRenderer : IDisposable
                 list.Add(new MenuButton(ButtonId.NewGame, "NEW GAME", new VirtualRect(160.0f, y, 320.0f, height)));
                 y += step;
                 list.Add(new MenuButton(ButtonId.SelectLevel, "SELECT LEVEL", new VirtualRect(160.0f, y, 320.0f, height)));
+                y += step;
+                list.Add(new MenuButton(ButtonId.Customize, "CUSTOMIZE / FORCE", new VirtualRect(160.0f, y, 320.0f, height)));
                 y += step;
                 list.Add(new MenuButton(ButtonId.Quit, "QUIT", new VirtualRect(160.0f, y, 320.0f, height)));
                 return list;
@@ -789,11 +1116,12 @@ public sealed class MenuRenderer : IDisposable
             case MenuScreen.PauseMenu:
                 return
                 [
-                    new MenuButton(ButtonId.Resume, "RESUME", new VirtualRect(180.0f, 140.0f, 280.0f, 34.0f)),
-                    new MenuButton(ButtonId.RestartLevel, "RESTART LEVEL", new VirtualRect(180.0f, 184.0f, 280.0f, 34.0f)),
-                    new MenuButton(ButtonId.SelectLevel, "SELECT LEVEL", new VirtualRect(180.0f, 228.0f, 280.0f, 34.0f)),
-                    new MenuButton(ButtonId.MainMenu, "MAIN MENU", new VirtualRect(180.0f, 272.0f, 280.0f, 34.0f)),
-                    new MenuButton(ButtonId.Quit, "QUIT", new VirtualRect(180.0f, 316.0f, 280.0f, 34.0f)),
+                    new MenuButton(ButtonId.Resume, "RESUME", new VirtualRect(180.0f, 126.0f, 280.0f, 32.0f)),
+                    new MenuButton(ButtonId.RestartLevel, "RESTART LEVEL", new VirtualRect(180.0f, 166.0f, 280.0f, 32.0f)),
+                    new MenuButton(ButtonId.SelectLevel, "SELECT LEVEL", new VirtualRect(180.0f, 206.0f, 280.0f, 32.0f)),
+                    new MenuButton(ButtonId.Customize, "CUSTOMIZE / FORCE", new VirtualRect(180.0f, 246.0f, 280.0f, 32.0f)),
+                    new MenuButton(ButtonId.MainMenu, "MAIN MENU", new VirtualRect(180.0f, 286.0f, 280.0f, 32.0f)),
+                    new MenuButton(ButtonId.Quit, "QUIT", new VirtualRect(180.0f, 326.0f, 280.0f, 32.0f)),
                 ];
 
             case MenuScreen.LevelComplete:
@@ -822,6 +1150,11 @@ public sealed class MenuRenderer : IDisposable
             case ButtonId.SelectLevel:
                 _previousScreen = _currentScreen;
                 CurrentScreen = MenuScreen.LevelSelect;
+                return MenuAction.None;
+
+            case ButtonId.Customize:
+                _previousScreen = _currentScreen;
+                CurrentScreen = MenuScreen.Customize;
                 return MenuAction.None;
 
             case ButtonId.RestartLevel:
