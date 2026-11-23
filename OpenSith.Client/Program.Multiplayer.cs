@@ -840,7 +840,12 @@ public static partial class Program
         }
     }
 
-    private static void RenderMultiplayerWorldAndHud(float aspect, Matrix4x4 view, Matrix4x4 projection)
+    private static void RenderMultiplayerWorldAndHud(
+        int renderWidth,
+        int renderHeight,
+        float aspect,
+        Matrix4x4 view,
+        Matrix4x4 projection)
     {
         if (_shader == null || _meshRenderer == null || _level == null)
             return;
@@ -1011,8 +1016,8 @@ public static partial class Program
                 : (_netBannerMessage ?? (isDead ? "PRESS R TO RESPAWN" : null));
 
             _hudRenderer.Render(
-                _window!.Size.X,
-                _window.Size.Y,
+                renderWidth,
+                renderHeight,
                 lpSnap?.Health ?? 100f,
                 lpSnap?.MaxHealth ?? 100f,
                 lpSnap?.Shields ?? 100f,
@@ -1043,8 +1048,8 @@ public static partial class Program
                 }
                 _scoreboardRows.Sort((a, b) => b.Score.CompareTo(a.Score));
                 _hudRenderer.RenderScoreboard(
-                    _window.Size.X,
-                    _window.Size.Y,
+                    renderWidth,
+                    renderHeight,
                     $"OPENSITH MP - {_currentLevelFile}",
                     _scoreboardRows);
             }

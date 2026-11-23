@@ -50,6 +50,10 @@ public static partial class Program
 
     private static Vector2 _lastMousePos;
     private static bool _firstMouseMove = true;
+    private static Vector2D<int> _preFullscreenSize = new(1280, 720);
+    private static Vector2D<int> _preFullscreenPosition = new(100, 100);
+    private static WindowState _preFullscreenWindowState = WindowState.Normal;
+    private static bool _hasSavedWindowedPlacement;
     private static bool _flyMode = false;
     private static bool _thirdPerson = false;
     private const float SaberIgniteDuration = 0.70f;
@@ -126,6 +130,9 @@ public static partial class Program
         _window.Update += OnUpdate;
         _window.Render += OnRender;
         _window.Closing += OnClosing;
+        _window.FramebufferResize += OnFramebufferResize;
+        _window.Resize += OnWindowResize;
+        _window.StateChanged += OnWindowStateChanged;
         _window.FocusChanged += focused =>
         {
             if (!focused)
@@ -138,6 +145,7 @@ public static partial class Program
         Console.WriteLine("  • Shift: Sprint");
         Console.WriteLine("  • F: Toggle Fly/Noclip mode");
         Console.WriteLine("  • V / F1: Toggle 1st-person / 3rd-person camera");
+        Console.WriteLine("  • Alt+Enter: Toggle Fullscreen");
         Console.WriteLine("  • E: Activate / open nearby door");
         Console.WriteLine("  • 1..9 / 0: Switch weapon (1=Fists, 2=Bryar, 3=StRifle, 4=ThermDet, 5=Bowcaster, 6=Repeater, 7=RailDet, 8=SeqChg, 9=ConcRifle, 0=Lightsaber)");
         Console.WriteLine("  • H / I / L: Use Bacta Tank / Toggle IR Goggles / Toggle Field Light");
@@ -251,6 +259,7 @@ public static partial class Program
     private static void OnLoad()
     {
         _gl = _window!.CreateOpenGL();
+        SyncViewport();
         _input = _window!.CreateInput();
 
         // Enable Depth Testing
@@ -320,6 +329,13 @@ public static partial class Program
         {
             keyboard.KeyDown += (k, key, code) =>
             {
+                if ((key == Key.Enter || key == Key.KeypadEnter) &&
+                    (k.IsKeyPressed(Key.AltLeft) || k.IsKeyPressed(Key.AltRight)))
+                {
+                    ToggleFullscreen();
+                    return;
+                }
+
                 if (_menuRenderer != null && _menuRenderer.CurrentScreen != MenuScreen.None)
                 {
                     MenuAction action = _menuRenderer.HandleKeyDown(key);
@@ -513,8 +529,10 @@ public static partial class Program
 
                 if (key == Key.ControlLeft || key == Key.ControlRight || key == Key.Enter)
                 {
+                    bool wasPrimaryKeyFire = _fireKeyPrimary;
                     _fireKeyPrimary = false;
-                    _worldSim.EndWeaponFire(localPlayerId, 0);
+                    if (wasPrimaryKeyFire)
+                        _worldSim.EndWeaponFire(localPlayerId, 0);
                 }
                 else if (key == Key.Z)
                 {
@@ -1302,6 +1320,9 @@ public static partial class Program
 
     private static void OnRender(double deltaTime)
     {
+        if (!TrySyncRenderViewport(out int renderWidth, out int renderHeight))
+            return;
+
         _gl!.ClearColor(0.02f, 0.02f, 0.04f, 1.0f);
         _gl.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
 
@@ -1314,14 +1335,14 @@ public static partial class Program
         {
             _shader!.Use();
 
-            float aspect = (float)_window!.Size.X / Math.Max(1, _window.Size.Y);
+            float aspect = (float)renderWidth / Math.Max(1, renderHeight);
             Matrix4x4 model = Matrix4x4.Identity;
             Matrix4x4 view = _camera.GetViewMatrix();
             Matrix4x4 projection = _camera.GetProjectionMatrix(aspect);
 
             if (IsMultiplayerClient)
             {
-                RenderMultiplayerWorldAndHud(aspect, view, projection);
+                RenderMultiplayerWorldAndHud(renderWidth, renderHeight, aspect, view, projection);
             }
             else
             {
@@ -1512,8 +1533,8 @@ public static partial class Program
                         _ => (int)inv.EnergyAmmo
                     };
                     _hudRenderer.Render(
-                        _window.Size.X,
-                        _window.Size.Y,
+                        renderWidth,
+                        renderHeight,
                         inv.Health,
                         inv.MaxHealth,
                         inv.Shields,
@@ -1535,8 +1556,108 @@ public static partial class Program
 
         if (_menuRenderer != null && _menuRenderer.CurrentScreen != MenuScreen.None)
         {
-            _menuRenderer.Render(_window!.Size.X, _window.Size.Y);
+            _menuRenderer.Render(renderWidth, renderHeight);
         }
+    }
+
+    /// <summary>
+    /// Resolves the OpenGL drawable viewport size in pixels from framebuffer and logical window bounds,
+    /// returning <see cref="Vector2D{T}.Zero"/> while minimized or before a valid surface exists.
+    /// </summary>
+    public static Vector2D<int> ResolveViewportSize(
+        Vector2D<int> framebufferSize,
+        Vector2D<int> windowSize,
+        WindowState windowState)
+    {
+        if (windowState == WindowState.Minimized)
+            return Vector2D<int>.Zero;
+
+        if (framebufferSize.X > 0 && framebufferSize.Y > 0)
+            return framebufferSize;
+
+        if (windowSize.X > 0 && windowSize.Y > 0)
+            return windowSize;
+
+        return Vector2D<int>.Zero;
+    }
+
+    private static bool TrySyncRenderViewport(out int width, out int height)
+    {
+        if (_window == null || _gl == null)
+        {
+            width = 0;
+            height = 0;
+            return false;
+        }
+
+        Vector2D<int> vp = ResolveViewportSize(_window.FramebufferSize, _window.Size, _window.WindowState);
+        if (vp.X <= 0 || vp.Y <= 0)
+        {
+            width = 0;
+            height = 0;
+            return false;
+        }
+
+        _gl.Viewport(0, 0, (uint)vp.X, (uint)vp.Y);
+        width = vp.X;
+        height = vp.Y;
+        return true;
+    }
+
+    private static void SyncViewport() => TrySyncRenderViewport(out _, out _);
+
+    private static void OnFramebufferResize(Vector2D<int> newSize)
+    {
+        _firstMouseMove = true;
+        if (_gl != null && newSize.X > 0 && newSize.Y > 0)
+            _gl.Viewport(0, 0, (uint)newSize.X, (uint)newSize.Y);
+    }
+
+    private static void OnWindowResize(Vector2D<int> newSize)
+    {
+        _firstMouseMove = true;
+        SyncViewport();
+    }
+
+    private static void OnWindowStateChanged(WindowState newState)
+    {
+        _firstMouseMove = true;
+        if (newState != WindowState.Minimized)
+            SyncViewport();
+    }
+
+    private static void ToggleFullscreen()
+    {
+        if (_window == null)
+            return;
+
+        if (_window.WindowState != WindowState.Fullscreen)
+        {
+            _preFullscreenWindowState = _window.WindowState == WindowState.Maximized
+                ? WindowState.Maximized
+                : WindowState.Normal;
+
+            if (_window.WindowState == WindowState.Normal && _window.Size.X > 0 && _window.Size.Y > 0)
+            {
+                _preFullscreenSize = _window.Size;
+                _preFullscreenPosition = _window.Position;
+                _hasSavedWindowedPlacement = true;
+            }
+
+            _window.WindowState = WindowState.Fullscreen;
+        }
+        else
+        {
+            _window.WindowState = _preFullscreenWindowState;
+            if (_preFullscreenWindowState == WindowState.Normal && _hasSavedWindowedPlacement)
+            {
+                _window.Size = _preFullscreenSize;
+                _window.Position = _preFullscreenPosition;
+            }
+        }
+
+        _firstMouseMove = true;
+        SyncViewport();
     }
 
     private static bool UpdateLocalAirborneTiming(float dt, bool isDead)
