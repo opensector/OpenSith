@@ -673,4 +673,183 @@ public sealed class BotAnimationAndWeaponBalanceTests
         Assert.Equal(0f, evt.FloatParam0);
         Assert.True(welcome.PlayerThingId >= 0);
     }
+
+    private static JklTemplate MakeTemplate(string name, params (string Key, string Value)[] pairs)
+    {
+        var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (k, v) in pairs)
+            dict[k] = v;
+        return new JklTemplate { Name = name, BasedOn = "none", Parameters = dict };
+    }
+
+    [Fact]
+    public void PunchWall_SpawnsSubtleNonAdditiveDustPuff_WithoutExplosionOrSparks()
+    {
+        var level = CreateBoxArena();
+        level.Templates["+punchcloud"] = MakeTemplate("+punchcloud",
+            ("type", "particle"), ("timer", "0.15"), ("material", "00gsmoke.mat"),
+            ("range", "0.006"), ("maxthrust", "4.0"), ("elementsize", "0.004"), ("count", "16"));
+        level.Templates["+punch_exp"] = MakeTemplate("+punch_exp",
+            ("type", "explosion"), ("timer", "0.001"), ("soundclass", "exp_punch.snd"),
+            ("creatething", "+punchcloud"), ("typeflags", "0x0"));
+        level.Templates["+punch"] = MakeTemplate("+punch",
+            ("type", "weapon"), ("size", "0.001"), ("damage", "20"), ("force", "50"),
+            ("range", "0.15"), ("typeflags", "0x200d"), ("explode", "+punch_exp"), ("fleshhit", "+punch_exp"));
+
+        var vfs = new InMemoryVfs();
+        var sim = new WorldSimulation(level, vfs, isMultiplayer: true, isDedicatedServer: true);
+        var spawned = new List<WorldSimulation.VisualEffect>();
+        sim.OnVisualEffectSpawned += spawned.Add;
+
+        PlayerState kyle = CreateLoadedPlayer(sim, 0, "PunchTester");
+        sim.UpdatePlayerInput(kyle.ThingIndex, new Vector3(0f, 5.88f, 0.05f), 0, Vector3.UnitY);
+
+        sim.FireProjectile(kyle.ThingIndex, "+punch", "-1", 0, Vector3.Zero, Vector3.Zero, 1f, 0, 0f, 0f);
+
+        Assert.Empty(sim.Sparks);
+        Assert.DoesNotContain(spawned, v => v.Kind == WorldSimulation.VisualEffectKind.Billboard);
+        var puff = Assert.Single(spawned, v => v.Kind == WorldSimulation.VisualEffectKind.ParticleRing);
+        Assert.Equal("+punchcloud", puff.SpriteName);
+        Assert.Equal("00gsmoke.mat", puff.MaterialName);
+        Assert.False(puff.IsAdditive);
+        Assert.Equal(0f, puff.MaxLight);
+        Assert.True(puff.ExpandRadius < 0.08f, $"Expected small dust puff radius < 0.08, got {puff.ExpandRadius}.");
+        Assert.True(puff.Width < 0.02f, $"Expected small dust particle quad < 0.02, got {puff.Width}.");
+        Assert.True(puff.Duration <= 0.25f, $"Expected short punch dust lifetime <= 0.25s, got {puff.Duration}.");
+        Assert.Equal(16, puff.ParticleCount);
+    }
+
+    [Fact]
+    public async Task Lightsaber_WallAndEnemyHits_SpawnRetailSparkEffects_WithThrottle_AndReplicateInMultiplayer()
+    {
+        var level = CreateBoxArena();
+        level.Templates["+sspks_wall"] = MakeTemplate("+sspks_wall",
+            ("type", "particle"), ("timer", "0.10"), ("material", "00ramp1.mat"),
+            ("range", "0.030"), ("maxthrust", "8.0"), ("elementsize", "0.003"), ("count", "48"));
+        level.Templates["+ssparks_wall"] = MakeTemplate("+ssparks_wall",
+            ("type", "explosion"), ("timer", "0.80"), ("soundclass", "exp_saber_wall.snd"),
+            ("creatething", "+sspks_wall"), ("blasttime", "0.70"), ("maxlight", "0.50"));
+        level.Templates["+sspks_blood"] = MakeTemplate("+sspks_blood",
+            ("type", "particle"), ("timer", "0.20"), ("material", "00ramp2.mat"),
+            ("range", "0.040"), ("maxthrust", "9.0"), ("elementsize", "0.005"), ("count", "24"));
+        level.Templates["+ssparks_blood"] = MakeTemplate("+ssparks_blood",
+            ("type", "explosion"), ("timer", "0.80"), ("soundclass", "exp_saber_blood.snd"),
+            ("creatething", "+sspks_blood"), ("blasttime", "0.70"), ("maxlight", "0.30"));
+        level.Templates["civilian"] = MakeTemplate("civilian",
+            ("type", "actor"), ("aiclass", "passive.ai"), ("typeflags", "0x180000"), ("size", "0.065"), ("health", "50"));
+        level.Templates["remote"] = MakeTemplate("remote",
+            ("type", "actor"), ("aiclass", "passive.ai"), ("typeflags", "0x100"), ("size", "0.065"), ("health", "50"));
+
+        int civilianId = level.Things.Count;
+        level.Things.Add(new JklThing
+        {
+            ThingIndex = civilianId,
+            TemplateName = "civilian",
+            SectorIndex = 0,
+            Position = new Vector3(3.0f, 0.20f, 0.13f)
+        });
+        int remoteId = level.Things.Count;
+        level.Things.Add(new JklThing
+        {
+            ThingIndex = remoteId,
+            TemplateName = "remote",
+            SectorIndex = 0,
+            Position = new Vector3(-3.0f, 0.20f, 0.13f)
+        });
+
+        var vfs = new InMemoryVfs();
+        vfs.AddText("misc/ai/passive.ai", """
+            alignment 0.0
+            rank 1
+            sightdist 0.0
+            heardist 0.0
+            """);
+        var sim = new WorldSimulation(level, vfs, isMultiplayer: true, isDedicatedServer: true);
+        var spawned = new List<WorldSimulation.VisualEffect>();
+        sim.OnVisualEffectSpawned += spawned.Add;
+
+        PlayerState kyle = CreateLoadedPlayer(sim, 0, "SaberSparks");
+        PlayerState enemy = CreateLoadedPlayer(sim, 1, "Victim");
+
+        // 1. Wall hit emits +sspks_wall ParticleRing and obeys 200ms spark throttle
+        sim.UpdatePlayerInput(kyle.ThingIndex, new Vector3(0f, 5.88f, 0.05f), 0, Vector3.UnitY);
+        sim.UpdatePlayerInput(enemy.ThingIndex, new Vector3(0f, -5.0f, 0.05f), 0, Vector3.UnitY);
+        sim.JkEnableSaber(kyle.ThingIndex, 50f, 0.25f, 0.50f);
+
+        const float dt = 1.0f / 60.0f;
+        sim.StepWorld(dt); // tick 1 -> sparks on north wall
+        var wallSpark = Assert.Single(spawned, v => v.Kind == WorldSimulation.VisualEffectKind.ParticleRing);
+        Assert.Equal("+sspks_wall", wallSpark.SpriteName);
+        Assert.True(wallSpark.IsAdditive);
+        Assert.True(wallSpark.ColorTint.X >= 0.9f && wallSpark.ColorTint.Y > 0.5f && wallSpark.ColorTint.Z < 0.5f);
+        Assert.InRange(wallSpark.ExpandRadius, 0.08f, 0.30f);
+
+        // Immediately within 200ms: throttled (still 1 spark ring)
+        sim.StepWorld(dt);
+        Assert.Single(spawned, v => v.Kind == WorldSimulation.VisualEffectKind.ParticleRing);
+
+        // Advance past 200ms and scrape wall again -> second +sspks_wall burst spawns
+        for (int i = 0; i < 15; i++)
+            sim.StepWorld(dt);
+        Assert.Equal(2, spawned.Count(v => v.Kind == WorldSimulation.VisualEffectKind.ParticleRing && v.SpriteName == "+sspks_wall"));
+
+        // 2. Enemy player & organic civilian NPC (0x180000 NOTARGET) emit +sspks_blood; SITH_AF_DROID NPC (0x100) emits +sspks_wall
+        spawned.Clear();
+        sim.JkDisableSaber(kyle.ThingIndex);
+        sim.UpdatePlayerInput(kyle.ThingIndex, new Vector3(0f, 0f, 0.05f), 0, Vector3.UnitY);
+        sim.UpdatePlayerInput(enemy.ThingIndex, new Vector3(0f, 0.20f, 0.05f), 0, -Vector3.UnitY);
+        sim.JkEnableSaber(kyle.ThingIndex, 50f, 0.25f, 0.40f);
+        sim.StepWorld(dt);
+        var bloodSpark = Assert.Single(spawned, v => v.Kind == WorldSimulation.VisualEffectKind.ParticleRing);
+        Assert.Equal("+sspks_blood", bloodSpark.SpriteName);
+        Assert.True(bloodSpark.IsAdditive);
+        Assert.True(bloodSpark.ColorTint.X >= 0.9f && bloodSpark.ColorTint.Y < 0.5f);
+
+        spawned.Clear();
+        sim.JkDisableSaber(kyle.ThingIndex);
+        sim.UpdatePlayerInput(enemy.ThingIndex, new Vector3(0f, -5.0f, 0.05f), 0, Vector3.UnitY);
+        sim.UpdatePlayerInput(kyle.ThingIndex, new Vector3(3.0f, 0f, 0.05f), 0, Vector3.UnitY);
+        sim.JkEnableSaber(kyle.ThingIndex, 50f, 0.25f, 0.40f);
+        sim.StepWorld(dt);
+        var civSpark = Assert.Single(spawned, v => v.Kind == WorldSimulation.VisualEffectKind.ParticleRing);
+        Assert.Equal("+sspks_blood", civSpark.SpriteName);
+
+        spawned.Clear();
+        sim.JkDisableSaber(kyle.ThingIndex);
+        sim.UpdatePlayerInput(kyle.ThingIndex, new Vector3(-3.0f, 0f, 0.05f), 0, Vector3.UnitY);
+        sim.JkEnableSaber(kyle.ThingIndex, 50f, 0.25f, 0.40f);
+        sim.StepWorld(dt);
+        var droidSpark = Assert.Single(spawned, v => v.Kind == WorldSimulation.VisualEffectKind.ParticleRing);
+        Assert.Equal("+sspks_wall", droidSpark.SpriteName);
+
+        // 3. DedicatedGameServer replicates saber spark ParticleRing over UDP
+        var mpLevel = CreateBoxArena();
+        mpLevel.Templates["+sspks_wall"] = level.Templates["+sspks_wall"];
+        mpLevel.Templates["+ssparks_wall"] = level.Templates["+ssparks_wall"];
+        using var server = new DedicatedGameServer(mpLevel, new InMemoryVfs(), "test.gob", "arena.jkl", port: 0, maxPlayers: 8, tickRateHz: 30);
+        using var client = new MultiplayerClient();
+
+        Task<ServerWelcomePacket> connectTask = client.ConnectAsync("127.0.0.1", server.BoundPort, "SparkWatcher");
+        while (!connectTask.IsCompleted)
+        {
+            server.Tick(0.01f);
+            await Task.Delay(5);
+        }
+        ServerWelcomePacket welcome = await connectTask;
+        PlayerState srvPlayer = server.Simulation.GetPlayerByThing(welcome.PlayerThingId)!;
+        server.Simulation.UpdatePlayerInput(srvPlayer.ThingIndex, new Vector3(0f, 5.88f, 0.05f), 0, Vector3.UnitY);
+        server.Simulation.JkEnableSaber(srvPlayer.ThingIndex, 50f, 0.25f, 0.40f);
+
+        var events = new List<NetWorldEvent>();
+        for (int i = 0; i < 10; i++)
+        {
+            server.Tick(1.0f / 30.0f);
+            await Task.Delay(5);
+            client.PollSnapshots(events, 1.0f / 30.0f, out _);
+            if (events.Any(e => e.Kind == NetEventKind.ParticleRing && e.Text0 == "+sspks_wall"))
+                break;
+        }
+
+        Assert.Contains(events, e => e.Kind == NetEventKind.ParticleRing && e.Text0 == "+sspks_wall");
+    }
 }

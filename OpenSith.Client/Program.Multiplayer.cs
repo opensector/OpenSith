@@ -546,21 +546,26 @@ public static partial class Program
                 case NetEventKind.ParticleRing:
                 {
                     (Vector3 tint, float pitchSpread, int pCount) = NetCodec.UnpackRingMeta(evt.IntParam0);
+                    bool isSmoke = WorldSimulation.IsSmokeParticleEffect(evt.Text0, evt.Text1);
+                    float expandRadius = MathF.Max(0.02f, evt.FloatParam0);
+                    float particleSize = isSmoke
+                        ? Math.Clamp(expandRadius * 0.25f, 0.009f, 0.025f)
+                        : Math.Clamp(expandRadius * 0.08f, 0.009f, 0.035f);
                     _netVisualEffects.Add(new WorldSimulation.VisualEffect
                     {
                         Kind = WorldSimulation.VisualEffectKind.ParticleRing,
                         Position = evt.Position,
                         SpriteName = evt.Text0,
                         MaterialName = string.IsNullOrWhiteSpace(evt.Text1) ? "dusty.mat" : evt.Text1,
-                        Width = 0.04f,
-                        Height = 0.04f,
-                        ExpandRadius = MathF.Max(0.25f, evt.FloatParam0),
-                        Duration = MathF.Max(0.2f, evt.FloatParam1),
-                        MaxLight = 0.5f,
+                        Width = particleSize,
+                        Height = particleSize,
+                        ExpandRadius = expandRadius,
+                        Duration = MathF.Max(0.12f, evt.FloatParam1),
+                        MaxLight = isSmoke ? 0f : 0.5f,
                         ColorTint = tint,
                         ParticleCount = pCount,
                         PitchSpreadDeg = pitchSpread,
-                        IsAdditive = true
+                        IsAdditive = !isSmoke
                     });
                     break;
                 }

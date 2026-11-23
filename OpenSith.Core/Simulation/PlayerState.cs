@@ -57,6 +57,7 @@ public sealed class PlayerState
     public float SaberCollideLength { get; set; }
     public float SaberStunLength { get; set; }
     public HashSet<int> SaberHitThisSwing { get; } = [];
+    public float LastSaberSparkTime { get; set; } = -1f;
     public string PovModel { get; set; } = "bryv.3do";
     public string PovKey { get; set; } = "bryvpst1.key";
     public string PovIdleKey { get; set; } = "bryvpst1.key";

@@ -676,6 +676,7 @@ public sealed partial class WorldSimulation
         player.SaberCollideLength = collideLength;
         player.SaberStunLength = stunLength;
         player.SaberHitThisSwing.Clear();
+        player.LastSaberSparkTime = -1f;
     }
 
     public void JkDisableSaber(int thingId)
@@ -867,6 +868,7 @@ public sealed partial class WorldSimulation
         bool hitWall = TryRaycastWorldWithHit(rayOrigin, meleeEnd, out Vector3 wallHitPos, out int hitSurfaceId, out _);
         float closestDist = hitWall ? Vector3.Distance(rayOrigin, wallHitPos) : maxRange;
 
+        bool hitAnyEntity = false;
         foreach (var npc in _npcs.Values)
         {
             if (!npc.IsAlive || player.SaberHitThisSwing.Contains(npc.Thing.ThingIndex))
@@ -883,6 +885,7 @@ public sealed partial class WorldSimulation
             if (perpDist > hitRadius || !HasLineOfSight(rayOrigin, npcCenter))
                 continue;
 
+            hitAnyEntity = true;
             player.SaberHitThisSwing.Add(npc.Thing.ThingIndex);
 
             if (CanNpcBlock(npc))
@@ -901,14 +904,22 @@ public sealed partial class WorldSimulation
                     npc.AnimMode = 1;
                     npc.LoopAnim = false;
                     Vector3 sparkPos = npcCenter + toAttacker * 0.06f;
-                    SpawnSparks(sparkPos, toAttacker, count: 12);
-                    _audio?.PlaySoundPos("ltsaberhit01.wav", sparkPos, 0.95f, 0.5f, 6.0f);
+                    if (!SpawnSaberSparks(player, sparkPos, toAttacker, SaberSparkKind.Saber))
+                        _audio?.PlaySoundPos("ltsaberhit01.wav", sparkPos, 0.95f, 0.5f, 6.0f);
                     DispatchThingCogMessageFromSource(npc.Thing.ThingIndex, player.ThingIndex, "blocked");
                     continue;
                 }
             }
 
-            _audio?.PlaySoundPos("ltsaberbodyhit01.wav", npc.Thing.Position, 0.9f, 0.5f, 5.0f);
+            Vector3 npcHitPos = rayOrigin + dir * proj;
+            bool isDroid = (npc.TypeFlags & 0x100) != 0 ||
+                npc.Thing.TemplateName.Contains("droid", StringComparison.OrdinalIgnoreCase) ||
+                npc.Thing.TemplateName.Contains("mouse", StringComparison.OrdinalIgnoreCase) ||
+                npc.Thing.TemplateName.StartsWith("r5", StringComparison.OrdinalIgnoreCase) ||
+                npc.Thing.TemplateName.Contains("probe", StringComparison.OrdinalIgnoreCase);
+            SaberSparkKind sparkKind = isDroid ? SaberSparkKind.Wall : SaberSparkKind.Blood;
+            if (!SpawnSaberSparks(player, npcHitPos, -dir, sparkKind))
+                _audio?.PlaySoundPos("ltsaberbodyhit01.wav", npc.Thing.Position, 0.9f, 0.5f, 5.0f);
             ApplyNpcDamage(npc.Thing.ThingIndex, damage, rayOrigin, damageType: 16, attackerThingId: player.ThingIndex);
         }
 
@@ -930,7 +941,10 @@ public sealed partial class WorldSimulation
             float perpDist = Vector3.Distance(rayOrigin + dir * proj, targetCenter);
             if (perpDist <= 0.10f && HasLineOfSight(rayOrigin, targetCenter))
             {
+                hitAnyEntity = true;
                 player.SaberHitThisSwing.Add(targetPlayer.ThingIndex);
+                Vector3 targetHitPos = rayOrigin + dir * proj;
+                SpawnSaberSparks(player, targetHitPos, -dir, SaberSparkKind.Blood, playSound: false);
                 ApplyDamageToPlayer(targetPlayer, player.ThingIndex, damage, "ltsaberbodyhit01.wav");
             }
         }
@@ -948,18 +962,85 @@ public sealed partial class WorldSimulation
             float perpDist = Vector3.Distance(rayOrigin + dir * proj, propCenter);
             if (perpDist <= GetPropHitRadius(thingId) && HasLineOfSight(rayOrigin, propCenter))
             {
+                hitAnyEntity = true;
                 player.SaberHitThisSwing.Add(thingId);
-                _audio?.PlaySoundPos("ltsaberbodyhit01.wav", propCenter, 0.9f, 0.5f, 5.0f);
+                Vector3 propHitPos = rayOrigin + dir * proj;
+                if (!SpawnSaberSparks(player, propHitPos, -dir, SaberSparkKind.Wall))
+                    _audio?.PlaySoundPos("ltsaberhit07.wav", propCenter, 0.9f, 0.5f, 5.0f);
                 DispatchThingCogMessageFromSource(thingId, player.ThingIndex, "damaged", new CogValue(damage), new CogValue(16));
             }
         }
 
         if (hitWall && hitSurfaceId >= 0)
         {
+            if (!hitAnyEntity)
+                SpawnSaberSparks(player, wallHitPos - dir * 0.015f, -dir, SaberSparkKind.Wall);
+
             int surfaceHitMarker = -1000 - hitSurfaceId;
             if (player.SaberHitThisSwing.Add(surfaceHitMarker))
                 DispatchSurfaceDamaged(hitSurfaceId, damage, damageType: 16, sourceRefOverride: player.ThingIndex);
         }
+    }
+
+    private enum SaberSparkKind
+    {
+        Wall,
+        Blood,
+        Saber
+    }
+
+    private bool SpawnSaberSparks(PlayerState player, Vector3 position, Vector3 awayDir, SaberSparkKind kind, bool playSound = true)
+    {
+        if (_elapsedLevelTime < player.LastSaberSparkTime + 0.20f)
+            return false;
+
+        player.LastSaberSparkTime = _elapsedLevelTime;
+
+        _saberInfos.TryGetValue(player.ThingIndex, out var info);
+        (string sparkTemplate, string fallbackMat, string fallbackSound) = kind switch
+        {
+            SaberSparkKind.Blood => (
+                string.IsNullOrWhiteSpace(info?.BloodSparks) ? "+ssparks_blood" : info.BloodSparks,
+                "00ramp2.mat",
+                "ltsaberbodyhit01.wav"),
+            SaberSparkKind.Saber => (
+                string.IsNullOrWhiteSpace(info?.SaberSparks) ? "+ssparks_saber" : info.SaberSparks,
+                "00teleport.mat",
+                "ltsaberhit01.wav"),
+            _ => (
+                string.IsNullOrWhiteSpace(info?.WallSparks) ? "+ssparks_wall" : info.WallSparks,
+                "00ramp1.mat",
+                "ltsaberhit07.wav")
+        };
+
+        if (_level.Templates.ContainsKey(sparkTemplate))
+        {
+            TriggerExplosion(position, sparkTemplate, player.ThingIndex, fallbackSound: fallbackSound, playSound: playSound);
+            return true;
+        }
+
+        var sparkFx = new VisualEffect
+        {
+            Kind = VisualEffectKind.ParticleRing,
+            Position = position,
+            SpriteName = sparkTemplate,
+            MaterialName = fallbackMat,
+            Width = 0.012f,
+            Height = 0.012f,
+            Duration = 0.35f,
+            MaxLight = 0.5f,
+            ColorTint = ResolveParticleTint(sparkTemplate),
+            IsAdditive = true,
+            ExpandRadius = 0.16f,
+            ParticleCount = 32,
+            PitchSpreadDeg = 360f
+        };
+        _visualEffects.Add(sparkFx);
+        OnVisualEffectSpawned?.Invoke(sparkFx);
+        SpawnSparks(position, awayDir, count: 10);
+        if (playSound)
+            _audio?.PlaySoundPos(fallbackSound, position, 0.85f, 0.5f, 6.0f);
+        return true;
     }
 
     // -------------------------------------------------------------------------
@@ -1458,13 +1539,15 @@ public sealed partial class WorldSimulation
         string? explosionTemplate,
         int ownerThingIndex,
         int directHitThingId = -1,
-        string fallbackSound = "ricochet01.wav")
+        string fallbackSound = "ricochet01.wav",
+        bool playSound = true)
     {
         if (string.IsNullOrWhiteSpace(explosionTemplate) ||
             explosionTemplate.Equals("none", StringComparison.OrdinalIgnoreCase))
         {
             SpawnSparks(position, Vector3.UnitZ, count: 10);
-            _audio?.PlaySoundPos(fallbackSound, position, 0.75f, 0.5f, 6.0f);
+            if (playSound)
+                _audio?.PlaySoundPos(fallbackSound, position, 0.75f, 0.5f, 6.0f);
             return;
         }
 
@@ -1472,8 +1555,9 @@ public sealed partial class WorldSimulation
         string? tmplType = ResolveTemplateParam(tmpl, "type");
         if (string.Equals(tmplType, "particle", StringComparison.OrdinalIgnoreCase))
         {
-            SpawnParticleCloudFromTemplate(tmpl, position, fallbackRadius: 0.35f);
-            _audio?.PlaySoundPos(fallbackSound, position, 0.75f, 0.5f, 6.0f);
+            SpawnParticleCloudFromTemplate(tmpl, position, fallbackRadius: 0f);
+            if (playSound)
+                _audio?.PlaySoundPos(fallbackSound, position, 0.75f, 0.5f, 6.0f);
             return;
         }
 
@@ -1484,44 +1568,64 @@ public sealed partial class WorldSimulation
         float duration = ParseTemplateFloat(tmpl, "blasttime", ParseTemplateFloat(tmpl, "timer", 0.5f));
         if (duration <= 0f)
             duration = 0.5f;
-        float maxLight = ParseTemplateFloat(tmpl, "maxlight", 0.5f);
+        float maxLight = ParseTemplateFloat(tmpl, "maxlight", ParseTemplateFloat(tmpl, "light", 0f));
+        string? spriteName = ResolveTemplateParam(tmpl, "sprite");
 
         SpawnVisualEffectFromTemplate(tmpl, position, duration, maxLight);
 
         string? createThing = ResolveTemplateParam(tmpl, "creatething");
         if (!string.IsNullOrWhiteSpace(createThing) && !createThing.Equals("none", StringComparison.OrdinalIgnoreCase))
-            SpawnParticleCloudFromTemplate(createThing, position, fallbackRadius: range > 0f ? range : 0.45f, fallbackDuration: duration);
+            SpawnParticleCloudFromTemplate(createThing, position, fallbackRadius: range, fallbackDuration: duration);
 
         if (range > 0f && (damage > 0f || force > 0f))
             ApplyExplosionSplashDamage(position, range, damage, force, damageClass, ownerThingIndex, directHitThingId);
 
-        string? soundClassName = ResolveTemplateParam(tmpl, "soundclass");
-        if (!string.IsNullOrWhiteSpace(soundClassName) &&
-            !soundClassName.Equals("none", StringComparison.OrdinalIgnoreCase) &&
-            TryResolveSoundClassEntry(soundClassName, SoundEvent.Create, out var sndEntry) &&
-            sndEntry.HasSound)
+        if (playSound)
         {
-            float vol = sndEntry.MaxVolume > 0f ? sndEntry.MaxVolume : 1.0f;
-            float minR = sndEntry.MinRadius > 0f ? sndEntry.MinRadius : 0.8f;
-            float maxR = sndEntry.MaxRadius > minR ? sndEntry.MaxRadius : 10.0f;
-            _audio?.PlaySoundPos(sndEntry.SoundFileName, position, vol, minR, maxR);
-        }
-        else if (damage > 0f && range >= 0.25f)
-        {
-            _audio?.PlaySoundPos("ThermalExpl01.wav", position, 0.95f, 0.8f, 12.0f);
-        }
-        else
-        {
-            _audio?.PlaySoundPos(fallbackSound, position, 0.75f, 0.5f, 6.0f);
+            string? soundClassName = ResolveTemplateParam(tmpl, "soundclass");
+            if (!string.IsNullOrWhiteSpace(soundClassName) &&
+                !soundClassName.Equals("none", StringComparison.OrdinalIgnoreCase) &&
+                TryResolveSoundClassEntry(soundClassName, SoundEvent.Create, out var sndEntry) &&
+                sndEntry.HasSound)
+            {
+                float vol = sndEntry.MaxVolume > 0f ? sndEntry.MaxVolume : 1.0f;
+                float minR = sndEntry.MinRadius > 0f ? sndEntry.MinRadius : 0.8f;
+                float maxR = sndEntry.MaxRadius > minR ? sndEntry.MaxRadius : 10.0f;
+                _audio?.PlaySoundPos(sndEntry.SoundFileName, position, vol, minR, maxR);
+            }
+            else if (damage > 0f && range >= 0.25f)
+            {
+                _audio?.PlaySoundPos("ThermalExpl01.wav", position, 0.95f, 0.8f, 12.0f);
+            }
+            else
+            {
+                _audio?.PlaySoundPos(fallbackSound, position, 0.75f, 0.5f, 6.0f);
+            }
         }
 
-        SpawnSparks(position, Vector3.UnitZ, count: range > 0.2f ? 16 : 8);
+        if (damage > 0f || maxLight > 0f || !string.IsNullOrWhiteSpace(spriteName))
+            SpawnSparks(position, Vector3.UnitZ, count: range > 0.2f ? 16 : 8);
+    }
+
+    public static bool IsSmokeParticleEffect(string? templateOrSprite, string? materialName)
+    {
+        string low = (templateOrSprite ?? string.Empty).ToLowerInvariant();
+        string matLow = (materialName ?? string.Empty).ToLowerInvariant();
+        if (low.Contains("conc") || low.Contains("fire") || low.Contains("dest") ||
+            low.Contains("saber") || low.Contains("sspks") || low.Contains("spark") ||
+            low.Contains("lightning"))
+        {
+            return false;
+        }
+
+        return low.Contains("punch") || low.Contains("smoke") || low.Contains("whitecloud") ||
+               low.Contains("dustcloud") || matLow.Contains("00gsmoke");
     }
 
     private void SpawnParticleCloudFromTemplate(
         string templateName,
         Vector3 position,
-        float fallbackRadius = 0.45f,
+        float fallbackRadius = 0f,
         float fallbackDuration = 0.5f)
     {
         if (string.IsNullOrWhiteSpace(templateName))
@@ -1529,13 +1633,17 @@ public sealed partial class WorldSimulation
 
         string tmpl = templateName.Trim();
         float timer = ParseTemplateFloat(tmpl, "timer", fallbackDuration);
-        if (timer <= 0f) timer = MathF.Max(0.25f, fallbackDuration);
-        float tmplRange = ParseTemplateFloat(tmpl, "range", 0f);
-        float expandRadius = MathF.Max(fallbackRadius, tmplRange);
-        int count = Math.Clamp((int)ParseTemplateFloat(tmpl, "count", 48f), 16, 96);
+        if (timer <= 0f) timer = MathF.Max(0.15f, fallbackDuration);
+        float tmplRange = ParseTemplateFloat(tmpl, "range", 0.02f);
+        float maxThrust = ParseTemplateFloat(tmpl, "maxthrust", 8f);
+        float particleExpand = Math.Clamp(tmplRange * (1f + maxThrust * 0.45f) + MathF.Min(0.35f, maxThrust * 0.004f), 0.03f, 0.50f);
+        float expandRadius = fallbackRadius > 0f ? MathF.Max(fallbackRadius, particleExpand) : particleExpand;
+        int count = Math.Clamp((int)ParseTemplateFloat(tmpl, "count", 32f), 8, 96);
         float pitchSpread = ParseTemplateFloat(tmpl, "pitchrange", 360f);
-        float elemSize = MathF.Max(0.015f, ParseTemplateFloat(tmpl, "elementsize", 0.012f));
+        float elemSize = Math.Clamp(ParseTemplateFloat(tmpl, "elementsize", 0.008f), 0.002f, 0.03f);
+        float particleWidth = Math.Clamp(elemSize * 2.8f, 0.009f, 0.045f);
         string? matName = ResolveTemplateParam(tmpl, "material");
+        bool isSmoke = IsSmokeParticleEffect(tmpl, matName);
 
         Vector3 tint = ResolveParticleTint(tmpl);
         var ringFx = new VisualEffect
@@ -1544,12 +1652,12 @@ public sealed partial class WorldSimulation
             Position = position,
             SpriteName = tmpl,
             MaterialName = !string.IsNullOrWhiteSpace(matName) ? matName : "dusty.mat",
-            Width = MathF.Max(0.03f, elemSize * 2.5f),
-            Height = MathF.Max(0.03f, elemSize * 2.5f),
-            Duration = MathF.Max(0.28f, timer * 2.5f),
-            MaxLight = 0.5f,
+            Width = particleWidth,
+            Height = particleWidth,
+            Duration = isSmoke ? Math.Clamp(timer * 1.25f, 0.14f, 0.35f) : Math.Clamp(timer * 2.2f, 0.25f, 0.70f),
+            MaxLight = isSmoke ? 0f : 0.5f,
             ColorTint = tint,
-            IsAdditive = true,
+            IsAdditive = !isSmoke,
             ExpandRadius = expandRadius,
             ParticleCount = count,
             PitchSpreadDeg = pitchSpread
@@ -1565,7 +1673,11 @@ public sealed partial class WorldSimulation
         if (low.Contains("lightning")) return new Vector3(0.58f, 0.85f, 1.0f);
         if (low.Contains("dest")) return new Vector3(0.85f, 1.0f, 0.45f);
         if (low.Contains("fire")) return new Vector3(1.0f, 0.56f, 0.14f);
-        if (low.Contains("saber")) return new Vector3(1.0f, 0.90f, 0.55f);
+        if (low.Contains("sspks_blood") || low.Contains("ssparks_blood")) return new Vector3(1.0f, 0.34f, 0.14f);
+        if (low.Contains("sspks_wall") || low.Contains("ssparks_wall")) return new Vector3(1.0f, 0.76f, 0.26f);
+        if (low.Contains("sspks_saber") || low.Contains("ssparks_saber") || low.Contains("saber")) return new Vector3(1.0f, 0.95f, 0.68f);
+        if (low.Contains("punch") || low.Contains("smoke") || low.Contains("whitecloud") || low.Contains("dustcloud"))
+            return new Vector3(0.58f, 0.56f, 0.52f);
         return new Vector3(0.85f, 0.80f, 0.72f);
     }
 

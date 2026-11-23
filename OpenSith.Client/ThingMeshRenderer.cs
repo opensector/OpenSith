@@ -943,6 +943,7 @@ public sealed class ThingMeshRenderer : IDisposable
         finally
         {
             shader.SetUniform("uModel", Matrix4x4.Identity);
+            shader.SetUniform("uColorMod", Vector3.One);
             shader.SetUniform("uTint", Vector3.Zero);
             shader.SetUniform("uAlpha", 1.0f);
             shader.SetUniform("uAlphaTest", 0.0f);
@@ -1003,19 +1004,24 @@ public sealed class ThingMeshRenderer : IDisposable
         WorldSimulation.VisualEffect fx,
         float lifeFrac)
     {
-        uint texHandle = string.IsNullOrWhiteSpace(fx.MaterialName)
-            ? _textureManager.DefaultWhiteTexture
-            : _textureManager.GetOrCreateTexture(fx.MaterialName).Handle;
         uint whiteHandle = _textureManager.DefaultWhiteTexture;
+        var matCels = string.IsNullOrWhiteSpace(fx.MaterialName)
+            ? []
+            : _textureManager.GetOrCreateTextureCels(fx.MaterialName);
+        int celIdx = matCels.Length > 1 ? Math.Clamp((int)(lifeFrac * matCels.Length), 0, matCels.Length - 1) : 0;
+        uint texHandle = matCels.Length > 0 && matCels[celIdx].Handle != 0
+            ? matCels[celIdx].Handle
+            : whiteHandle;
 
         float ease = 1.0f - MathF.Pow(1.0f - lifeFrac, 2.2f);
-        float maxRadius = MathF.Max(0.15f, fx.ExpandRadius);
+        float maxRadius = MathF.Max(0.02f, fx.ExpandRadius);
         float alpha = Math.Clamp((1.0f - lifeFrac) * 1.15f, 0.05f, 1.0f);
-        float size = MathF.Max(0.025f, fx.Width * (1.25f - 0.55f * lifeFrac));
+        float size = MathF.Max(0.005f, fx.Width * (1.25f - 0.55f * lifeFrac));
         bool isFlatRing = fx.PitchSpreadDeg <= 15f;
-        int count = Math.Clamp(fx.ParticleCount > 0 ? fx.ParticleCount : 48, 12, 96);
+        int count = Math.Clamp(fx.ParticleCount > 0 ? fx.ParticleCount : 32, 8, 96);
         float spreadRad = fx.PitchSpreadDeg * (MathF.PI / 180f);
         int baseSeed = HashEffectSeed(fx.Position);
+        float quadAlpha = fx.IsAdditive ? alpha * 0.9f : alpha * 0.45f;
 
         for (int i = 0; i < count; i++)
         {
@@ -1030,8 +1036,10 @@ public sealed class ThingMeshRenderer : IDisposable
             float cosP = MathF.Cos(pitch);
             Vector3 dir = new(cosP * MathF.Cos(yaw), cosP * MathF.Sin(yaw), MathF.Sin(pitch));
             Vector3 pPos = fx.Position + dir * (maxRadius * ease * radialScale);
+            if (!isFlatRing && fx.IsAdditive && maxRadius <= 0.30f)
+                pPos.Z -= 0.16f * lifeFrac * lifeFrac;
 
-            DrawEffectQuad(shader, quadModel, whiteHandle, pPos, right * size, up * size, back, fx.ColorTint, alpha * 0.9f);
+            DrawEffectQuad(shader, quadModel, texHandle, pPos, right * size, up * size, back, fx.ColorTint, quadAlpha);
         }
 
         // Concussion-style outer expanding shockwave halo ring
@@ -1040,12 +1048,11 @@ public sealed class ThingMeshRenderer : IDisposable
             const int ringDots = 24;
             float ringR = maxRadius * ease;
             float dotSize = size * 1.4f;
-            uint haloTex = texHandle != 0 ? texHandle : whiteHandle;
             for (int i = 0; i < ringDots; i++)
             {
                 float a = (i / (float)ringDots) * MathF.Tau;
                 Vector3 pPos = fx.Position + new Vector3(MathF.Cos(a) * ringR, MathF.Sin(a) * ringR, 0f);
-                DrawEffectQuad(shader, quadModel, haloTex, pPos, right * dotSize, up * dotSize, back, fx.ColorTint, alpha * 0.75f);
+                DrawEffectQuad(shader, quadModel, texHandle, pPos, right * dotSize, up * dotSize, back, fx.ColorTint, alpha * 0.75f);
             }
         }
     }
@@ -1174,7 +1181,8 @@ public sealed class ThingMeshRenderer : IDisposable
 
         _gl.BindTexture(TextureTarget.Texture2D, texHandle);
         shader.SetUniform("uModel", model);
-        shader.SetUniform("uTint", colorTint == Vector3.One ? Vector3.Zero : colorTint * alpha);
+        shader.SetUniform("uColorMod", colorTint);
+        shader.SetUniform("uTint", Vector3.Zero);
         shader.SetUniform("uAlpha", alpha);
 
         _gl.DrawElements(PrimitiveType.Triangles, (uint)quadModel.Batches[0].ElementCount, DrawElementsType.UnsignedInt, (void*)0);

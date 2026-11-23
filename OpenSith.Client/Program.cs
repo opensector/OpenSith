@@ -290,6 +290,7 @@ public static partial class Program
 
             uniform sampler2D uTexture;
             uniform vec3 uTint;
+            uniform vec3 uColorMod;
             uniform float uAlpha;
             uniform float uAlphaTest;
 
@@ -299,12 +300,14 @@ public static partial class Program
             {
                 vec4 texColor = texture(uTexture, vTexCoord);
                 if (uAlphaTest > 0.5 && texColor.a < 0.1) discard;
-                vec3 lighted = texColor.rgb * max(vIntensity, 0.25) + uTint;
+                vec3 lighted = texColor.rgb * max(vIntensity, 0.25) * uColorMod + uTint;
                 FragColor = vec4(lighted, texColor.a * uAlpha);
             }
         ";
 
         _shader = new ShaderProgram(_gl, vShader, fShader);
+        _shader.Use();
+        _shader.SetUniform("uColorMod", Vector3.One);
         _hudRenderer = new HudRenderer(_gl, _vfs!);
         _saberRenderer = new SaberRenderer(_gl);
         _menuRenderer = new MenuRenderer(_gl, _vfs!);
